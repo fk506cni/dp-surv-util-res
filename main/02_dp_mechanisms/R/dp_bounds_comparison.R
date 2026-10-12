@@ -1,0 +1,257 @@
+CLIPPING_BOUNDS_FIXED <- list(
+  lung = list(
+    age       = c(18, 110),
+    sex       = c(1, 2),
+    ph.ecog   = c(0, 5),
+    ph.karno  = c(0, 100),
+    pat.karno = c(0, 100),
+    meal.cal  = c(0, 4000),
+    wt.loss   = c(-50, 100)
+  ),
+  pbc = list(
+    age      = c(18, 110),
+    sex      = c("f", "m"),
+    trt      = c(1, 2),
+    ascites  = c(0, 1),
+    hepato   = c(0, 1),
+    spiders  = c(0, 1),
+    edema    = c(0, 0.5, 1),
+    bili     = c(0, 50),
+    chol     = c(0, 2000),
+    albumin  = c(0, 8),
+    copper   = c(0, 4000),
+    alk.phos = c(0, 20000),
+    ast      = c(0, 10000),
+    trig     = c(0, 2000),
+    platelet = c(0, 6000),
+    protime  = c(0, 200),
+    stage    = c(1, 2, 3, 4)
+  ),
+  colon = list(
+    sex      = c(0, 1),
+    age      = c(18, 110),
+    obstruct = c(0, 1),
+    perfor   = c(0, 1),
+    adhere   = c(0, 1),
+    nodes    = c(0, 90),
+    differ   = c(1, 2, 3),
+    extent   = c(1, 2, 3, 4),
+    surg     = c(0, 1),
+    node4    = c(0, 1),
+    rx       = c("Obs", "Lev", "Lev+5FU")
+  ),
+  rotterdam = list(
+    age    = c(18, 110),
+    meno   = c(0, 1),
+    size   = c("<=20", "20-50", ">50"),
+    grade  = c(2, 3),
+    nodes  = c(0, 90),
+    pgr    = c(0, 2000),
+    er     = c(0, 2000),
+    hormon = c(0, 1),
+    chemo  = c(0, 1)
+  ),
+  flchain = list(
+    age        = c(50, 110),
+    sex        = c("F", "M"),
+    sample.yr  = c(1995, 2003),
+    kappa      = c(0, 30),
+    lambda     = c(0, 40),
+    creatinine = c(0, 80),
+    mgus       = c(0, 1)
+  )
+)
+
+widen_bounds_ds <- function(bounds_ds, types_ds) {
+  stopifnot(setequal(names(bounds_ds), names(types_ds)))
+  out <- bounds_ds
+  for (col in names(bounds_ds)) {
+    if (identical(types_ds[[col]], "continuous")) {
+      b <- as.numeric(bounds_ds[[col]])
+      stopifnot(length(b) == 2, b[1] < b[2])
+      center <- (b[1] + b[2]) / 2
+      w <- b[2] - b[1]
+      out[[col]] <- c(center - w, center + w)
+    }
+  }
+  out
+}
+
+widen_bounds_all <- function(clipping_bounds, covariate_types) {
+  stopifnot(setequal(names(clipping_bounds), names(covariate_types)))
+  setNames(
+    lapply(names(clipping_bounds),
+           function(ds) widen_bounds_ds(clipping_bounds[[ds]], covariate_types[[ds]])),
+    names(clipping_bounds)
+  )
+}
+
+if (!exists("CLIPPING_BOUNDS") || !exists("COVARIATE_TYPES")) {
+  stop("dp_bounds_comparison.R: dp_input_perturbation_phase1.R を先に source してください")
+}
+
+CLIPPING_BOUNDS_WIDE <- widen_bounds_all(CLIPPING_BOUNDS, COVARIATE_TYPES)
+
+BOUNDS_ARM_SEED_OFFSET <- c(fixed = 1000000L, widened = 2000000L)
+
+BOUNDS_ARM_BOUNDS <- list(
+  fixed   = "CLIPPING_BOUNDS_FIXED",
+  widened = "CLIPPING_BOUNDS_WIDE"
+)
+
+BOUNDS_ARM_OUTPUT_DIR <- c(
+  fixed   = "phase1_bounds_fixed",
+  widened = "phase1_bounds_widened"
+)
+
+BOUNDS_DATASET_BASE_SEED <- c(lung = 42L, pbc = 100042L, colon = 200042L,
+                              rotterdam = 300042L, flchain = 400042L)
+
+assert_bounds_structure <- function(bounds, reference = CLIPPING_BOUNDS,
+                                    types = COVARIATE_TYPES, label = "bounds") {
+  if (!setequal(names(bounds), names(reference))) {
+    stop(sprintf("%s: データセット集合が CLIPPING_BOUNDS と一致しません", label))
+  }
+  for (ds in names(reference)) {
+    if (!setequal(names(bounds[[ds]]), names(reference[[ds]]))) {
+      stop(sprintf("%s[%s]: 共変量集合が一致しません（欠落: %s / 余分: %s）", label, ds,
+                   paste(setdiff(names(reference[[ds]]), names(bounds[[ds]])), collapse = ","),
+                   paste(setdiff(names(bounds[[ds]]), names(reference[[ds]])), collapse = ",")))
+    }
+    for (col in names(reference[[ds]])) {
+      ty <- types[[ds]][[col]]
+      if (identical(ty, "continuous")) {
+        b <- bounds[[ds]][[col]]
+        if (length(b) != 2 || !is.numeric(b) || !(b[1] < b[2])) {
+          stop(sprintf("%s[%s$%s]: 連続変数の境界が c(lower, upper) になっていません", label, ds, col))
+        }
+      } else {
+        if (!identical(bounds[[ds]][[col]], reference[[ds]][[col]])) {
+          stop(sprintf("%s[%s$%s]: カテゴリ/二値のカテゴリ集合が CLIPPING_BOUNDS と一致しません（型を含めて比較）",
+                       label, ds, col))
+        }
+      }
+    }
+  }
+  invisible(TRUE)
+}
+
+assert_bounds_structure(CLIPPING_BOUNDS_FIXED, label = "CLIPPING_BOUNDS_FIXED")
+assert_bounds_structure(CLIPPING_BOUNDS_WIDE,  label = "CLIPPING_BOUNDS_WIDE")
+
+FIXED_BOUNDS_SOURCES <- read.table(
+  text = paste(
+    "dataset|variable|tier|rule|lower|upper|unit_data|source_value|unit_source|conversion|source_citation|source_url|access_date|obs_ref",
+    "lung|age|4|No eligibility age stated in the source -> uniform rule [18, 110]|18|110|years|18-110|years|None|R survival::lung help page (no eligibility age stated) / Loprinzi et al. J Clin Oncol 1994;12:601-7|https://cran.r-project.org/web/packages/survival/|2026-08-23|No reference",
+    "lung|ph.ecog|1|Domain of the instrument (ECOG PS 0-5)|0|5|score|0-5|score|None|ECOG-ACRIN ECOG Performance Status (public-domain instrument) / original report Oken et al. Am J Clin Oncol 1982;5:649-55|https://ecog-acrin.org/resources/ecog-performance-status/|2026-08-15|No reference",
+    "lung|ph.karno|1|Domain of the instrument (Karnofsky PS 0-100)|0|100|score|0-100|score|None|Karnofsky & Burchenal 1949 (public-domain instrument; reproduced free of charge on the ECOG-ACRIN page)|https://ecog-acrin.org/resources/ecog-performance-status/|2026-08-15|No reference",
+    "lung|pat.karno|1|Domain of the instrument (Karnofsky PS 0-100)|0|100|score|0-100|score|None|Karnofsky & Burchenal 1949 (public-domain instrument; reproduced free of charge on the ECOG-ACRIN page)|https://ecog-acrin.org/resources/ecog-performance-status/|2026-08-15|No reference",
+    "lung|meal.cal|5|Lower 0 (intake is non-negative) / upper = maximum official EER rounded up to the nearest 1000 kcal|0|4000|kcal/day|3720|kcal/day|None|IOM Dietary Reference Intakes, EER (very active men, 3,720 kcal/day) + Dietary Guidelines for Americans 2015-2020, Appendix 2|https://www.dietaryguidelines.gov/|2026-08-15|No reference",
+    "lung|wt.loss|5|Loss side = largest reported 6-month loss rounded to the nearest 50 lb / gain side = about twice the most extreme pharmacological case|-50|100|lb/6 months|32.9 kg (loss) / 11.35 kg (gain)|kg|1 kg = 2.205 lb|Bahadori E, et al. Int J Clin Pract 2022 (gastric bypass, 32.89+/-20.22 kg at 6 months; PMID 36349055, PMC9629942, free full text) / Correll CU, et al. Int J Neuropsychopharmacol 2023 (olanzapine-induced gain, 11.35 kg; PMID 37326421, PMC10388390, free full text) / Hargrove JL, et al. Dyn Med 2008;7:16 (Minnesota Starvation Experiment modelled; PMID 18840293, PMC2596786, free full text) / framing: Fearon K, et al. Lancet Oncol 2011;12:489-495 (PMID 21296615)|https://pmc.ncbi.nlm.nih.gov/articles/PMC9629942/|2026-08-15|No reference",
+    "pbc|age|4|No eligibility age stated in the source -> uniform rule [18, 110]|18|110|years|18-110|years|None|R survival::pbc help page (no eligibility age stated) / Therneau & Grambsch 2000|https://cran.r-project.org/web/packages/survival/|2026-08-23|No reference",
+    "pbc|bili|2|P2b: highest value in a single adult case report, rounded up to one significant digit|0|50|mg/dL|41|mg/dL|None|Raza SM, Faraji M, Khan O, Shaukat R. Cureus 2020;12(3):e7210. doi:10.7759/cureus.7210|https://pmc.ncbi.nlm.nih.gov/articles/PMC7138422/|2026-08-23|No reference",
+    "pbc|chol|2|P2b: highest value in a case report of lipoprotein-X cholestasis, rounded up|0|2000|mg/dL|1730|mg/dL|None|Colantuono R, et al. Front Pediatr 2022;10:969081. doi:10.3389/fped.2022.969081|https://pmc.ncbi.nlm.nih.gov/articles/PMC9386286/|2026-08-23|No reference",
+    "pbc|albumin|2|P3: upper limit of normal for total serum protein (albumin is a fraction of it and cannot exceed it). Reclassified from P1; the bound is unchanged|0|8|g/dL|8|g/dL|None|Clinical Methods 3rd ed., ch.101 Serum Albumin and Globulin (NCBI Bookshelf): 'The normal serum protein level is 6 to 8 g/dl'|https://www.ncbi.nlm.nih.gov/books/NBK204/|2026-08-23|No reference",
+    "pbc|copper|2|P2a-1: highest observed value reported by the source series, rounded up to one significant digit (Protocol Sec. 2 Tier 2, Clause 2)|0|4000|ug/24h|3080|ug/24h|None (basal 24-h urinary copper; identical unit)|Walshe JM. The pattern of urinary copper excretion and its response to treatment in patients with Wilson's disease. QJM 2011;104(9):775-778. doi:10.1093/qjmed/hcr073. FULL TEXT OBTAINED 2026-08-30 (institutional OUP subscription); the Discussion reports the observed minimum and maximum for all three groups of the 192 Wilson's disease patients: pre-symptomatic 11-550, hepatic 61-3080, neurological 61-782 ug/24h. The adopted value is the largest of the three group maxima (hepatic group, n=37, 3080 ug/24h). The patient with 3080 was in a massive haemolytic crisis and the source states that such a single figure 'will skew the statistics'; that is a caution about the group MEAN, not a denial of eligibility as an attainable upper limit, so the case is NOT excluded (Clause 1: a bound is the highest attainable measured value, not a representative distribution). This supersedes the earlier P2a-3 derivation from the hepatic group mean 465.75 ug/24h, which was adopted only because the abstract alone was available and reported no range. The EASL penicillamine-challenge threshold had been replaced earlier because it is a post-challenge value (Clause 0). Timing evidence: Dickson ER et al. Hepatology 1989;10(1):1-7 (trial data collected at entry; Table 1 urine copper median 73 matches survival::pbc)|https://pubmed.ncbi.nlm.nih.gov/21622540/|2026-08-30|No reference",
+    "pbc|alk.phos|2|P2a-1: upper end of the observed range in a published series (n=382), rounded up|0|20000|U/L|14589|IU/L|1 IU/L = 1 U/L|Shkalim Zemer V, et al. Eur J Pediatr 2023;182(7):3211-3216. doi:10.1007/s00431-023-04995-1 ('range 1002-14,589 IU/L')|https://pmc.ncbi.nlm.nih.gov/articles/PMC10151212/|2026-08-23|No reference",
+    "pbc|ast|2|P3 (Clause 3): threshold delimiting the highest category (massive elevation). Cases exceeding it do exist in the literature|0|10000|U/mL (as labelled in the R help page; actually U/L, since the observed 26.35-457.25 cannot be U/mL)|10000|IU/L|1 IU/L = 1 U/L|StatPearls, Liver Function Tests (NCBI Bookshelf NBK482489): 'Massive elevation: greater than 10,000 IU/L'|https://www.ncbi.nlm.nih.gov/books/NBK482489/|2026-08-23|No reference",
+    "pbc|trig|2|P3 (Clause 3): threshold delimiting the highest category (very severe HTG). Exceeding cases: 10612 mg/dL (PMC6120174) / 10320 mg/dL (PMC6556268)|0|2000|mg/dL|2000|mg/dL|None|Endocrine Society Clinical Practice Guideline (Berglund et al. J Clin Endocrinol Metab 2012;97:2969-89) / Endotext NBK326743|https://www.ncbi.nlm.nih.gov/books/NBK326743/|2026-08-23|No reference",
+    "pbc|platelet|2|P2b: highest value in a single case report|0|6000|x10^9/L|6|x10^6/mm^3|1 x10^6/mm^3 = 1000 x10^9/L|Natelson EA. Tex Heart Inst J 2012;39(6):792-798. PMCID PMC3528235|https://pmc.ncbi.nlm.nih.gov/articles/PMC3528235/|2026-08-23|No reference",
+    "pbc|protime|2|P2b: highest value in a single case report, rounded up|0|200|seconds|>180|seconds|None|Kong MCP, et al. Cureus 2025;17(12):e99159. doi:10.7759/cureus.99159 ('Prothrombin time (s) >180')|https://pmc.ncbi.nlm.nih.gov/articles/PMC12795786/|2026-08-23|No reference",
+    "colon|age|4|No eligibility age stated in the source -> uniform rule [18, 110]|18|110|years|18-110|years|None|R survival::colon help page (no eligibility age stated) / Laurie JA, et al. J Clin Oncol 1989;7:1447-1456 / Moertel CG, et al. N Engl J Med 1990;322(6):352-358|https://cran.r-project.org/web/packages/survival/|2026-08-23|No reference",
+    "colon|nodes|3|Upper truncation value of the registry coding convention (NAACCR #820, code 90)|0|90|count|90|count|None|SEER Program Coding and Staging Manual 2025, Regional Nodes Positive (NAACCR #820, p.197): '90 or more nodes are positive'|https://seer.cancer.gov/manuals/2025/SPCSM_2025_MainDoc.pdf|2026-08-15|No reference",
+    "rotterdam|age|4|No eligibility age stated in the source -> uniform rule [18, 110]|18|110|years|18-110|years|None|R survival::rotterdam help page (no eligibility age stated) / Royston & Altman 2013|https://cran.r-project.org/web/packages/survival/|2026-08-23|No reference",
+    "rotterdam|nodes|3|Upper truncation value of the registry coding convention (NAACCR #820, code 90)|0|90|count|90|count|None|SEER Program Coding and Staging Manual 2025, Regional Nodes Positive (NAACCR #820, p.197)|https://seer.cancer.gov/manuals/2025/SPCSM_2025_MainDoc.pdf|2026-08-15|No reference",
+    "rotterdam|pgr|5|Lower 0 (receptor concentration is non-negative) / upper = about twice the maximum of an external series|0|2000|fmol/mg|1000-1102|fmol/mg|None|Iqbal MJ, et al. Br J Cancer 1986;54:445-449 (upper 1102 fmol/mg; PMID 3756080, PMC2001611, free full text) / Pichon MF, et al. Br J Cancer 1996;73:1545-1551 (2,257 cases, 'up to 1000 fmol/mg'; PMID 8664127, PMC2074541, free full text) / corroborating Bezwoda WR, et al. Cancer 1991;68:867-872 (415 advanced breast cancers, range 3-1000 fmol/mg; PMID 1855186; subscription) / corroborating Navarro D, et al. J Steroid Biochem 1989;34:491-498 (uterine fibroids, 805-2000 fmol/mg; PMID 2626044; subscription)|https://pmc.ncbi.nlm.nih.gov/articles/PMC2001611/|2026-08-15|No reference",
+    "rotterdam|er|5|Same rule as pgr, the assay being the same type of ligand-binding method|0|2000|fmol/mg|1000-1102|fmol/mg|None|Iqbal MJ, et al. Br J Cancer 1986;54:445-449 (PMID 3756080, PMC2001611, free full text) / Pichon MF, et al. Br J Cancer 1996;73:1545-1551 (PMID 8664127, PMC2074541, free full text) / corroborating Bezwoda WR, et al. Cancer 1991;68:867-872 (PMID 1855186; subscription) / corroborating Navarro D, et al. J Steroid Biochem 1989;34:491-498 (PMID 2626044; subscription)|https://pmc.ncbi.nlm.nih.gov/articles/PMC2001611/|2026-08-15|No reference",
+    "flchain|age|4|Lower limit from the eligibility criterion (aged 50 or greater); the side not given by the source takes the uniform-rule upper limit 110|50|110|years|50|years|None|R survival::flchain help page: 'residents of Olmsted County aged 50 or greater' / Dispenzieri A, et al. Mayo Clin Proc 2012;87(6):517-523 (PMID 22677072, PMC3538473, free full text)|https://pmc.ncbi.nlm.nih.gov/articles/PMC3538473/|2026-08-23|No reference",
+    "flchain|sample.yr|5|First and last year of the published study metadata (recruitment period), adopted as they stand|1995|2003|calendar year|1995-03-13 to 2003-11-21|date|Truncated to the year|Dispenzieri A, et al. Mayo Clin Proc 2012;87(6):517-523 (PMID 22677072, PMC3538473, free full text): 'Baseline information was obtained between March 13, 1995, and November 21, 2003'|https://pmc.ncbi.nlm.nih.gov/articles/PMC3538473/|2026-08-23|No reference",
+    "flchain|kappa|2|P2a-2: upper limit of the reference interval for the target subpopulation (ESRD on haemodialysis). The extreme values of monoclonal FLC are not adopted, under Clause 4 (the definition of the variable designates a subset): this variable is the nonclonal free light chain, which is the very title of the primary source. Supporting fact: the source, Pena et al. 2024, screened all 142 patients and excluded the 5 monoclonal cases|0|30|mg/dL|281.8|mg/L|1 mg/dL = 10 mg/L (28.18 mg/dL)|Pena C, Valjalo R, Perez R, et al. Haematologica 2024;109(11):3751-3754. doi:10.3324/haematol.2024.285093|https://pmc.ncbi.nlm.nih.gov/articles/PMC11532703/|2026-08-23|No reference",
+    "flchain|lambda|2|P2a-2: as above (same rule and same source as kappa)|0|40|mg/dL|312.6|mg/L|1 mg/dL = 10 mg/L (31.26 mg/dL)|Pena C, Valjalo R, Perez R, et al. Haematologica 2024;109(11):3751-3754. doi:10.3324/haematol.2024.285093|https://pmc.ncbi.nlm.nih.gov/articles/PMC11532703/|2026-08-23|No reference",
+    "flchain|creatinine|2|P2b: highest value in a single case report, rounded up|0|80|mg/dL|73.8|mg/dL|None|Persaud C, Sandesara U, Hoang V, Tate J, Latack W, Dado D. Highest Recorded Serum Creatinine. Case Rep Nephrol 2021;2021:6048919. doi:10.1155/2021/6048919|https://pmc.ncbi.nlm.nih.gov/articles/PMC8531789/|2026-08-23|No reference",
+    sep = "\n"),
+  sep = "|", header = TRUE, quote = "", comment.char = "",
+  stringsAsFactors = FALSE, fileEncoding = "UTF-8"
+)
+
+local({
+  cont <- do.call(rbind, lapply(names(COVARIATE_TYPES), function(ds) {
+    ty <- COVARIATE_TYPES[[ds]]
+    cols <- names(ty)[vapply(ty, identical, logical(1), "continuous")]
+    if (!length(cols)) return(NULL)
+    data.frame(dataset = ds, variable = cols, stringsAsFactors = FALSE)
+  }))
+  key_src <- paste(FIXED_BOUNDS_SOURCES$dataset, FIXED_BOUNDS_SOURCES$variable)
+  key_cnt <- paste(cont$dataset, cont$variable)
+  if (!setequal(key_src, key_cnt)) {
+    stop(sprintf("FIXED_BOUNDS_SOURCES と連続変数集合が一致しません（欠落: %s / 余分: %s）",
+                 paste(setdiff(key_cnt, key_src), collapse = ", "),
+                 paste(setdiff(key_src, key_cnt), collapse = ", ")))
+  }
+  bad_rule <- grepl("第 ?0 条", FIXED_BOUNDS_SOURCES$rule)
+  if (any(bad_rule)) {
+    stop(sprintf("FIXED_BOUNDS_SOURCES の rule 列に条項名「第 0 条」が含まれています（%s）。rule 列は tabS9 と実験 G の一次記録に印字されるため、現行の条項で書くこと",
+                 paste(paste(FIXED_BOUNDS_SOURCES$dataset[bad_rule],
+                             FIXED_BOUNDS_SOURCES$variable[bad_rule]), collapse = ", ")))
+  }
+  for (i in seq_len(nrow(FIXED_BOUNDS_SOURCES))) {
+    r <- FIXED_BOUNDS_SOURCES[i, ]
+    b <- CLIPPING_BOUNDS_FIXED[[r$dataset]][[r$variable]]
+    if (!isTRUE(all.equal(as.numeric(b), c(r$lower, r$upper)))) {
+      stop(sprintf("FIXED_BOUNDS_SOURCES[%s$%s] の境界が CLIPPING_BOUNDS_FIXED と食い違います（表 %g-%g / 定数 %g-%g）",
+                   r$dataset, r$variable, r$lower, r$upper, b[1], b[2]))
+    }
+  }
+  invisible(TRUE)
+})
+
+TIER2_SOURCE_VALUE_CONVERTED <- c(
+  "pbc bili"           = 41,
+  "pbc chol"           = 1730,
+  "pbc albumin"        = 8,
+  "pbc copper"         = 3080,
+  "pbc alk.phos"       = 14589,
+  "pbc ast"            = 10000,
+  "pbc trig"           = 2000,
+  "pbc platelet"       = 6 * 1000,
+  "pbc protime"        = 180,
+  "flchain kappa"      = 281.8 / 10,
+  "flchain lambda"     = 312.6 / 10,
+  "flchain creatinine" = 73.8
+)
+
+ceil_1sig <- function(x) {
+  stopifnot(all(x > 0))
+  f <- 10^floor(log10(x))
+  ceiling(x / f) * f
+}
+
+TIER2_P2A3_MULTIPLIER <- c()
+
+local({
+  t2 <- FIXED_BOUNDS_SOURCES[FIXED_BOUNDS_SOURCES$tier == 2, ]
+  key <- paste(t2$dataset, t2$variable)
+  if (!setequal(key, names(TIER2_SOURCE_VALUE_CONVERTED))) {
+    stop(sprintf("TIER2_SOURCE_VALUE_CONVERTED と Tier 2 の変数集合が一致しません（欠落: %s / 余分: %s）",
+                 paste(setdiff(key, names(TIER2_SOURCE_VALUE_CONVERTED)), collapse = ", "),
+                 paste(setdiff(names(TIER2_SOURCE_VALUE_CONVERTED), key), collapse = ", ")))
+  }
+  if (!all(names(TIER2_P2A3_MULTIPLIER) %in% key)) {
+    stop("TIER2_P2A3_MULTIPLIER に Tier 2 でない変数が含まれています")
+  }
+  for (i in seq_len(nrow(t2))) {
+    k   <- key[i]
+    mult <- if (k %in% names(TIER2_P2A3_MULTIPLIER)) TIER2_P2A3_MULTIPLIER[[k]] else 1
+    exp_upper <- ceil_1sig(TIER2_SOURCE_VALUE_CONVERTED[[k]]) * mult
+    if (!isTRUE(all.equal(exp_upper, t2$upper[i]))) {
+      stop(sprintf("丸め規則違反 [%s]: 換算後の出典値 %g を有効数字 1 桁に切り上げ %s と、採用境界の上限 %g が一致しません（規約 §2 Tier 2）",
+                   k, TIER2_SOURCE_VALUE_CONVERTED[[k]],
+                   if (mult == 1) sprintf("た %g", exp_upper) else sprintf("て %g 倍した %g", mult, exp_upper),
+                   t2$upper[i]))
+    }
+    if (!isTRUE(all.equal(0, t2$lower[i]))) {
+      stop(sprintf("共通規則違反 [%s]: Tier 2 の下限は 0 でなければならない（実際 %g）", k, t2$lower[i]))
+    }
+  }
+  invisible(TRUE)
+})

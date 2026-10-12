@@ -1,0 +1,761 @@
+---
+title: "データ準備"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.path = "figures/"
+)
+set.seed(42)
+```
+
+```{r load-packages}
+library(survival)
+library(survminer)
+library(tidyverse)
+library(arrow)
+library(openxlsx)
+library(knitr)
+```
+
+```{r load-data}
+data(lung, package = "survival")
+data(pbc, package = "survival")
+data(colon, package = "survival")
+
+cat(sprintf("lung:  N=%d, variables=%d\n", nrow(lung), ncol(lung)))
+cat(sprintf("pbc:   N=%d, variables=%d\n", nrow(pbc), ncol(pbc)))
+cat(sprintf("colon: N=%d, variables=%d\n", nrow(colon), ncol(colon)))
+```
+
+```{r export-raw}
+raw_dir <- "/home/rstudio/project/data/raw"
+dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
+
+write_csv(lung, file.path(raw_dir, "lung_raw.csv"))
+write_csv(pbc, file.path(raw_dir, "pbc_raw.csv"))
+write_csv(colon, file.path(raw_dir, "colon_raw.csv"))
+
+cat("Raw data exported to:", raw_dir, "\n")
+```
+
+```{r lung-missing}
+lung_covariates <- c("time", "status", "age", "sex", "ph.ecog",
+                     "ph.karno", "pat.karno", "meal.cal", "wt.loss")
+lung_sub <- lung[, lung_covariates]
+
+missing_count <- colSums(is.na(lung_sub))
+missing_pct <- round(missing_count / nrow(lung_sub) * 100, 1)
+lung_missing_tbl <- data.frame(
+  variable = names(missing_count),
+  n_missing = missing_count,
+  pct_missing = missing_pct
+)
+kable(lung_missing_tbl, caption = "lung: 欠損値集計", row.names = FALSE)
+```
+
+```{r lung-missing-heatmap, fig.height=4}
+lung_na_mat <- is.na(lung_sub) * 1
+lung_na_df <- lung_na_mat %>%
+  as.data.frame() %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "variable", values_to = "is_missing")
+
+ggplot(lung_na_df, aes(x = variable, y = row_id, fill = factor(is_missing))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "grey90", "1" = "#E64B35"),
+                    labels = c("0" = "Observed", "1" = "Missing")) +
+  labs(title = "lung: 欠損値パターン", x = NULL, y = "行番号", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r lung-distributions, fig.height=8}
+lung_cont <- lung_sub %>%
+  select(age, ph.karno, pat.karno, meal.cal, wt.loss) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+ggplot(lung_cont, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#4DBBD5", color = "white", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  labs(title = "lung: 連続共変量の分布") +
+  theme_minimal()
+```
+
+```{r lung-categorical, fig.height=4}
+lung_cat <- lung_sub %>%
+  select(sex, ph.ecog) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value))
+
+ggplot(lung_cat, aes(x = factor(value))) +
+  geom_bar(fill = "#3C5488", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(title = "lung: カテゴリカル共変量の分布", x = NULL, y = "度数") +
+  theme_minimal()
+```
+
+```{r lung-survival-dist}
+cat(sprintf("lung 生存時間: mean=%.1f, median=%.1f, range=[%d, %d]\n",
+            mean(lung$time), median(lung$time), min(lung$time), max(lung$time)))
+cat(sprintf("イベント率 (status==2): %.1f%% (%d/%d)\n",
+            sum(lung$status == 2) / nrow(lung) * 100,
+            sum(lung$status == 2), nrow(lung)))
+```
+
+```{r lung-time-hist, fig.height=4}
+ggplot(lung, aes(x = time, fill = factor(status))) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("1" = "#4DBBD5", "2" = "#E64B35"),
+                    labels = c("1" = "Censored", "2" = "Dead")) +
+  labs(title = "lung: 生存時間の分布", x = "Time (days)", y = "Count", fill = "Status") +
+  theme_minimal()
+```
+
+```{r lung-km, fig.height=5}
+lung_km <- lung %>% mutate(event = status - 1)
+km_lung <- survfit(Surv(time, event) ~ 1, data = lung_km)
+ggsurvplot(km_lung, data = lung_km,
+           title = "lung: Kaplan-Meier 曲線",
+           xlab = "Time (days)", ylab = "Survival Probability",
+           risk.table = TRUE, conf.int = TRUE,
+           palette = "#3C5488")
+```
+
+```{r pbc-missing}
+pbc_covariates <- c("time", "status", "age", "sex", "trt", "ascites", "hepato",
+                    "spiders", "edema", "bili", "chol", "albumin", "copper",
+                    "alk.phos", "ast", "trig", "platelet", "protime", "stage")
+pbc_sub <- pbc[, pbc_covariates]
+
+missing_count_pbc <- colSums(is.na(pbc_sub))
+missing_pct_pbc <- round(missing_count_pbc / nrow(pbc_sub) * 100, 1)
+pbc_missing_tbl <- data.frame(
+  variable = names(missing_count_pbc),
+  n_missing = missing_count_pbc,
+  pct_missing = missing_pct_pbc
+)
+kable(pbc_missing_tbl, caption = "pbc: 欠損値集計", row.names = FALSE)
+```
+
+```{r pbc-missing-heatmap, fig.height=5}
+pbc_na_mat <- is.na(pbc_sub) * 1
+pbc_na_df <- pbc_na_mat %>%
+  as.data.frame() %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "variable", values_to = "is_missing")
+
+ggplot(pbc_na_df, aes(x = variable, y = row_id, fill = factor(is_missing))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "grey90", "1" = "#E64B35"),
+                    labels = c("0" = "Observed", "1" = "Missing")) +
+  labs(title = "pbc: 欠損値パターン", x = NULL, y = "行番号", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r pbc-distributions, fig.height=10}
+pbc_cont_vars <- c("age", "bili", "chol", "albumin", "copper",
+                   "alk.phos", "ast", "trig", "platelet", "protime")
+pbc_cont <- pbc_sub %>%
+  select(all_of(pbc_cont_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+ggplot(pbc_cont, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#4DBBD5", color = "white", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(title = "pbc: 連続共変量の分布") +
+  theme_minimal()
+```
+
+```{r pbc-categorical, fig.height=6}
+pbc_cat_vars <- c("sex", "trt", "ascites", "hepato", "spiders", "edema", "stage")
+pbc_cat <- pbc_sub %>%
+  select(all_of(pbc_cat_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value))
+
+ggplot(pbc_cat, aes(x = value)) +
+  geom_bar(fill = "#3C5488", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(title = "pbc: カテゴリカル共変量の分布", x = NULL, y = "度数") +
+  theme_minimal()
+```
+
+```{r pbc-survival-dist}
+cat(sprintf("pbc 生存時間: mean=%.1f, median=%.1f, range=[%d, %d]\n",
+            mean(pbc$time), median(pbc$time), min(pbc$time), max(pbc$time)))
+cat(sprintf("status=0 (censored): %d, status=1 (transplant): %d, status=2 (dead): %d\n",
+            sum(pbc$status == 0), sum(pbc$status == 1), sum(pbc$status == 2)))
+```
+
+```{r pbc-time-hist, fig.height=4}
+ggplot(pbc, aes(x = time, fill = factor(status))) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("0" = "#4DBBD5", "1" = "#F39B7F", "2" = "#E64B35"),
+                    labels = c("0" = "Censored", "1" = "Transplant", "2" = "Dead")) +
+  labs(title = "pbc: 生存時間の分布", x = "Time (days)", y = "Count", fill = "Status") +
+  theme_minimal()
+```
+
+```{r pbc-km, fig.height=5}
+pbc_km <- pbc %>% mutate(event = as.integer(status == 2))
+km_pbc <- survfit(Surv(time, event) ~ 1, data = pbc_km)
+ggsurvplot(km_pbc, data = pbc_km,
+           title = "pbc: Kaplan-Meier 曲線 (event = death)",
+           xlab = "Time (days)", ylab = "Survival Probability",
+           risk.table = TRUE, conf.int = TRUE,
+           palette = "#3C5488")
+```
+
+```{r colon-missing}
+colon_covariates <- c("time", "status", "sex", "age", "obstruct", "perfor",
+                      "adhere", "nodes", "differ", "extent", "surg",
+                      "node4", "rx", "etype")
+colon_sub <- colon[, colon_covariates]
+
+missing_count_colon <- colSums(is.na(colon_sub))
+missing_pct_colon <- round(missing_count_colon / nrow(colon_sub) * 100, 1)
+colon_missing_tbl <- data.frame(
+  variable = names(missing_count_colon),
+  n_missing = missing_count_colon,
+  pct_missing = missing_pct_colon
+)
+kable(colon_missing_tbl, caption = "colon: 欠損値集計", row.names = FALSE)
+```
+
+```{r colon-missing-heatmap, fig.height=5}
+colon_na_mat <- is.na(colon_sub) * 1
+colon_na_df <- colon_na_mat %>%
+  as.data.frame() %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "variable", values_to = "is_missing")
+
+ggplot(colon_na_df, aes(x = variable, y = row_id, fill = factor(is_missing))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "grey90", "1" = "#E64B35"),
+                    labels = c("0" = "Observed", "1" = "Missing")) +
+  labs(title = "colon: 欠損値パターン", x = NULL, y = "行番号", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r colon-distributions, fig.height=4}
+colon_recur <- colon %>% filter(etype == 1)
+
+colon_cont <- colon_recur %>%
+  select(age, nodes) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+ggplot(colon_cont, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#4DBBD5", color = "white", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  labs(title = "colon (etype==1): 連続共変量の分布") +
+  theme_minimal()
+```
+
+```{r colon-categorical, fig.height=8}
+colon_cat_vars <- c("sex", "obstruct", "perfor", "adhere", "differ",
+                    "extent", "surg", "node4", "rx")
+colon_cat <- colon_recur %>%
+  select(all_of(colon_cat_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value))
+
+ggplot(colon_cat, aes(x = value)) +
+  geom_bar(fill = "#3C5488", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(title = "colon (etype==1): カテゴリカル共変量の分布", x = NULL, y = "度数") +
+  theme_minimal()
+```
+
+```{r colon-survival-dist}
+cat(sprintf("colon (etype==1) 生存時間: mean=%.1f, median=%.1f, range=[%d, %d]\n",
+            mean(colon_recur$time), median(colon_recur$time),
+            min(colon_recur$time), max(colon_recur$time)))
+cat(sprintf("イベント率 (status==1): %.1f%% (%d/%d)\n",
+            sum(colon_recur$status == 1) / nrow(colon_recur) * 100,
+            sum(colon_recur$status == 1), nrow(colon_recur)))
+```
+
+```{r colon-time-hist, fig.height=4}
+ggplot(colon_recur, aes(x = time, fill = factor(status))) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("0" = "#4DBBD5", "1" = "#E64B35"),
+                    labels = c("0" = "Censored", "1" = "Recurrence")) +
+  labs(title = "colon (etype==1): 生存時間の分布",
+       x = "Time (days)", y = "Count", fill = "Status") +
+  theme_minimal()
+```
+
+```{r colon-km, fig.height=5}
+km_colon <- survfit(Surv(time, status) ~ 1, data = colon_recur)
+ggsurvplot(km_colon, data = colon_recur,
+           title = "colon (etype==1): Kaplan-Meier 曲線",
+           xlab = "Time (days)", ylab = "Survival Probability",
+           risk.table = TRUE, conf.int = TRUE,
+           palette = "#3C5488")
+```
+
+```{r lung-preprocessing}
+lung_vars <- c("time", "status", "age", "sex", "ph.ecog",
+               "ph.karno", "pat.karno", "meal.cal", "wt.loss")
+lung_raw <- lung[, lung_vars]
+
+n_before_lung <- nrow(lung_raw)
+events_before_lung <- sum(lung_raw$status == 2)
+
+lung_prepared <- lung_raw %>%
+  drop_na() %>%
+  mutate(status = status - 1L)
+
+n_after_lung <- nrow(lung_prepared)
+events_after_lung <- sum(lung_prepared$status == 1)
+n_excluded_lung <- n_before_lung - n_after_lung
+
+cat(sprintf("lung 前処理:\n"))
+cat(sprintf("  除外前: N=%d, events=%d\n", n_before_lung, events_before_lung))
+cat(sprintf("  除外後: N=%d, events=%d\n", n_after_lung, events_after_lung))
+cat(sprintf("  除外行数: %d\n", n_excluded_lung))
+```
+
+```{r lung-verify}
+stopifnot(all(lung_prepared$status %in% c(0, 1)))
+stopifnot(sum(is.na(lung_prepared)) == 0)
+cat("lung: status 0/1 check PASS, no missing values\n")
+summary(lung_prepared)
+```
+
+```{r pbc-preprocessing}
+n_before_pbc <- nrow(pbc)
+events_before_pbc <- sum(pbc$status == 2)
+
+pbc_prepared <- pbc %>%
+  select(all_of(c("time", "status", "age", "sex", "trt", "ascites", "hepato",
+                  "spiders", "edema", "bili", "chol", "albumin", "copper",
+                  "alk.phos", "ast", "trig", "platelet", "protime", "stage"))) %>%
+  filter(!is.na(trt)) %>%
+  mutate(status = as.integer(status == 2))
+
+n_after_pbc <- nrow(pbc_prepared)
+events_after_pbc <- sum(pbc_prepared$status == 1)
+n_excluded_pbc <- n_before_pbc - n_after_pbc
+
+cat(sprintf("pbc 前処理:\n"))
+cat(sprintf("  除外前: N=%d, events(status==2)=%d\n", n_before_pbc, events_before_pbc))
+cat(sprintf("  除外後: N=%d, events=%d\n", n_after_pbc, events_after_pbc))
+cat(sprintf("  除外行数: %d (trt=NAの非ランダム化患者)\n", n_excluded_pbc))
+```
+
+```{r pbc-imputation}
+pbc_na_before <- colSums(is.na(pbc_prepared))
+cat("=== pbc 補完前の欠損 ===\n")
+print(pbc_na_before[pbc_na_before > 0])
+
+pbc_impute_vars <- c("chol", "copper", "trig", "platelet")
+pbc_impute_values <- list()
+
+for (var in pbc_impute_vars) {
+  med_val <- median(pbc_prepared[[var]], na.rm = TRUE)
+  n_imputed <- sum(is.na(pbc_prepared[[var]]))
+  pbc_prepared[[var]][is.na(pbc_prepared[[var]])] <- med_val
+  pbc_impute_values[[var]] <- list(method = "median", value = med_val, n = n_imputed)
+  cat(sprintf("  %s: median=%.1f, imputed %d values\n", var, med_val, n_imputed))
+}
+
+cat(sprintf("\npbc 補完後: 完全症例 %d/%d\n",
+            sum(complete.cases(pbc_prepared)), nrow(pbc_prepared)))
+```
+
+```{r pbc-verify}
+stopifnot(all(pbc_prepared$status %in% c(0, 1)))
+stopifnot(sum(is.na(pbc_prepared$trt)) == 0)
+stopifnot(sum(is.na(pbc_prepared)) == 0)
+cat("pbc: status 0/1 check PASS, no missing values\n")
+```
+
+```{r colon-preprocessing}
+n_before_colon <- nrow(colon)
+
+colon_prepared <- colon %>%
+  filter(etype == 1) %>%
+  select(all_of(c("time", "status", "sex", "age", "obstruct", "perfor",
+                  "adhere", "nodes", "differ", "extent", "surg",
+                  "node4", "rx")))
+
+n_after_colon <- nrow(colon_prepared)
+events_after_colon <- sum(colon_prepared$status == 1)
+
+cat(sprintf("colon 前処理:\n"))
+cat(sprintf("  全レコード: N=%d\n", n_before_colon))
+cat(sprintf("  etype==1 サブセット後: N=%d, events=%d\n",
+            n_after_colon, events_after_colon))
+```
+
+```{r colon-imputation}
+colon_na_before <- colSums(is.na(colon_prepared))
+cat("=== colon 補完前の欠損 ===\n")
+print(colon_na_before[colon_na_before > 0])
+
+colon_impute_values <- list()
+
+med_nodes <- median(colon_prepared$nodes, na.rm = TRUE)
+n_imp_nodes <- sum(is.na(colon_prepared$nodes))
+colon_prepared$nodes[is.na(colon_prepared$nodes)] <- med_nodes
+colon_impute_values[["nodes"]] <- list(method = "median", value = med_nodes, n = n_imp_nodes)
+cat(sprintf("  nodes: median=%.1f, imputed %d values\n", med_nodes, n_imp_nodes))
+
+mode_differ <- as.integer(names(sort(table(colon_prepared$differ), decreasing = TRUE))[1])
+n_imp_differ <- sum(is.na(colon_prepared$differ))
+colon_prepared$differ[is.na(colon_prepared$differ)] <- mode_differ
+colon_impute_values[["differ"]] <- list(method = "mode", value = mode_differ, n = n_imp_differ)
+cat(sprintf("  differ: mode=%d, imputed %d values\n", mode_differ, n_imp_differ))
+
+cat(sprintf("\ncolon 補完後: 完全症例 %d/%d\n",
+            sum(complete.cases(colon_prepared)), nrow(colon_prepared)))
+```
+
+```{r colon-verify}
+stopifnot(all(colon_prepared$status %in% c(0, 1)))
+stopifnot(sum(is.na(colon_prepared)) == 0)
+cat("colon: status 0/1 check PASS, no missing values\n")
+```
+
+```{r rotterdam-prep}
+rot <- survival::rotterdam
+
+rotterdam_prepared <- rot[, c("age", "meno", "size", "grade", "nodes",
+                              "pgr", "er", "hormon", "chemo", "rtime", "recur")]
+names(rotterdam_prepared)[names(rotterdam_prepared) == "rtime"] <- "time"
+names(rotterdam_prepared)[names(rotterdam_prepared) == "recur"] <- "status"
+
+rotterdam_prepared$size <- as.character(rotterdam_prepared$size)
+
+n_after_rot <- nrow(rotterdam_prepared)
+events_after_rot <- sum(rotterdam_prepared$status)
+
+cat(sprintf("rotterdam: N=%d, events=%d, covariates=%d\n",
+            n_after_rot, events_after_rot, ncol(rotterdam_prepared) - 2))
+cat(sprintf("rotterdam: 欠損値=%d\n", sum(is.na(rotterdam_prepared))))
+
+stopifnot(all(rotterdam_prepared$status %in% c(0, 1)))
+stopifnot(sum(is.na(rotterdam_prepared)) == 0)
+cat("rotterdam: status 0/1 check PASS, no missing values\n")
+```
+
+```{r flchain-prep}
+fl <- survival::flchain
+
+flchain_prepared <- fl[, c("age", "sex", "sample.yr", "kappa", "lambda",
+                            "creatinine", "mgus", "futime", "death")]
+names(flchain_prepared)[names(flchain_prepared) == "futime"] <- "time"
+names(flchain_prepared)[names(flchain_prepared) == "death"] <- "status"
+
+flchain_prepared$sex <- as.character(flchain_prepared$sex)
+
+n_before_fl <- nrow(flchain_prepared)
+n_missing_fl <- sum(!complete.cases(flchain_prepared))
+
+flchain_prepared <- flchain_prepared[complete.cases(flchain_prepared), ]
+
+n_after_fl <- nrow(flchain_prepared)
+events_after_fl <- sum(flchain_prepared$status)
+
+cat(sprintf("flchain: N=%d → %d (CCA, %d行除外), events=%d, covariates=%d\n",
+            n_before_fl, n_after_fl, n_missing_fl,
+            events_after_fl, ncol(flchain_prepared) - 2))
+cat(sprintf("flchain: 欠損値=%d\n", sum(is.na(flchain_prepared))))
+
+stopifnot(all(flchain_prepared$status %in% c(0, 1)))
+stopifnot(sum(is.na(flchain_prepared)) == 0)
+cat("flchain: status 0/1 check PASS, no missing values\n")
+```
+
+```{r clipping-bounds}
+CLIPPING_BOUNDS <- list(
+  lung = list(
+    age       = c(39, 82),
+    sex       = c(1, 2),
+    ph.ecog   = c(0, 3),
+    ph.karno  = c(50, 100),
+    pat.karno = c(30, 100),
+    meal.cal  = c(96, 2600),
+    wt.loss   = c(-24, 68)
+  ),
+  pbc = list(
+    age      = c(26.28, 78.44),
+    sex      = c("f", "m"),
+    trt      = c(1, 2),
+    ascites  = c(0, 1),
+    hepato   = c(0, 1),
+    spiders  = c(0, 1),
+    edema    = c(0, 0.5, 1),
+    bili     = c(0.3, 28),
+    chol     = c(120, 1775),
+    albumin  = c(1.96, 4.64),
+    copper   = c(4, 588),
+    alk.phos = c(289, 13862.4),
+    ast      = c(26.35, 457.25),
+    trig     = c(33, 598),
+    platelet = c(62, 563),
+    protime  = c(9, 17.1),
+    stage    = c(1, 2, 3, 4)
+  ),
+  colon = list(
+    sex      = c(0, 1),
+    age      = c(18, 85),
+    obstruct = c(0, 1),
+    perfor   = c(0, 1),
+    adhere   = c(0, 1),
+    nodes    = c(0, 33),
+    differ   = c(1, 2, 3),
+    extent   = c(1, 2, 3, 4),
+    surg     = c(0, 1),
+    node4    = c(0, 1),
+    rx       = c("Obs", "Lev", "Lev+5FU")
+  ),
+  rotterdam = list(
+    age    = c(24, 90),
+    meno   = c(0, 1),
+    size   = c("<=20", "20-50", ">50"),
+    grade  = c(2, 3),
+    nodes  = c(0, 34),
+    pgr    = c(0, 5004),
+    er     = c(0, 3275),
+    hormon = c(0, 1),
+    chemo  = c(0, 1)
+  ),
+  flchain = list(
+    age        = c(50, 101),
+    sex        = c("F", "M"),
+    sample.yr  = c(1995, 2003),
+    kappa      = c(0.01, 20.50),
+    lambda     = c(0.04, 26.60),
+    creatinine = c(0.4, 10.8),
+    mgus       = c(0, 1)
+  )
+)
+
+T_MAX <- list(
+  lung      = 1022,
+  pbc       = 4556,
+  colon     = 3329,
+  rotterdam = 7043,
+  flchain   = 5215
+)
+
+cat("=== CLIPPING_BOUNDS ===\n")
+for (ds in names(CLIPPING_BOUNDS)) {
+  cat(sprintf("\n--- %s ---\n", ds))
+  bounds <- CLIPPING_BOUNDS[[ds]]
+  for (var in names(bounds)) {
+    cat(sprintf("  %-10s: [%s, %s]\n", var, bounds[[var]][1], bounds[[var]][2]))
+  }
+}
+cat(sprintf("\n=== T_MAX ===\n"))
+for (ds in names(T_MAX)) {
+  cat(sprintf("  %s: %d\n", ds, T_MAX[[ds]]))
+}
+```
+
+```{r baseline-cox-setup}
+cox_formula_lung <- Surv(time, status) ~ age + sex + ph.ecog + ph.karno +
+  pat.karno + meal.cal + wt.loss
+cox_formula_pbc <- Surv(time, status) ~ age + sex + trt + ascites + hepato +
+  spiders + edema + bili + chol + albumin + copper + alk.phos + ast +
+  trig + platelet + protime + stage
+cox_formula_colon <- Surv(time, status) ~ sex + age + obstruct + perfor +
+  adhere + nodes + differ + extent + surg + node4 + rx
+cox_formula_rotterdam <- Surv(time, status) ~ age + meno + size + grade +
+  nodes + pgr + er + hormon + chemo
+cox_formula_flchain <- Surv(time, status) ~ age + sex + sample.yr + kappa +
+  lambda + creatinine + mgus
+```
+
+```{r cox-lung}
+cox_lung <- coxph(cox_formula_lung, data = lung_prepared)
+summary_lung <- summary(cox_lung)
+cat(sprintf("lung C-index: %.4f (se=%.4f)\n",
+            summary_lung$concordance["C"], summary_lung$concordance["se(C)"]))
+print(summary_lung)
+```
+
+```{r cox-pbc}
+cox_pbc <- coxph(cox_formula_pbc, data = pbc_prepared)
+summary_pbc <- summary(cox_pbc)
+cat(sprintf("pbc C-index: %.4f (se=%.4f)\n",
+            summary_pbc$concordance["C"], summary_pbc$concordance["se(C)"]))
+print(summary_pbc)
+```
+
+```{r cox-colon}
+cox_colon <- coxph(cox_formula_colon, data = colon_prepared)
+summary_colon <- summary(cox_colon)
+cat(sprintf("colon C-index: %.4f (se=%.4f)\n",
+            summary_colon$concordance["C"], summary_colon$concordance["se(C)"]))
+print(summary_colon)
+```
+
+```{r cox-rotterdam}
+cox_rotterdam <- coxph(cox_formula_rotterdam, data = rotterdam_prepared)
+summary_rotterdam <- summary(cox_rotterdam)
+cat(sprintf("rotterdam C-index: %.4f (se=%.4f)\n",
+            summary_rotterdam$concordance["C"], summary_rotterdam$concordance["se(C)"]))
+print(summary_rotterdam)
+```
+
+```{r cox-flchain}
+cox_flchain <- coxph(cox_formula_flchain, data = flchain_prepared)
+summary_flchain <- summary(cox_flchain)
+cat(sprintf("flchain C-index: %.4f (se=%.4f)\n",
+            summary_flchain$concordance["C"], summary_flchain$concordance["se(C)"]))
+print(summary_flchain)
+```
+
+```{r baseline-results}
+extract_cox_results <- function(model, dataset_name) {
+  s <- summary(model)
+  coefs <- as.data.frame(s$coefficients)
+  coefs$variable <- rownames(coefs)
+  coefs$dataset <- dataset_name
+  coefs$HR <- coefs[["exp(coef)"]]
+  coefs$beta <- coefs[["coef"]]
+  coefs$se <- coefs[["se(coef)"]]
+  coefs$z <- coefs[["z"]]
+  coefs$p_value <- coefs[["Pr(>|z|)"]]
+  coefs$c_index <- s$concordance["C"]
+  coefs$c_index_se <- s$concordance["se(C)"]
+
+  coefs[, c("dataset", "variable", "beta", "HR", "se", "z", "p_value",
+            "c_index", "c_index_se")]
+}
+
+baseline_results <- bind_rows(
+  extract_cox_results(cox_lung, "lung"),
+  extract_cox_results(cox_pbc, "pbc"),
+  extract_cox_results(cox_colon, "colon"),
+  extract_cox_results(cox_rotterdam, "rotterdam"),
+  extract_cox_results(cox_flchain, "flchain")
+)
+
+kable(baseline_results, digits = 4, caption = "ベースライン Cox 回帰結果")
+```
+
+```{r baseline-c-index-summary}
+c_index_summary <- baseline_results %>%
+  group_by(dataset) %>%
+  summarise(
+    c_index = first(c_index),
+    c_index_se = first(c_index_se),
+    n_significant = sum(p_value < 0.05),
+    n_covariates = n(),
+    .groups = "drop"
+  )
+kable(c_index_summary, digits = 4, caption = "ベースライン C-index サマリー")
+```
+
+```{r save-prepared}
+out_dir <- "/home/rstudio/project/data/01_prepared"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+datasets <- list(
+  lung = lung_prepared,
+  pbc = pbc_prepared,
+  colon = colon_prepared,
+  rotterdam = rotterdam_prepared,
+  flchain = flchain_prepared
+)
+
+for (ds_name in names(datasets)) {
+  ds <- datasets[[ds_name]]
+
+  write_csv(ds, file.path(out_dir, sprintf("%s_prepared.csv", ds_name)))
+  write_parquet(ds, file.path(out_dir, sprintf("%s_prepared.parquet", ds_name)))
+  write.xlsx(ds, file.path(out_dir, sprintf("%s_prepared.xlsx", ds_name)))
+
+  cat(sprintf("%s: saved CSV/Parquet/XLSX (N=%d, cols=%d)\n",
+              ds_name, nrow(ds), ncol(ds)))
+}
+
+write_csv(baseline_results, file.path(out_dir, "baseline_cox_results.csv"))
+cat(sprintf("\nBaseline Cox results saved: %d rows\n", nrow(baseline_results)))
+```
+
+```{r verify-outputs}
+expected_files <- c(
+  "lung_prepared.csv", "lung_prepared.parquet", "lung_prepared.xlsx",
+  "pbc_prepared.csv", "pbc_prepared.parquet", "pbc_prepared.xlsx",
+  "colon_prepared.csv", "colon_prepared.parquet", "colon_prepared.xlsx",
+  "rotterdam_prepared.csv", "rotterdam_prepared.parquet", "rotterdam_prepared.xlsx",
+  "flchain_prepared.csv", "flchain_prepared.parquet", "flchain_prepared.xlsx",
+  "baseline_cox_results.csv"
+)
+raw_files <- c("lung_raw.csv", "pbc_raw.csv", "colon_raw.csv")
+
+cat("=== data/01_prepared/ ===\n")
+for (f in expected_files) {
+  path <- file.path(out_dir, f)
+  exists <- file.exists(path)
+  size <- if (exists) file.info(path)$size else NA
+  cat(sprintf("  [%s] %s (%s bytes)\n",
+              ifelse(exists, "OK", "MISSING"), f,
+              ifelse(is.na(size), "N/A", format(size, big.mark = ","))))
+}
+
+cat("\n=== data/raw/ ===\n")
+for (f in raw_files) {
+  path <- file.path(raw_dir, f)
+  exists <- file.exists(path)
+  size <- if (exists) file.info(path)$size else NA
+  cat(sprintf("  [%s] %s (%s bytes)\n",
+              ifelse(exists, "OK", "MISSING"), f,
+              ifelse(is.na(size), "N/A", format(size, big.mark = ","))))
+}
+```
+
+```{r implementation-summary}
+cat(sprintf("実施日: %s\n", Sys.Date()))
+cat(sprintf("lung:  N=%d, events=%d, 除外行=%d (CCA)\n",
+            n_after_lung, events_after_lung, n_excluded_lung))
+cat(sprintf("pbc:   N=%d, events=%d, 除外行=%d (trt=NA), 中央値補完=%d値\n",
+            n_after_pbc, events_after_pbc, n_excluded_pbc,
+            sum(sapply(pbc_impute_values, function(x) x$n))))
+cat(sprintf("colon: N=%d, events=%d, subset=etype==1, 補完=%d値\n",
+            n_after_colon, events_after_colon,
+            sum(sapply(colon_impute_values, function(x) x$n))))
+cat(sprintf("ベースライン C-index: lung=%.4f, pbc=%.4f, colon=%.4f\n",
+            summary_lung$concordance["C"],
+            summary_pbc$concordance["C"],
+            summary_colon$concordance["C"]))
+cat("\n=== 補完値一覧 ===\n")
+cat("pbc:\n")
+for (v in names(pbc_impute_values)) {
+  iv <- pbc_impute_values[[v]]
+  cat(sprintf("  %s: %s=%.1f (n=%d)\n", v, iv$method, iv$value, iv$n))
+}
+cat("colon:\n")
+for (v in names(colon_impute_values)) {
+  iv <- colon_impute_values[[v]]
+  cat(sprintf("  %s: %s=%s (n=%d)\n", v, iv$method, iv$value, iv$n))
+}
+```
+
+```{r session-info}
+sessionInfo()
+```
+

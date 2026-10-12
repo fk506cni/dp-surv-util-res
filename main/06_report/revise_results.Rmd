@@ -1,0 +1,2187 @@
+---
+title: "Revision Figures and Tables"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    fig_caption: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  out.width = "90%",
+  dpi = 300
+)
+
+library(tidyverse)
+library(knitr)
+options(kableExtra.latex.load_packages = FALSE)
+library(kableExtra)
+library(survival)
+library(scales)
+library(openxlsx)
+library(xtable)
+library(arrow)
+
+source("/home/rstudio/project/main/06_report/R/revise_helpers.R")
+
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+options(knitr.kable.linesep = "")
+```
+
+```{r load-data}
+kpi_summary <- read.csv(file.path(EVAL_DIR, "kpi_summary_reffix.csv"),
+                        stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         epsilon_label = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)))
+
+baseline_all <- read.csv(file.path(PREP_DIR, "baseline_cox_results.csv"),
+                         stringsAsFactors = FALSE)
+```
+
+```{r variable-types}
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R"))
+
+var_types_tbl <- map_dfr(DATASET_ORDER, function(ds) {
+  types <- unlist(COVARIATE_TYPES[[ds]])
+  dat <- read.csv(file.path(PROJECT_DIR, "data/01_prepared",
+                            paste0(ds, "_prepared.csv")),
+                  stringsAsFactors = FALSE)
+  cont_v <- names(types)[types == "continuous"]
+  bin_v  <- names(types)[types == "binary"]
+  cat_v  <- names(types)[types == "categorical"]
+  k_of   <- function(v) length(unique(dat[[v]]))
+
+  stopifnot(
+    length(types) == Q_VALUES[[ds]],
+    length(types) == ncol(dat) - 2L,
+    length(cont_v) + length(bin_v) + length(cat_v) == length(types),
+    all(names(types) %in% names(dat)),
+    all(vapply(bin_v, k_of, integer(1)) == 2L),
+    all(vapply(cat_v, k_of, integer(1)) ==
+        vapply(cat_v, function(v) length(CLIPPING_BOUNDS[[ds]][[v]]), integer(1))),
+    all(vapply(cat_v, function(v) setequal(
+          as.character(unique(dat[[v]])),
+          as.character(CLIPPING_BOUNDS[[ds]][[v]])), logical(1))),
+    all(vapply(bin_v, function(v) setequal(
+          as.character(unique(dat[[v]])), c("0", "1")), logical(1)))
+  )
+
+  tibble(
+    Dataset = ds,
+    N = nrow(dat),
+    q = length(types),
+    Continuous = length(cont_v),
+    Binary = length(bin_v),
+    Categorical = length(cat_v),
+    `Categorical variables (k)` = if (length(cat_v) == 0) "---" else
+      paste0(cat_v, " (", vapply(cat_v, k_of, integer(1)), ")", collapse = ", "),
+    `Cox coef.` = sum(baseline_all$dataset == ds),
+    `K (Phase 3)` = K_VALUES[[ds]]
+  )
+})
+
+save_tbl(var_types_tbl, "tabS5_variable_types", digits = 0,
+        col.names = c("Dataset", "$N$", "$q$", "Continuous", "Binary",
+                       "Categorical", "Categorical variables ($k$)",
+                       "Cox coef.", "$K$ (Phase 3)"))
+
+kable(var_types_tbl,
+      caption = "Covariate type composition by dataset. Continuous variables are perturbed by the Laplace mechanism, binary variables by binary randomized response, and categorical variables by categorical randomized response over $k$ categories. $q$ is the number of covariates, `Cox coef.' the number of estimated Cox coefficients (larger than $q$ where a 3-level factor is dummy-coded), and $K$ the number of discrete-time intervals in Phase 3.",
+      col.names = c("Dataset", "$N$", "$q$", "Continuous", "Binary",
+                     "Categorical", "Categorical variables ($k$)",
+                     "Cox coef.", "$K$ (Phase 3)"),
+      escape = FALSE,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r alpha-load}
+ARM_SUFFIX <- "_reffix"
+stopifnot(ARM_SUFFIX %in% c("", "_reffix"))
+asfx <- function(stem) paste0(stem, ARM_SUFFIX, ".csv")
+
+alpha_summary <- read.csv(file.path(EVAL_DIR, asfx("alpha_sensitivity_summary")),
+                          stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         alpha_key = sprintf("%.2f", alpha))
+
+alpha_denom <- read.csv(file.path(EVAL_DIR, asfx("alpha_sensitivity_denominators")),
+                        stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+alpha_peaks <- read.csv(file.path(EVAL_DIR, asfx("alpha_sensitivity_peaks")),
+                        stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+alpha_peaks_fixed <- read.csv(file.path(EVAL_DIR, asfx("alpha_sensitivity_peaks_fixed_denom")),
+                              stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+INPUT_PHASES <- c("Phase 1", "Phase 2", "Phase 3")
+
+stopifnot(
+  setequal(sprintf("%.2f", unique(alpha_summary$alpha)), names(ALPHA_COLORS)),
+  nrow(alpha_summary) == length(ALPHA_VALUES) * length(DATASET_ORDER) *
+                          length(INPUT_PHASES) * 15L,
+  nrow(alpha_peaks)   == length(ALPHA_VALUES) * length(DATASET_ORDER) * length(INPUT_PHASES),
+  nrow(alpha_denom)   == length(ALPHA_VALUES) * length(DATASET_ORDER) * length(INPUT_PHASES),
+  nrow(alpha_peaks_fixed) ==
+    length(ALPHA_VALUES) * length(DATASET_ORDER) * length(INPUT_PHASES),
+  !anyNA(alpha_summary$mean_fpr), !anyNA(alpha_summary$mean_lsr),
+  all(c("mean_fpr_r4", "mean_lsr_r4") %in% names(alpha_summary)),
+  !anyNA(alpha_summary$mean_fpr_r4), !anyNA(alpha_summary$mean_lsr_r4),
+  max(abs(alpha_summary$mean_fpr_r4 * 1e4 - round(alpha_summary$mean_fpr_r4 * 1e4))) < 1e-6,
+  max(abs(alpha_summary$mean_lsr_r4 * 1e4 - round(alpha_summary$mean_lsr_r4 * 1e4))) < 1e-6,
+  max(abs(alpha_summary$mean_fpr - alpha_summary$mean_fpr_r4)) <= 0.5e-4 + 1e-12,
+  max(abs(alpha_summary$mean_lsr - alpha_summary$mean_lsr_r4)) <= 0.5e-4 + 1e-12,
+  !anyNA(alpha_peaks_fixed$peak_over_alpha),
+  {
+    ref <- alpha_peaks %>% filter(alpha == 0.05) %>%
+      select(dataset, phase, a = peak_fpr) %>%
+      inner_join(alpha_peaks_fixed %>% filter(alpha == 0.05) %>%
+                   select(dataset, phase, b = peak_fpr), by = c("dataset", "phase"))
+    nrow(ref) == length(DATASET_ORDER) * length(INPUT_PHASES) && max(abs(ref$a - ref$b)) == 0
+  }
+)
+
+alpha_src <- file.path(PROJECT_DIR, "main/04_evaluation/alpha_sensitivity.Rmd")
+alpha_csv <- file.path(EVAL_DIR, asfx(paste0("alpha_sensitivity_",
+                                             c("summary", "denominators", "peaks",
+                                               "peaks_fixed_denom", "lsr_detail"))))
+stopifnot(all(file.exists(c(alpha_src, alpha_csv))))
+if (any(file.mtime(alpha_csv) < file.mtime(alpha_src))) {
+  stop("alpha_sensitivity_*.csv is older than main/04_evaluation/alpha_sensitivity.Rmd. ",
+       "Re-knit alpha_sensitivity.Rmd before knitting this document.", call. = FALSE)
+}
+
+save_csv_copy(file.path(EVAL_DIR, asfx("alpha_sensitivity_lsr_detail")), "alpha_sensitivity_lsr_detail")
+alpha_lsr_pub <- read.csv(file.path(OUT_DIR, "alpha_sensitivity_lsr_detail.csv"), stringsAsFactors = FALSE)
+stopifnot(nrow(alpha_lsr_pub) == 3300L, sum(alpha_lsr_pub$alpha == 0.05) == 1140L,
+          identical(names(alpha_lsr_pub),
+                    c("alpha", "dataset", "phase", "epsilon", "variable", "n_sims", "n_lost", "lsr")))
+
+A_swap <- alpha_summary %>%
+  select(alpha_key, dataset, phase, epsilon, mean_fpr) %>%
+  pivot_wider(names_from = alpha_key, values_from = mean_fpr)
+stopifnot(nrow(A_swap) == length(DATASET_ORDER) * length(INPUT_PHASES) * 15L,
+          !anyNA(A_swap$`0.01`), !anyNA(A_swap$`0.05`), !anyNA(A_swap$`0.10`))
+A_drop_01_05 <- sum(A_swap$`0.05` < A_swap$`0.01`)
+A_drop_05_10 <- sum(A_swap$`0.10` < A_swap$`0.05`)
+A_drop_total <- A_drop_01_05 + A_drop_05_10
+A_rows       <- nrow(A_swap)
+
+A_nonmono <- alpha_peaks %>%
+  select(alpha, dataset, phase, peak_fpr) %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>% select(-alpha) %>%
+  pivot_wider(names_from = alpha_key, values_from = peak_fpr) %>%
+  filter(`0.05` < `0.01` | `0.10` < `0.05`)
+A_n_nonmono <- nrow(A_nonmono)
+
+A_med <- function(df, p1_only) {
+  d <- if (p1_only) df %>% filter(phase == "Phase 1") else df
+  d %>% group_by(alpha) %>% summarise(m = median(peak_over_alpha), .groups = "drop") %>%
+    arrange(alpha) %>% pull(m)
+}
+A_med_fixed_45 <- A_med(alpha_peaks_fixed, FALSE)
+A_med_fixed_p1 <- A_med(alpha_peaks_fixed, TRUE)
+A_med_var_45   <- A_med(alpha_peaks, FALSE)
+A_med_var_p1   <- A_med(alpha_peaks, TRUE)
+A_floor <- pmin(A_med_var_45, A_med_fixed_45)
+A_spread_var   <- max(A_med_var_p1)   / min(A_med_var_p1)
+A_spread_fixed <- max(A_med_fixed_p1) / min(A_med_fixed_p1)
+A_n_cond       <- nrow(alpha_peaks)
+A_ratio_min    <- min(alpha_peaks$peak_over_alpha)
+A_ratio_max    <- max(alpha_peaks$peak_over_alpha)
+A_n_over_alpha <- sum(alpha_peaks$peak_fpr > alpha_peaks$alpha)
+stopifnot(A_n_over_alpha == A_n_cond)
+
+a1 <- function(x) sprintf("%.1f", x)
+a2 <- function(x) sprintf("%.2f", x)
+a1_floor <- function(x) sprintf("%.1f", floor(x * 10 + 1e-9) / 10)
+
+RATIO_FLOOR <- 0.1
+
+alpha_p1 <- alpha_summary %>%
+  filter(phase == "Phase 1", is.finite(epsilon)) %>%
+  mutate(
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    fpr_ratio = mean_fpr / alpha,
+    ratio_clamped = fpr_ratio <= RATIO_FLOOR,
+    fpr_ratio_plot = pmax(fpr_ratio, RATIO_FLOOR)
+  )
+n_ratio_clamped <- sum(alpha_p1$ratio_clamped)
+n_ratio_zero    <- sum(alpha_p1$mean_fpr == 0)
+stopifnot(nrow(alpha_p1) == length(ALPHA_VALUES) * length(DATASET_ORDER) * 14L,
+          n_ratio_zero == 6L,
+          all(alpha_p1$ratio_clamped[alpha_p1$mean_fpr == 0]),
+          n_ratio_clamped >= n_ratio_zero,
+          max(alpha_p1$fpr_ratio) < 60)
+```
+
+```{r fig-alpha-fpr, fig.cap=paste0("False positive rate under Phase 1 (covariate-only local DP) at three significance levels. (A) Mean FPR on a common linear scale, with the nominal level of each alpha drawn as a dashed line. (B) The same curves expressed as a multiple of alpha on a common logarithmic scale, so that the five datasets and the three levels share one axis; the dashed line at 1 marks the nominal level. The axis is floored at ", RATIO_FLOOR, " times the nominal level: ", n_ratio_clamped, " of the ", nrow(alpha_p1), " points lie at or below that floor (", n_ratio_zero, " of them, all at epsilon = 1000, are exactly zero and have no position on a logarithmic axis; the remaining ", n_ratio_clamped - n_ratio_zero, " lie between ", sprintf("%.3f", min(alpha_p1$fpr_ratio[alpha_p1$fpr_ratio > 0])), " and ", sprintf("%.3f", max(alpha_p1$fpr_ratio[alpha_p1$ratio_clamped])), " times the nominal level) and are drawn as hollow symbols on the bottom axis line, that is, above their true value. The inverted-U shape, with a peak at intermediate epsilon, is present at all three levels in all five datasets. Note that the denominator of the FPR - the set of baseline non-significant Cox coefficients - is re-derived at each alpha, so a coefficient can leave the denominator when alpha is relaxed; the mean FPR can therefore decrease when alpha is increased, which is visible where the alpha = 0.10 curve falls below the alpha = 0.05 curve for colon."), fig.width=12, fig.height=8}
+library(patchwork)
+
+eps_scale <- scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                           labels = c("0.1", "1", "10", "100", "1k"))
+
+p_abs <- ggplot(alpha_p1, aes(x = epsilon, y = mean_fpr, color = alpha_key)) +
+  geom_hline(aes(yintercept = alpha, color = alpha_key),
+             linetype = "dashed", linewidth = 0.4, alpha = 0.7, show.legend = FALSE) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.4) +
+  facet_wrap(~ dataset_label, nrow = 1) +
+  eps_scale +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_color_manual(values = ALPHA_COLORS, labels = ALPHA_LABELS) +
+  labs(x = NULL, y = "Mean FPR", color = NULL) +
+  theme_paper()
+
+p_ratio <- ggplot(alpha_p1, aes(x = epsilon, y = fpr_ratio_plot, color = alpha_key)) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+  geom_line(linewidth = 0.7) +
+  geom_point(data = ~ dplyr::filter(.x, !ratio_clamped), size = 1.4) +
+  geom_point(data = ~ dplyr::filter(.x, ratio_clamped), size = 1.4, shape = 1,
+             show.legend = FALSE) +
+  facet_wrap(~ dataset_label, nrow = 1) +
+  eps_scale +
+  scale_y_log10(breaks = c(0.1, 0.5, 1, 5, 25, 50),
+                labels = c("<=0.1", "0.5", "1", "5", "25", "50")) +
+  scale_color_manual(values = ALPHA_COLORS, labels = ALPHA_LABELS) +
+  labs(x = expression(epsilon), y = expression("Mean FPR" / alpha), color = NULL) +
+  theme_paper()
+
+p_alpha_fpr <- (p_abs / p_ratio) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom")
+
+save_fig(p_alpha_fpr, "figS5_fpr_alpha_sensitivity", width = 12, height = 8)
+p_alpha_fpr
+```
+
+```{r alpha-peak-summary}
+peak_p1 <- alpha_peaks %>%
+  filter(phase == "Phase 1") %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>%
+  select(dataset, alpha_key, peak_eps, peak_fpr, peak_over_alpha) %>%
+  pivot_wider(names_from = alpha_key,
+              values_from = c(peak_eps, peak_fpr, peak_over_alpha)) %>%
+  arrange(dataset)
+
+kable(peak_p1,
+      caption = "Phase 1: location and height of the FPR peak at each significance level. `peak\\_eps' is the smallest epsilon attaining the maximum mean FPR over the finite grid; `peak\\_over\\_alpha' is the peak expressed as a multiple of the nominal level.",
+      col.names = c("Dataset",
+                     "$\\varepsilon_{\\text{peak}}$ (0.01)", "$\\varepsilon_{\\text{peak}}$ (0.05)",
+                     "$\\varepsilon_{\\text{peak}}$ (0.10)",
+                     "FPR$_{\\text{peak}}$ (0.01)", "FPR$_{\\text{peak}}$ (0.05)",
+                     "FPR$_{\\text{peak}}$ (0.10)",
+                     "$\\times\\alpha$ (0.01)", "$\\times\\alpha$ (0.05)", "$\\times\\alpha$ (0.10)"),
+      escape = FALSE, digits = 3, booktabs = TRUE, linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r alpha-peak-fixed-denominator}
+median_cmp <- bind_rows(
+  alpha_peaks %>% mutate(Denominator = "Re-derived at each level (as specified)"),
+  alpha_peaks_fixed %>% mutate(Denominator = "Held fixed at the alpha = 0.05 set")
+) %>%
+  mutate(alpha_key = sprintf("%.2f", alpha))
+
+bind_rows(
+  median_cmp %>% mutate(Set = "All 45 conditions"),
+  median_cmp %>% filter(phase == "Phase 1") %>% mutate(Set = "Phase 1 only (15 conditions)")
+) %>%
+  group_by(Set, Denominator, alpha_key) %>%
+  summarise(med = median(peak_over_alpha), .groups = "drop") %>%
+  pivot_wider(names_from = alpha_key, values_from = med) %>%
+  arrange(desc(Set), Denominator) %>%
+  kable(caption = "Median of the peak FPR expressed as a multiple of the nominal level, under the two treatments of the denominator. Re-deriving the denominator at each level is what the experiment specifies and what tabS4 and figS5 report; holding it fixed isolates the effect of moving the decision threshold alone. The two agree at alpha = 0.05 by construction.",
+        col.names = c("Set", "Denominator", "$\\alpha$=0.01", "$\\alpha$=0.05", "$\\alpha$=0.10"),
+        escape = FALSE, digits = 2, booktabs = TRUE, linesep = "") %>%
+  kable_styling(latex_options = c("hold_position"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r alpha-denominators}
+denom_wide <- alpha_denom %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>%
+  select(dataset, phase, alpha_key, n_sig_coef, n_nonsig_coef) %>%
+  pivot_wider(names_from = alpha_key, values_from = c(n_sig_coef, n_nonsig_coef)) %>%
+  arrange(dataset, phase)
+
+kable(denom_wide,
+      caption = "Denominators of the two rates at each significance level. LSR averages over the baseline-significant Cox coefficients and FPR over the baseline non-significant ones; the Phase 3 rows are counted after removing the coefficients whose significance disagrees between the Cox and the discrete-time GLM fit. Note that these are counts of Cox coefficients, not of covariates: rotterdam's `size' contributes two dummy columns and colon's `rx' contributes one.",
+      col.names = c("Dataset", "Phase",
+                     "$n_{\\text{sig}}$ (0.01)", "$n_{\\text{sig}}$ (0.05)", "$n_{\\text{sig}}$ (0.10)",
+                     "$n_{\\text{non}}$ (0.01)", "$n_{\\text{non}}$ (0.05)", "$n_{\\text{non}}$ (0.10)"),
+      escape = FALSE, booktabs = TRUE, linesep = "") %>%
+  kable_styling(latex_options = c("hold_position"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r tab-alpha-sensitivity}
+alpha_tbl <- alpha_summary %>%
+  select(dataset, phase, epsilon, alpha_key,
+         mean_fpr = mean_fpr_r4, mean_lsr = mean_lsr_r4) %>%
+  pivot_wider(names_from = alpha_key, values_from = c(mean_fpr, mean_lsr)) %>%
+  arrange(dataset, phase, epsilon) %>%
+  mutate(epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon))) %>%
+  mutate(across(where(is.numeric), ~ sprintf("%.4f", .x)))
+
+save_tbl(alpha_tbl, "tabS4_alpha_sensitivity", digits = 4,
+        col.names = c("Dataset", "Phase", "$\\varepsilon$",
+                       "FPR ($\\alpha$=0.01)", "FPR ($\\alpha$=0.05)", "FPR ($\\alpha$=0.10)",
+                       "LSR ($\\alpha$=0.01)", "LSR ($\\alpha$=0.05)", "LSR ($\\alpha$=0.10)"))
+
+kable(alpha_tbl %>% filter(phase == "Phase 1"),
+      caption = sprintf(paste0("Mean FPR and mean LSR at three significance levels (Phase 1 rows ",
+                               "shown; the saved table covers all three input perturbation ",
+                               "phases). The denominator is re-derived at each level, so the mean ",
+                               "FPR can decrease when alpha is relaxed: this happens in %d of the ",
+                               "%d saved rows and reflects high-FPR coefficients leaving the ",
+                               "denominator, not a computational inconsistency."),
+                        A_drop_total, A_rows),
+      col.names = c("Dataset", "Phase", "$\\varepsilon$",
+                     "FPR ($\\alpha$=0.01)", "FPR ($\\alpha$=0.05)", "FPR ($\\alpha$=0.10)",
+                     "LSR ($\\alpha$=0.01)", "LSR ($\\alpha$=0.05)", "LSR ($\\alpha$=0.10)"),
+      escape = FALSE, booktabs = TRUE, linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 8) %>%
+  scroll_box(height = "400px")
+```
+
+```{r fpr-mech-load}
+mech_coef  <- read.csv(file.path(EVAL_DIR, asfx("fpr_mechanism_coef_peaks")),
+                       stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+mech_peak  <- read.csv(file.path(EVAL_DIR, asfx("fpr_mechanism_peak_decomp")),
+                       stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+mech_scale <- read.csv(file.path(EVAL_DIR, asfx("fpr_mechanism_dataset_scale")),
+                       stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+mech_case  <- read.csv(file.path(EVAL_DIR, asfx("fpr_mechanism_case_study")),
+                       stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+N_NONSIG_P1_EXPECTED <- if (ARM_SUFFIX == "_reffix") 27L else 25L
+
+stopifnot(
+  nrow(mech_peak)  == N_NONSIG_P1_EXPECTED,
+  nrow(mech_scale) == length(DATASET_ORDER),
+  nrow(mech_case)  == 28L,
+  nrow(mech_coef)  > 0,
+  !anyNA(mech_peak$z_eff), !anyNA(mech_peak$fpr_full),
+  !anyNA(mech_scale$fwhm_dec), !anyNA(mech_coef$peak_fpr)
+)
+
+stopifnot(
+  identical(
+    as.integer(nrow(mech_peak)),
+    as.integer(alpha_denom %>% filter(alpha == 0.05, phase == "Phase 1") %>%
+                 summarise(n = sum(n_nonsig_coef)) %>% pull(n))
+  )
+)
+N_NONSIG_P1 <- nrow(mech_peak)
+
+mech_src <- file.path(PROJECT_DIR, "main/04_evaluation/fpr_mechanism.Rmd")
+mech_csv <- file.path(EVAL_DIR, asfx(paste0("fpr_mechanism_",
+                                            c("coef_peaks", "peak_decomp", "dataset_scale",
+                                              "case_study"))))
+stopifnot(all(file.exists(c(mech_src, mech_csv))))
+if (any(file.mtime(mech_csv) < file.mtime(mech_src))) {
+  stop("fpr_mechanism_*.csv is older than main/04_evaluation/fpr_mechanism.Rmd. ",
+       "Re-knit fpr_mechanism.Rmd before knitting this document.", call. = FALSE)
+}
+
+mech_width <- read.csv(file.path(EVAL_DIR, asfx("fpr_mechanism_width_defs")),
+                       stringsAsFactors = FALSE)
+stopifnot(nrow(mech_width) == 5L, !anyNA(mech_width$p_value))
+```
+
+```{r fpr-mech-publish}
+for (stem in c("fpr_mechanism_coef_peaks", "fpr_mechanism_peak_decomp")) {
+  save_csv_copy(file.path(EVAL_DIR, asfx(stem)), stem)
+}
+stopifnot(
+  nrow(read.csv(file.path(OUT_DIR, "fpr_mechanism_peak_decomp.csv"))) == N_NONSIG_P1,
+  nrow(read.csv(file.path(OUT_DIR, "fpr_mechanism_coef_peaks.csv")))  == nrow(mech_coef)
+)
+```
+
+```{r fpr-mech-values}
+fmt2  <- function(x) sprintf("%.2f", x)
+fmtsg <- function(x) sprintf("%.2f", x)
+oxford <- function(x) {
+  if (length(x) <= 1) return(paste(x, collapse = ""))
+  paste(paste(x[-length(x)], collapse = ", "), "and", x[length(x)])
+}
+n_word <- function(k) {
+  w <- c("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+         "eleven", "twelve", "thirteen", "fourteen", "fifteen")
+  if (k >= 1 && k <= length(w)) w[k] else as.character(k)
+}
+
+mech_p1_a05 <- mech_coef %>% filter(phase == "Phase 1", alpha == 0.05)
+stopifnot(nrow(mech_p1_a05) == N_NONSIG_P1)
+
+V_rho_dist <- cor(mech_p1_a05$dist, mech_p1_a05$peak_fpr, method = "spearman")
+V_near <- mech_p1_a05 %>% arrange(dist) %>% slice_head(n = 2) %>%
+  arrange(desc(peak_fpr))
+V_far_high <- mech_p1_a05 %>% anti_join(V_near, by = c("dataset", "variable")) %>%
+  arrange(desc(peak_fpr)) %>% slice_head(n = 3)
+
+V_drv <- function(key) sum(mech_peak$driver == key)
+V_se_only   <- V_drv("SE 縮小が単独で十分")
+V_beta_only <- V_drv("β の変動が単独で十分")
+V_both      <- V_drv("両経路とも単独で十分")
+V_neither   <- V_drv("どちらも単独では不十分（相互作用）")
+stopifnot(V_se_only + V_beta_only + V_both + V_neither == N_NONSIG_P1)
+
+V_rho_zeff <- cor(abs(mech_peak$z_eff), mech_peak$fpr_full, method = "spearman")
+V_rho_deff <- cor(mech_peak$disp_eff,   mech_peak$fpr_full, method = "spearman")
+
+V_nonadd <- mech_peak %>% filter(fpr_se_only >= 0.999, fpr_full < 0.5) %>% arrange(desc(fpr_full))
+stopifnot(nrow(V_nonadd) == 3L)
+stopifnot(setequal(V_nonadd$variable, c("trig", "pgr", "er")))
+CAPTION_NONADD <- paste(V_nonadd$dataset, V_nonadd$variable)
+stopifnot(setequal(CAPTION_NONADD, c("pbc trig", "rotterdam er", "rotterdam pgr")))
+
+V_n_zeff_gt <- sum(abs(mech_peak$z_eff) > abs(mech_peak$z_base))
+
+V_rho_rse_n   <- cor(mech_peak$r_se, mech_peak$n, method = "spearman")
+V_rho_shift_n <- cor(abs(mech_peak$shift_z), mech_peak$n, method = "spearman")
+V_rho_peak_n  <- cor(mech_peak$fpr_full, mech_peak$n, method = "spearman")
+V_ci <- {
+  z <- atanh(V_rho_rse_n); se <- sqrt(1.06 / (N_NONSIG_P1 - 3))
+  tanh(z + c(-1, 1) * qnorm(0.975) * se)
+}
+V_ds <- mech_scale %>% mutate(dataset = as.character(dataset))
+V_ds_row <- function(ds, col) V_ds[[col]][V_ds$dataset == ds]
+
+V_w_impl <- mech_width %>% filter(startsWith(definition, "実装"))
+V_w_25   <- mech_width %>% filter(startsWith(definition, "プラトー基線 25"))
+V_w_75   <- mech_width %>% filter(startsWith(definition, "プラトー基線 75"))
+stopifnot(nrow(V_w_impl) == 1L, nrow(V_w_25) == 1L, nrow(V_w_75) == 1L)
+V_p_min <- min(mech_width$p_value)
+
+V_fl_worst <- mech_p1_a05 %>% filter(dataset == "flchain") %>% arrange(desc(peak_fpr))
+V_lu_worst <- mech_p1_a05 %>% filter(dataset == "lung") %>% arrange(desc(peak_fpr))
+```
+
+```{r fig-fpr-mechanism, fig.width=13, fig.height=13, fig.cap=paste0("Mechanism of the inverted-U false positive rate, Phase 1 at alpha = 0.05. (A) Peak FPR of each baseline non-significant Cox coefficient against its distance from the significance threshold, log10(p) - log10(alpha); point size is the sample size. Proximity to the threshold raises the peak but does not determine it: pbc ascites and hepato sit an order of magnitude away and still peak above 0.9. (B) The two routes to a false positive, evaluated at each coefficient's peak epsilon. The horizontal axis is the counterfactual FPR obtained when only the standard error is allowed to vary and beta is held at its undisturbed value; the vertical axis is the counterfactual obtained when only beta varies. Points on the diagonal are driven equally by both. The two routes are not additive: several coefficients would cross on the standard-error route alone yet have a low observed rate, because beta is simultaneously attenuated towards zero. The three clearest cases (", oxford(CAPTION_NONADD), ") coincide at the lower right corner and are labelled individually. (C) Dataset-level peak height and width against sample size; the dotted line only orders the five datasets by n and does not imply interpolation between them. The peak height is not monotone in n and the width, measured as the full width at half maximum above the low-epsilon plateau, is between 0.5 and 0.9 decades of epsilon in every dataset. (D) The two case studies. flchain kappa and colon differ have almost the same baseline p-value (0.053) and peak at the same epsilon, but by opposite mechanisms. (E, F) Peak FPR of the same ", N_NONSIG_P1, " coefficients against the centre |z_eff| and the dispersion d_eff of the perturbed Wald statistic at each coefficient's peak epsilon, with the Spearman rank correlations quoted in the text (", fmt2(V_rho_zeff), " and ", fmtsg(V_rho_deff), "); colours and point sizes as in (A).")}
+library(patchwork)
+library(ggrepel)
+
+mech_p1 <- mech_coef %>% filter(phase == "Phase 1", alpha == 0.05)
+LABEL_COEFS <- c("kappa", "differ", "ascites", "hepato", "creatinine", "spiders")
+ROUTE_LABEL_COEFS <- c(LABEL_COEFS, "trig", "er", "pgr")
+
+p_dist <- ggplot(mech_p1, aes(x = dist, y = peak_fpr, color = dataset, size = n)) +
+  geom_point(alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data = mech_p1 %>% filter(variable %in% LABEL_COEFS),
+    aes(label = variable), size = 3, show.legend = FALSE,
+    min.segment.length = 0, box.padding = 0.4, seed = 42) +
+  scale_color_manual(values = DATASET_COLORS, labels = DATASET_LABELS_SHORT) +
+  scale_size_continuous(range = c(1.5, 6), transform = "log10",
+                        breaks = c(200, 1000, 6000)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(x = expression(log[10](p[baseline]) - log[10](alpha)),
+       y = "Peak FPR", color = NULL, size = expression(n)) +
+  guides(color = guide_legend(order = 1, nrow = 1, override.aes = list(size = 3)),
+         size = guide_legend(order = 2, nrow = 1)) +
+  theme_paper()
+
+p_route <- ggplot(mech_peak, aes(x = fpr_se_only, y = fpr_beta_only,
+                                 color = dataset, size = fpr_full)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              linewidth = 0.4, color = "grey50") +
+  geom_point(alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data = mech_peak %>% filter(variable %in% ROUTE_LABEL_COEFS),
+    aes(label = variable), size = 3, show.legend = FALSE,
+    min.segment.length = 0, box.padding = 0.4, max.overlaps = Inf, seed = 42) +
+  scale_color_manual(values = DATASET_COLORS, guide = "none") +
+  scale_size_continuous(range = c(1.5, 6), limits = c(0, 1),
+                        breaks = c(0.1, 0.5, 0.9),
+                        labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(x = "FPR with SE varying, beta fixed at baseline",
+       y = "FPR with beta varying, SE fixed at baseline",
+       size = "Observed\npeak FPR") +
+  theme_paper()
+
+scale_long <- mech_scale %>%
+  select(dataset, n, peak_fpr, fwhm_dec) %>%
+  mutate(peak_fpr = 100 * peak_fpr) %>%
+  pivot_longer(c(peak_fpr, fwhm_dec), names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metric, levels = c("peak_fpr", "fwhm_dec"),
+                         labels = c("Peak FPR (%)", "Peak width (decades of epsilon)")))
+
+p_scale <- ggplot(scale_long, aes(x = n, y = value, color = dataset)) +
+  geom_line(aes(group = metric), color = "grey65", linewidth = 0.4, linetype = "dotted") +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(aes(label = dataset), size = 3, show.legend = FALSE,
+                           min.segment.length = 0, box.padding = 0.4, seed = 42) +
+  facet_wrap(~ metric, scales = "free_y", nrow = 1) +
+  scale_x_log10(breaks = c(200, 1000, 6000), labels = c("200", "1000", "6000")) +
+  scale_y_continuous(labels = function(x) sprintf("%g", x)) +
+  scale_color_manual(values = DATASET_COLORS, guide = "none") +
+  expand_limits(y = 0) +
+  labs(x = expression(n ~ "(log scale)"), y = NULL) +
+  theme_paper()
+
+case_lab <- c("flchain kappa" = "flchain kappa (SE route)",
+              "colon differ"  = "colon differ (confounding route)")
+mech_case2 <- mech_case %>%
+  mutate(case = case_lab[paste(dataset, variable)])
+
+p_case <- ggplot(mech_case2, aes(x = epsilon, y = fpr_full, color = case)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  scale_color_manual(values = c(
+    "flchain kappa (SE route)"         = unname(DATASET_COLORS["flchain"]),
+    "colon differ (confounding route)" = unname(DATASET_COLORS["colon"]))) +
+  labs(x = expression(epsilon), y = "FPR of the single coefficient", color = NULL) +
+  theme_paper()
+
+mech_peak_ef <- mech_peak %>% mutate(abs_z_eff = abs(z_eff))
+rho_label <- function(rho) paste0("Spearman \u03c1 = ", sub("^-", "\u2212", fmt2(rho)))
+p_moment <- function(xvar, xlab, rho, corner) {
+  ggplot(mech_peak_ef, aes(x = .data[[xvar]], y = fpr_full, color = dataset, size = n)) +
+    geom_point(alpha = 0.85) +
+    ggrepel::geom_text_repel(
+      data = mech_peak_ef %>% filter(variable %in% LABEL_COEFS),
+      aes(label = variable), size = 3, show.legend = FALSE,
+      min.segment.length = 0, box.padding = 0.4, max.overlaps = Inf, seed = 42) +
+    annotate("text", x = corner$x, y = corner$y, hjust = corner$hjust, vjust = corner$vjust,
+             label = rho_label(rho), size = 3.5, family = "Times New Roman") +
+    scale_color_manual(values = DATASET_COLORS, guide = "none") +
+    scale_size_continuous(range = c(1.5, 6), transform = "log10",
+                          breaks = c(200, 1000, 6000), guide = "none") +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(x = xlab, y = "Peak FPR") +
+    theme_paper()
+}
+p_zeff <- p_moment("abs_z_eff", expression("|" * z[eff] * "|"), V_rho_zeff,
+                   list(x = -Inf, y =  Inf, hjust = -0.1, vjust =  1.6))
+p_deff <- p_moment("disp_eff",  expression(d[eff]),               V_rho_deff,
+                   list(x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.8))
+
+p_mech <- (p_dist | p_route) / (p_scale | p_case) / (p_zeff | p_deff) +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.box = "horizontal", legend.margin = margin(t = 0, b = 0))
+
+save_fig(p_mech, "figS6_fpr_mechanism", width = 13, height = 13)
+p_mech
+```
+
+```{r load-subsampling}
+sub_curves <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_curves.csv"), stringsAsFactors = FALSE)
+sub_peaks  <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_peaks.csv"),  stringsAsFactors = FALSE)
+sub_rse    <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_rse.csv"),    stringsAsFactors = FALSE)
+sub_rel    <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_rse_rel.csv"), stringsAsFactors = FALSE)
+sub_var    <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_rse_by_var.csv"),
+                       stringsAsFactors = FALSE)
+sub_chan   <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_channels.csv"), stringsAsFactors = FALSE)
+sub_rho    <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_rho.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+
+key_of <- function(x) stringr::str_extract(x, "^[AB]")
+sub_curves$denom_key <- key_of(sub_curves$denominator)
+sub_peaks$denom_key  <- key_of(sub_peaks$denominator)
+
+SUB_N_LEVELS <- c(168, 312, 500, 929, 2000, 2982, 6524)
+SUB_B_ITER   <- 1000
+SUB_COEFS    <- c("age", "sexM", "sample.yr", "kappa", "lambda", "creatinine", "mgus")
+peaks_fpr <- sub_peaks[sub_peaks$metric == "FPR", ]
+stopifnot(
+  nrow(peaks_fpr) == 2 * length(SUB_N_LEVELS),
+  nrow(sub_curves) == 2 * length(SUB_N_LEVELS) * 14,
+  nrow(sub_rse) == length(SUB_N_LEVELS) * 14,
+  nrow(sub_rel) == length(SUB_N_LEVELS) * 14,
+  nrow(sub_var) == length(SUB_COEFS) * length(SUB_N_LEVELS) * 14,
+  setequal(unique(sub_var$variable), SUB_COEFS),
+  nrow(sub_chan) == 14,
+  !anyNA(sub_peaks$denom_key), !anyNA(sub_curves$denom_key),
+  setequal(unique(peaks_fpr$denom_key), c("A", "B")),
+  all(tapply(sub_peaks$denominator, sub_peaks$denom_key, function(x) length(unique(x))) == 1),
+  setequal(unique(sub_peaks$n_target), SUB_N_LEVELS),
+  !anyNA(sub_curves$mean_fpr), !anyNA(sub_rse$mean_rse), !anyNA(sub_rel$median_rel),
+  !anyNA(sub_var$median_rse), all(sub_var[["反復数"]] > 0.25 * SUB_B_ITER),
+  all(sub_curves$n_fpr > 0.9 * SUB_B_ITER)
+)
+
+sub_src <- file.path(PROJECT_DIR, "main/04_evaluation/fpr_subsampling.Rmd")
+sub_csv <- file.path(EVAL_DIR, paste0("fpr_subsampling_",
+                                      c("curves", "peaks", "rse", "rse_rel", "rse_by_var", "channels", "rho",
+                                        "paired", "identification", "nsr", "rse_slope", "rse_slope_allvar",
+                                        "conv_sens", "subsamples"), ".csv"))
+stopifnot(all(file.exists(c(sub_src, sub_csv))))
+if (any(file.mtime(sub_csv) < file.mtime(sub_src))) {
+  stop("fpr_subsampling_*.csv is older than main/04_evaluation/fpr_subsampling.Rmd. ",
+       "Re-knit fpr_subsampling.Rmd before knitting this document.", call. = FALSE)
+}
+```
+
+```{r subsampling-values}
+sub_paired <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_paired.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+sub_ident  <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_identification.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+sub_nsr    <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_nsr.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+sub_slope6 <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_rse_slope.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+sub_slope7 <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_rse_slope_allvar.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+sub_conv   <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_conv_sens.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+
+stopifnot(ncol(sub_chan) == 9)
+names(sub_chan) <- c("epsilon", "n_cells", "se_base", "z_base", "shift_z", "r_se",
+                     "beta_bias", "beta_base", "z_eff")
+stopifnot(
+  all(vapply(sub_chan, function(x) all(is.finite(x)), logical(1))),
+  diff(range(sub_chan$se_base))   < 1e-9,
+  diff(range(sub_chan$z_base))    < 1e-9,
+  diff(range(sub_chan$beta_base)) < 1e-9,
+  all(sub_chan$se_base < 0), all(sub_chan$z_base > 0), all(sub_chan$beta_base < 0),
+  max(abs(sub_chan$shift_z - sub_chan$beta_bias + sub_chan$se_base)) < 1e-8,
+  max(abs(sub_chan$z_base  - sub_chan$beta_base + sub_chan$se_base)) < 1e-8,
+  diff(range(sub_chan$r_se)) > 1e-9
+)
+stopifnot(nrow(sub_conv) == length(SUB_N_LEVELS) * nrow(sub_chan),
+          !anyNA(sub_conv$d), all(sub_conv$d >= 0))
+
+pk <- function(k, n, col, m = "FPR") {
+  v <- sub_peaks[[col]][sub_peaks$denom_key == k & sub_peaks$n_target == n &
+                          sub_peaks$metric == m]
+  stopifnot(length(v) == 1L)
+  v
+}
+cv <- function(k, n, e, col) {
+  v <- sub_curves[[col]][sub_curves$denom_key == k & sub_curves$n_target == n &
+                           sub_curves$epsilon == e]
+  stopifnot(length(v) == 1L)
+  v
+}
+ch  <- function(col, e) sub_chan[[col]][sub_chan$epsilon == e]
+med <- function(col) median(sub_chan[[col]])
+rho_of <- function(k, m = "FPR") {
+  r <- sub_rho[sub_rho$metric == m & startsWith(sub_rho$denominator, paste0(k, ":")), ]
+  stopifnot(nrow(r) == 1L)
+  r
+}
+NRATIO  <- max(SUB_N_LEVELS) / min(SUB_N_LEVELS)
+slope6  <- max(abs(sub_slope6[["log(n) の係数"]]))
+slope6c <- max(abs(c(sub_slope6[["95% 下限"]], sub_slope6[["95% 上限"]])))
+slope7  <- max(abs(sub_slope7[["log(n) の係数"]]))
+
+SB_p1 <- function(x) sprintf("%.1f", 100 * x)
+SB_p2 <- function(x) sprintf("%.2f", 100 * x)
+SB_d1 <- function(x) sprintf("%.1f", x)
+SB_d2 <- function(x) sprintf("%.2f", x)
+SB_d3 <- function(x) sprintf("%.3f", x)
+SB_d4 <- function(x) sprintf("%.4f", x)
+SB_d5 <- function(x) sprintf("%.5f", x)
+SB_N_SM <- min(SUB_N_LEVELS)
+SB_N_LG <- max(SUB_N_LEVELS)
+
+SB_peak_lg  <- pk("A", SB_N_LG, "peak");    SB_peak_sm <- pk("A", SB_N_SM, "peak")
+SB_plat_lg  <- pk("A", SB_N_LG, "plateau"); SB_plat_sm <- pk("A", SB_N_SM, "plateau")
+SB_shrink_w <- n_word(round(SB_peak_lg / SB_peak_sm))
+SB_prow     <- sub_paired[sub_paired$n_target == SB_N_SM, ]
+stopifnot(nrow(SB_prow) == 1L)
+SB_exc <- SB_prow[["上振れ 平均"]]; SB_exc_lo <- SB_prow[["95% 下限"]]; SB_exc_hi <- SB_prow[["95% 上限"]]
+SB_nlev   <- length(SUB_N_LEVELS)
+SB_rhoA   <- rho_of("A"); SB_rhoB <- rho_of("B"); SB_rhoL <- rho_of("A", "LSR")
+SB_peak_e <- unique(sub_peaks$peak_eps[sub_peaks$metric == "FPR"])
+stopifnot(length(SB_peak_e) == 1L)
+
+SB_den_lg   <- pk("A", SB_N_LG, "mean_denom"); SB_den_sm   <- pk("A", SB_N_SM, "mean_denom")
+SB_peakB_lg <- pk("B", SB_N_LG, "peak");       SB_peakB_sm <- pk("B", SB_N_SM, "peak")
+
+SB_neps     <- nrow(sub_chan)
+SB_neps_all <- SB_neps + 1L
+SB_chg_pt   <- exp(slope6  * log(NRATIO)) - 1
+SB_chg_ci   <- exp(slope6c * log(NRATIO)) - 1
+SB_rel_min  <- min(sub_rel$median_rel)
+SB_rel_dep  <- 1 - SB_rel_min
+SB_rse_ratio <- function(v) {
+  d <- sub_var[sub_var$variable == v & sub_var$epsilon == 1, ]
+  stopifnot(nrow(d) == SB_nlev)
+  d$median_rse[d$n_target == SB_N_LG] / d$median_rse[d$n_target == SB_N_SM]
+}
+SB_flat   <- vapply(c("age", "sexM", "sample.yr"),      SB_rse_ratio, numeric(1))
+SB_rise   <- vapply(c("kappa", "lambda", "creatinine"), SB_rse_ratio, numeric(1))
+SB_mgus_r <- SB_rse_ratio("mgus")
+SB_spread <- max(sub_var$median_rse[sub_var$epsilon == 1]) /
+             min(sub_var$median_rse[sub_var$epsilon == 1])
+sub_diag <- read.csv(file.path(EVAL_DIR, "fpr_subsampling_subsamples.csv"),
+                     check.names = FALSE, stringsAsFactors = FALSE)
+stopifnot(nrow(sub_diag) == SB_nlev * SUB_B_ITER)
+SB_mgus_sm  <- sub_diag$n_mgus[sub_diag$n_target == SB_N_SM]
+SB_mgus_med <- median(SB_mgus_sm); SB_mgus_max <- max(SB_mgus_sm)
+SB_ident_sm <- sub_ident[["その割合"]][sub_ident$n_target == SB_N_SM]
+SB_ident_lg <- sub_ident[["その割合"]][sub_ident$n_target == 2982]
+SB_mgus_full <- unique(sub_diag$n_mgus[sub_diag$n_target == SB_N_LG])
+stopifnot(length(SB_mgus_full) == 1L)
+SB_mgus_prev <- SB_mgus_full / SB_N_LG
+sb_base <- read.csv(file.path(PREP_DIR, "baseline_cox_reffix.csv"), stringsAsFactors = FALSE)
+SB_nonsig_full <- sb_base$variable[sb_base$dataset == "flchain" & sb_base$p_value >= 0.05]
+stopifnot(setequal(SB_nonsig_full, c("kappa", "creatinine", "mgus")),
+          abs(SB_den_lg - length(SB_nonsig_full)) < 1e-9)
+SB_s7_i   <- which.max(abs(sub_slope7[["log(n) の係数"]]))
+SB_s7_val <- sub_slope7[["log(n) の係数"]][SB_s7_i]
+SB_s7_eps <- sub_slope7$epsilon[SB_s7_i]
+SB_s7_lo  <- sub_slope7[["95% 下限"]][SB_s7_i]; SB_s7_hi <- sub_slope7[["95% 上限"]][SB_s7_i]
+SB_s7_pos <- sum(sub_slope7[["log(n) の係数"]] > 0)
+
+SB_nneg  <- sum(sub_chan$beta_bias < 0)
+SB_share <- round(100 * (ch("shift_z", SB_peak_e) - ch("beta_bias", SB_peak_e)) /
+                    ch("shift_z", SB_peak_e))
+
+SB_EPS_MIN  <- min(sub_curves$epsilon)
+SB_lsr_sm   <- cv("A", SB_N_SM, SB_EPS_MIN, "mean_lsr")
+SB_lsr_lg   <- cv("A", SB_N_LG, SB_EPS_MIN, "mean_lsr")
+SB_conv_med <- median(sub_conv$d); SB_conv_max <- max(sub_conv$d)
+SB_nsr_fac  <- max(sub_nsr[["水準平均の最大 / 最小"]])
+SB_nsr_mono <- sum(sub_nsr[["p 値"]] < 0.05); SB_ncont <- nrow(sub_nsr)
+SB_nfits    <- SB_nlev * SUB_B_ITER * (1L + SB_neps_all)
+```
+
+```{r fig-fpr-subsampling, fig.width=13, fig.height=14, fig.cap=paste0("Direct test of the sample-size hypothesis by subsampling flchain (Phase 1, alpha = 0.05). At each of the ", n_word(SB_nlev), " sizes the experiment runs ", SUB_B_ITER, " replicates; every replicate draws its own stratified subsample, fits the baseline Cox model to it, and perturbs that same subsample once at each of the ", n_word(SB_neps_all), " privacy budgets, so subsampling variation and privacy noise are paired one to one and averaged over the same ", SUB_B_ITER, " draws (", format(SB_nfits, big.mark = ","), " model fits in total). Inside one dataset the covariate set, the number of covariates, the clipping bounds and hence the Laplace scale of every continuous covariate and the flip probability of every categorical one are identical at all ", n_word(SB_nlev), " sizes. (A) Mean FPR against the privacy budget at each size, with the denominator re-derived from the baseline fit of the subsample being perturbed; the dashed line is the nominal 5 percent level. (B) Peak height and peak width against the sample size under two treatments of the denominator: re-derived at each size, and restricted to the three coefficients that are non-significant in the full ", SB_N_LG, " records. The width is the full width at half maximum above the low-epsilon plateau; a width whose upper edge reached the largest budget on the grid would be drawn hollow and read as a lower bound, which does not occur in this run. (C) The DP-induced shrinkage of the standard error, r_SE, shown separately for each of the ", n_word(length(SUB_COEFS)), " coefficients as the median over the ", SUB_B_ITER, " replicates; the legend occupies the eighth cell of the three-by-three grid and the dashed line marks no shrinkage. Each panel keeps its own vertical scale, so a panel shows whether that coefficient's shrinkage depends on n, not how the coefficients compare with one another: r_SE differs by a factor of about ", round(SB_spread / 10) * 10, " between them at a given budget, and a shared scale would flatten ", n_word(length(SUB_COEFS) - 1L), " of the ", n_word(length(SUB_COEFS)), " into featureless lines. Read across the panels, age, sexM and sample.yr are flat in n (a factor of ", SB_d2(min(SB_flat)), " to ", SB_d2(max(SB_flat)), " over the ", SB_d1(NRATIO), "-fold range); kappa, lambda and creatinine RISE with n (", SB_d1(min(SB_rise)), " to ", SB_d1(max(SB_rise)), "), that is, a larger sample shrinks the standard error LESS, which is the opposite of the direction the proposed mechanism requires, and they are the same three covariates whose within-subsample dispersion also rises with n; only the rare indicator mgus falls (", SB_d2(SB_mgus_r), "), and it is the coefficient that cannot be evaluated in ", SB_p1(SB_ident_sm), " percent of the replicates at n = ", SB_N_SM, ". The regression in panel D therefore excludes mgus, with the seven-coefficient version reported as a sensitivity analysis in fpr_subsampling.Rmd. Pooling the coefficients after normalising each by its own value at n = ", SB_N_LG, " gives a median that stays between ", SB_d3(SB_rel_min), " and 1, quoted in the text. (D) Slope of the logarithm of each quantity in the identity z_eff = (z_base + s)/r_SE, together with the undisturbed standard error and the undisturbed coefficient themselves, regressed on log n with a fixed effect per coefficient. The dotted lines at plus and minus one half are exact square-root rates and the dashed line at zero is independence of the sample size. Nothing on the beta scale grows with n; the undisturbed standard error falls at the n to the minus one half rate, and dividing by it is what makes every quantity measured in standard-error units grow. Convergence: the primary curves use every replicate that yields a finite estimate, including those where coxph emits a separation warning for the rare indicator mgus; restricting to warning-free replicates is reported as a sensitivity analysis in fpr_subsampling.Rmd, which is a deliberate departure from the convention used for Figure 4 (figS6).")}
+library(patchwork)
+
+PANEL_C_FORM <- "facet"
+stopifnot(PANEL_C_FORM %in% c("facet", "normalized", "pooled"))
+
+n_pal <- setNames(viridisLite::viridis(length(SUB_N_LEVELS), option = "C", end = 0.9),
+                  as.character(SUB_N_LEVELS))
+x_n <- list(scale_x_log10(breaks = SUB_N_LEVELS, labels = as.character(SUB_N_LEVELS)),
+            theme(axis.text.x = element_text(angle = 45, hjust = 1, size = rel(0.75))))
+
+p_curve <- sub_curves %>%
+  filter(denom_key == "A") %>%
+  mutate(n_lab = factor(n_target, levels = SUB_N_LEVELS)) %>%
+  ggplot(aes(x = epsilon, y = 100 * mean_fpr, color = n_lab)) +
+  geom_hline(yintercept = 5, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.5) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000), labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_color_manual(values = n_pal) +
+  labs(x = expression(epsilon), y = "Mean FPR (%)", color = expression(n),
+       subtitle = "Denominator re-derived from each replicate's own baseline fit") +
+  guides(color = guide_legend(nrow = 1)) +
+  theme_paper()
+
+peak_long <- peaks_fpr %>%
+  mutate(peak = 100 * peak) %>%
+  select(denom_key, n_target, peak, fwhm_dec, censored) %>%
+  pivot_longer(c(peak, fwhm_dec), names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metric, levels = c("peak", "fwhm_dec"),
+                         labels = c("Peak FPR (%)", "Peak width (decades of epsilon)")),
+         denom = factor(denom_key, levels = c("A", "B"),
+                        labels = c("re-derived", "restricted")),
+         open = censored & metric == "Peak width (decades of epsilon)",
+         fill_col = ifelse(open, "white",
+                           c("re-derived" = "#0072B2", "restricted" = "#D55E00")[as.character(denom)]))
+
+p_peak <- ggplot(peak_long, aes(x = n_target, y = value, color = denom, shape = denom)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(aes(fill = fill_col), size = 2.6, stroke = 0.9) +
+  scale_fill_identity() +
+  facet_wrap(~ metric, scales = "free_y", nrow = 1) +
+  scale_x_log10(breaks = SUB_N_LEVELS, labels = as.character(SUB_N_LEVELS)) +
+  scale_color_manual(values = c("re-derived" = "#0072B2", "restricted" = "#D55E00")) +
+  scale_shape_manual(values = c("re-derived" = 21, "restricted" = 24)) +
+  scale_y_continuous(labels = function(x) sprintf("%g", x)) +
+  expand_limits(y = 0) +
+  labs(x = expression(n ~ "(log scale)"), y = NULL, color = "Denominator", shape = "Denominator") +
+  theme_paper() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = rel(0.75)))
+
+EPS_SHOW <- c(1, 5, 10, 30, 100, 1000)
+if (PANEL_C_FORM == "facet") {
+  p_rse <- sub_var %>%
+    filter(epsilon %in% EPS_SHOW) %>%
+    mutate(variable = factor(variable, levels = SUB_COEFS),
+           eps_lab = factor(epsilon, levels = EPS_SHOW)) %>%
+    ggplot(aes(x = n_target, y = median_rse, color = eps_lab)) +
+    geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.35, color = "grey40") +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 1.5) +
+    facet_wrap(~ variable, ncol = 3, scales = "free_y") +
+    scale_x_log10(breaks = SUB_N_LEVELS, labels = as.character(SUB_N_LEVELS)) +
+    scale_color_viridis_d(option = "D", end = 0.85) +
+    labs(x = expression(n ~ "(log scale)"),
+         y = expression(r[SE] * ", median over the 1000 replicates"),
+         color = expression(epsilon)) +
+    guides(color = guide_legend(ncol = 2, title.position = "top", byrow = TRUE)) +
+    theme_paper() +
+    theme(legend.position = "inside",
+          legend.position.inside = c(0.855, 0.145),
+          legend.justification = c(0.5, 0.5),
+          legend.background = element_rect(fill = "white", colour = "grey70", linewidth = 0.3),
+          legend.margin = margin(7, 10, 7, 10),
+          legend.key.size = unit(0.95, "lines"),
+          legend.title = element_text(size = rel(1.05)),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = rel(0.7)))
+} else {
+  c_dat <- if (PANEL_C_FORM == "normalized") {
+    sub_rel %>% filter(epsilon %in% EPS_SHOW) %>% mutate(y = median_rel)
+  } else {
+    sub_rse %>% filter(epsilon %in% EPS_SHOW) %>% mutate(y = median_rse)
+  }
+  c_lab <- if (PANEL_C_FORM == "normalized")
+    "r_SE(n) / r_SE(n = 6524), median over coefficients" else "r_SE, median over coefficients"
+  p_rse <- c_dat %>%
+    mutate(eps_lab = factor(epsilon, levels = EPS_SHOW)) %>%
+    ggplot(aes(x = n_target, y = y, color = eps_lab)) +
+    geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+    geom_line(linewidth = 0.7) + geom_point(size = 1.8) +
+    scale_color_viridis_d(option = "D", end = 0.85) +
+    labs(x = expression(n ~ "(log scale)"), y = c_lab, color = expression(epsilon)) +
+    guides(color = guide_legend(nrow = 1)) +
+    theme_paper() + x_n
+}
+
+chan_long <- sub_chan %>%
+  select(-n_cells) %>%
+  pivot_longer(-epsilon, names_to = "component", values_to = "slope") %>%
+  mutate(component = factor(
+    component,
+    levels = c("z_eff", "shift_z", "z_base", "r_se", "beta_bias", "se_base", "beta_base"),
+    labels = c("|z_eff|", "|s(eps)|", "|z_base|", "r_SE",
+               "|bias on the beta scale|", "SE_base", "|beta_base|")))
+
+p_chan <- ggplot(chan_long, aes(x = epsilon, y = slope, color = component)) +
+  geom_hline(yintercept = c(-0.5, 0, 0.5), linetype = c("dotted", "dashed", "dotted"),
+             linewidth = 0.4, color = "grey40") +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.6) +
+  annotate("text", x = 0.1, y = 0.52, label = "+1/2", hjust = 0, vjust = 0,
+           size = 3, color = "grey30", family = "Times New Roman") +
+  annotate("text", x = 0.1, y = -0.02, label = "no dependence on n", hjust = 0, vjust = 1,
+           size = 3, color = "grey30", family = "Times New Roman") +
+  annotate("text", x = 0.1, y = -0.48, label = "-1/2", hjust = 0, vjust = 1,
+           size = 3, color = "grey30", family = "Times New Roman") +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000), labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(x = expression(epsilon), y = expression("slope of" ~ log(.) ~ "on" ~ log(n)), color = NULL) +
+  guides(color = guide_legend(nrow = 2)) +
+  theme_paper()
+
+box_h <- theme(legend.box = "horizontal", legend.margin = margin(t = 0, b = 0))
+p_sub <- if (PANEL_C_FORM == "facet") {
+  ((p_curve + box_h) | (p_peak + box_h)) / p_rse / (p_chan + box_h) +
+    plot_layout(heights = c(1, 1.55, 0.95)) +
+    plot_annotation(tag_levels = "A")
+} else {
+  ((p_curve + box_h) | (p_peak + box_h)) / ((p_rse + box_h) | (p_chan + box_h)) +
+    plot_annotation(tag_levels = "A")
+}
+FIG7_H <- if (PANEL_C_FORM == "facet") 14 else 9.5
+save_fig(p_sub, "figS7_fpr_subsampling", width = 13, height = FIG7_H)
+p_sub
+```
+
+```{r subsampling-prose-check}
+stopifnot(
+  SB_rhoA[["逆転の数"]] == 0L, SB_rhoB[["逆転の数"]] == 0L,
+  SB_rhoA$rho == 1, SB_rhoB$rho == 1,
+  length(SB_peak_e) == 1L,
+  sum(sub_peaks$censored[sub_peaks$metric == "FPR"]) == 0L,
+  all(sub_slope6[["log(n) の係数"]] > 0),
+  SB_s7_pos == SB_neps - 1L, SB_s7_lo < 0, SB_s7_hi > 0,
+  SB_s7_val < 0, sum(sub_slope7[["log(n) の係数"]] < 0) == 1L,
+  max(sub_rel$median_rel) == 1,
+  all(vapply(split(sub_rel, sub_rel$epsilon),
+             function(d) all(diff(d$median_rel[order(d$n_target)]) > -1e-9), logical(1))),
+  all(SB_flat > 1), all(SB_rise > 1), max(SB_flat) < min(SB_rise), SB_mgus_r < 1,
+  setequal(names(SB_rise),
+           sub_nsr$src_var[order(-sub_nsr[["水準平均の最大 / 最小"]])][seq_along(SB_rise)]),
+  all(sub_nsr[["rho(n, sd(X) の水準平均)"]][match(names(SB_rise), sub_nsr$src_var)] > 0),
+  SB_rhoL[["p 値（厳密）"]] > 0.05,
+  min(sub_var$median_rse) <= 0.1,
+  {
+    e <- sort(unique(sub_curves$epsilon))
+    r <- e[-1] / e[-length(e)]
+    min(r) >= 1.4 - 0.05 && max(r) <= 5 + 0.05
+  },
+  2982 %in% SUB_N_LEVELS,
+  SB_nfits == 112000L, SB_nlev == 7L, SB_neps_all == 15L, length(SUB_COEFS) == 7L
+)
+
+stopifnot(
+  A_med_fixed_45[3] >= A_med_fixed_45[2],
+  A_med_fixed_45[1] > A_med_fixed_45[2],
+  all(diff(A_med_fixed_p1) < 0)
+)
+sb_n_claims <- local({
+  src <- knitr::knit_code$get("subsampling-prose-check")
+  if (is.null(src)) NA_integer_ else
+    sum(vapply(parse(text = src), function(e)
+      if (is.call(e) && identical(e[[1]], as.name("stopifnot"))) length(e) - 1L else 0L, integer(1)))
+})
+cat(sprintf(paste("Prose figures are computed in `subsampling-values` and referenced inline;",
+                  "this chunk checks the %s assertions (qualitative claims and literals) that remain.\n"),
+            sb_n_claims))
+```
+
+```{r grr-variance}
+var_grr <- function(k, eps) (k - 2 + exp(eps)) / expm1(eps)^2
+var_oue <- function(eps)    (4 * exp(eps))     / expm1(eps)^2
+
+wang_tab2 <- data.frame(
+  eps    = c(0.5, 1.0, 2.0, 4.0),
+  de2    = c(   3.92,   0.92,  0.18, 0.02),
+  de32   = c(  75.20,  11.08,  0.92, 0.03),
+  de1024 = c(2432.40, 347.07, 25.22, 0.37),
+  oue    = c(  15.67,   3.68,  0.72, 0.08)
+)
+wang_repro <- data.frame(
+  eps    = wang_tab2$eps,
+  de2    = round(var_grr(2L,    wang_tab2$eps), 2),
+  de32   = round(var_grr(32L,   wang_tab2$eps), 2),
+  de1024 = round(var_grr(1024L, wang_tab2$eps), 2),
+  oue    = round(var_oue(       wang_tab2$eps), 2)
+)
+stopifnot(identical(as.matrix(wang_tab2), as.matrix(wang_repro)))
+
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase2.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/survival_stacking.R"))
+
+EPS_REP <- c(0.1, 0.5, 1, 5, 10, 30, 100)
+
+grr_targets <- map_dfr(DATASET_ORDER, function(ds) {
+  types <- unlist(COVARIATE_TYPES[[ds]])
+  q     <- Q_VALUES[[ds]]
+  dat   <- read.csv(file.path(PROJECT_DIR, "data/01_prepared", paste0(ds, "_prepared.csv")),
+                    stringsAsFactors = FALSE)
+  cat_v <- names(types)[types == "categorical"]
+  bin_v <- names(types)[types == "binary"]
+
+  k_cat <- vapply(cat_v, function(v) length(CLIPPING_BOUNDS[[ds]][[v]]), integer(1))
+  stopifnot(
+    length(cat_v) == sum(types == "categorical"),
+    length(bin_v) == sum(types == "binary"),
+    all(vapply(cat_v, function(v) setequal(as.character(unique(dat[[v]])),
+                                           as.character(CLIPPING_BOUNDS[[ds]][[v]])), logical(1))),
+    all(vapply(bin_v, function(v) setequal(as.character(unique(dat[[v]])), c("0", "1")), logical(1))),
+    length(cat_v) + length(bin_v) + sum(types == "continuous") == q
+  )
+
+  n_int <- nrow(create_time_intervals(dat$time[dat$status == 1], K_VALUES[[ds]]))
+  stopifnot(n_int == K_VALUES[[ds]])
+
+  cov_tbl <- tibble(
+    target = c(cat_v, bin_v),
+    role   = "Covariate",
+    k      = c(unname(k_cat), rep(2L, length(bin_v)))
+  )
+  bind_rows(
+    cov_tbl %>% mutate(dataset = ds, q = q, phase = "1"),
+    cov_tbl %>% mutate(dataset = ds, q = q, phase = "2, 3"),
+    tibble(dataset = ds, q = q, phase = "2, 3",
+           target = "delta (event indicator)", role = "Event indicator", k = 2L),
+    tibble(dataset = ds, q = q, phase = "3",
+           target = "k* (interval index)", role = "Interval index", k = as.integer(n_int))
+  )
+})
+
+grr_grid <- grr_targets %>%
+  crossing(epsilon = EPS_REP) %>%
+  mutate(
+    eps_j = if_else(phase == "1",
+                    map2_dbl(epsilon, q, allocate_budget),
+                    map2_dbl(epsilon, q, allocate_budget_phase2)),
+    v_grr  = var_grr(k, eps_j),
+    v_oue  = var_oue(eps_j),
+    ratio  = v_grr / v_oue,
+    thresh = 3 * exp(eps_j) + 2,
+    grr_opt = k < thresh,
+    eps_star = if_else(k <= 5L, NA_real_,
+                       if_else(phase == "1", as.double(q), as.double(q + 2)) *
+                         log(pmax((k - 2) / 3, .Machine$double.xmin)))
+  ) %>%
+  arrange(factor(dataset, levels = DATASET_ORDER),
+          factor(role, levels = c("Covariate", "Event indicator", "Interval index")),
+          phase, target, epsilon)
+
+stopifnot(
+  isTRUE(all.equal(
+    map2_dbl(rep(EPS_REP, length(Q_VALUES)),
+             rep(unname(Q_VALUES), each = length(EPS_REP)), allocate_budget_phase2),
+    map2_dbl(rep(EPS_REP, length(Q_VALUES)),
+             rep(unname(Q_VALUES), each = length(EPS_REP)), allocate_budget_phase3))),
+  all(grr_grid$grr_opt == (grr_grid$v_grr < grr_grid$v_oue)),
+  sum(!grr_grid$grr_opt) == 24L,
+  identical(
+    vapply(DATASET_ORDER, function(ds) {
+      types <- unlist(COVARIATE_TYPES[[ds]])
+      cv    <- names(types)[types == "categorical"]
+      kv    <- vapply(cv, function(v) length(CLIPPING_BOUNDS[[ds]][[v]]), integer(1))
+      paste(sprintf("%s (%d)", cv, kv), collapse = ", ")
+    }, character(1), USE.NAMES = FALSE),
+    {
+      tabS5 <- read.csv(file.path(OUT_DIR, "tabS5_variable_types.csv"), stringsAsFactors = FALSE)
+      tabS5[["Categorical.variables..k."]][match(DATASET_ORDER, tabS5$Dataset)]
+    }
+  )
+)
+
+fmt_g <- function(x) trimws(formatC(x, format = "g", digits = 4))
+
+grr_tbl <- grr_grid %>%
+  transmute(
+    Dataset = dataset,
+    q       = q,
+    Phase   = phase,
+    `Mechanism target` = target,
+    Role    = role,
+    k       = k,
+    epsilon = epsilon,
+    `eps_j` = fmt_g(eps_j),
+    `Var_GRR/n` = fmt_g(v_grr),
+    `Var_OUE/n` = fmt_g(v_oue),
+    `Var ratio (GRR/OUE)` = sprintf("%.3f", ratio),
+    `3exp(eps_j)+2` = fmt_g(thresh),
+    `GRR optimal`   = if_else(grr_opt, "Yes", "No"),
+    `Crossover eps` = if_else(is.na(eps_star), "---", sprintf("%.2f", eps_star))
+  )
+
+grr_display <- c("s", vapply(grr_tbl, function(col)
+  switch(class(col)[1], integer = "d", numeric = "f", "s"), character(1)))
+grr_digits  <- rep(0L, ncol(grr_tbl) + 1L)
+grr_eps_pos <- 1L + which(names(grr_tbl) == "epsilon")
+stopifnot(length(grr_eps_pos) == 1L, is.numeric(grr_tbl$epsilon))
+grr_display[grr_eps_pos] <- "g"
+grr_digits[grr_eps_pos]  <- 4L
+save_tbl(grr_tbl, "tabS6_grr_variance", digits = grr_digits, display = unname(grr_display),
+         col.names = c("Dataset", "$q$", "Phase", "Mechanism target", "Role", "$k$",
+                       "$\\varepsilon$", "$\\varepsilon_j$",
+                       "$\\mathrm{Var}_{\\mathrm{GRR}}/n$", "$\\mathrm{Var}_{\\mathrm{OUE}}/n$",
+                       "Ratio", "$3e^{\\varepsilon_j}+2$", "GRR optimal", "$\\varepsilon^{*}$"))
+```
+
+```{r grr-variance-interval}
+grr_interval <- grr_grid %>%
+  filter(role == "Interval index") %>%
+  transmute(Dataset = dataset, `$K$` = k,
+            `$\\varepsilon$` = epsilon,
+            `$\\varepsilon_j$` = fmt_g(eps_j),
+            `$\\mathrm{Var}_{\\mathrm{GRR}}/n$` = fmt_g(v_grr),
+            `$\\mathrm{Var}_{\\mathrm{OUE}}/n$` = fmt_g(v_oue),
+            Ratio = sprintf("%.3f", ratio),
+            `$3e^{\\varepsilon_j}+2$` = fmt_g(thresh),
+            `GRR optimal` = if_else(grr_opt, "Yes", "No"),
+            `$\\varepsilon^{*}$` = sprintf("%.2f", eps_star))
+
+kable(grr_interval,
+      caption = "Analytical variance of GRR and OUE for the Phase 3 interval index $k^{*}_i$, the only mechanism in the study whose domain exceeds $k = 5$. The per-variable budget is $\\varepsilon_j = \\varepsilon/(q+2)$; variances are per user, following Table 2 of Wang et al. GRR has the smaller variance when $k < 3e^{\\varepsilon_j}+2$, equivalently above the total budget $\\varepsilon^{*} = (q+2)\\ln((K-2)/3)$ given in the last column. The worst case for GRR is flchain at $\\varepsilon = 0.1$, where its variance is 2.97 times that of OUE; the ratio is bounded by $(K-1)/4 = 3$ as $\\varepsilon \\to 0$.",
+      escape = FALSE, booktabs = TRUE, linesep = "", align = "lrrrrrrrrr") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r grr-variance-covariates}
+grr_cov <- grr_grid %>%
+  filter(role != "Interval index") %>%
+  group_by(dataset, phase, k) %>%
+  mutate(targets = paste(sort(unique(target)), collapse = ", ")) %>%
+  ungroup() %>%
+  select(dataset, phase, k, targets, epsilon, ratio) %>%
+  distinct() %>%
+  pivot_wider(names_from = epsilon, values_from = ratio,
+              names_prefix = "eps", values_fn = unique) %>%
+  arrange(factor(dataset, levels = DATASET_ORDER), phase, k)
+
+stopifnot(nrow(grr_cov) == 20L, !anyNA(grr_cov))
+
+kable(grr_cov %>%
+        mutate(across(starts_with("eps"), ~ sprintf("%.3f", .x))) %>%
+        rename(Dataset = dataset, Phase = phase, `$k$` = k, `Mechanisms` = targets),
+      caption = "Ratio $\\mathrm{Var}_{\\mathrm{GRR}}/\\mathrm{Var}_{\\mathrm{OUE}}$ for every categorical and binary mechanism applied to a covariate, and for the event indicator $\\delta$, at the seven representative total budgets. A ratio below 1 means GRR has the smaller variance. All 20 rows are below 1 at all seven budgets; the ratio is exactly $1/4$ whenever $k = 2$ and is bounded by $(k-1)/4$ in general, so no budget on the grid, and indeed no positive budget at all, would favour OUE for these variables.",
+      col.names = c("Dataset", "Phase", "$k$", "Mechanisms",
+                    sprintf("$\\varepsilon=%s$", as.character(EPS_REP))),
+      escape = FALSE, booktabs = TRUE, linesep = "",
+      align = paste0("llrl", strrep("r", length(EPS_REP)))) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r grr-prose-check}
+cov_rows <- grr_grid %>% filter(role != "Interval index")
+int_rows <- grr_grid %>% filter(role == "Interval index")
+eps_star_by_ds <- int_rows %>% distinct(dataset, eps_star) %>%
+  arrange(eps_star) %>% pull(eps_star, name = dataset)
+
+grr_quoted <- tribble(
+  ~what,                                   ~value,                                        ~expected, ~tol,
+  "targets in tabS6",                      nrow(grr_targets),                             58,        0,
+  "rows in tabS6",                         nrow(grr_grid),                                406,       0,
+  "covariate/delta mechanisms",            nrow(distinct(cov_rows, dataset, phase, target)), 53,   0,
+  "all covariate/delta rows GRR-optimal",  as.numeric(all(cov_rows$grr_opt)),             1,         0,
+  "largest covariate domain k",            max(cov_rows$k),                               4,         0,
+  "largest covariate ratio",               max(cov_rows$ratio),                           0.747,     0.0005,
+  "ratio at k = 2 (exactly 1/4)",          max(abs(cov_rows$ratio[cov_rows$k == 2] - 0.25)), 0,      1e-12,
+  "interval-index rows failing",           sum(!int_rows$grr_opt),                        24,        0,
+  "worst interval-index ratio",            max(int_rows$ratio),                           2.97,      0.005,
+  "analytic ratio bound (largest K)",      (max(int_rows$k) - 1) / 4,                     3,         0,
+  "largest covariate ratio bound",         (max(cov_rows$k) - 1) / 4,                     0.75,      0,
+  "eps* lung",                             eps_star_by_ds[["lung"]],                      6.2,       0.05,
+  "eps* flchain",                          eps_star_by_ds[["flchain"]],                   11.7,      0.05,
+  "eps* colon",                            eps_star_by_ds[["colon"]],                     12.8,      0.05,
+  "eps* rotterdam",                        eps_star_by_ds[["rotterdam"]],                 13.2,      0.05,
+  "eps* pbc",                              eps_star_by_ds[["pbc"]],                       16.1,      0.05
+)
+bad <- grr_quoted %>% filter(abs(value - expected) > tol)
+if (nrow(bad) > 0) { print(as.data.frame(bad)); stop("Experiment F: a quoted figure no longer matches.") }
+
+stopifnot(
+  identical(int_rows$dataset[which.max(int_rows$ratio)], "flchain"),
+  int_rows$epsilon[which.max(int_rows$ratio)] == min(EPS_REP),
+  identical(sort(int_rows$dataset[int_rows$epsilon == 10 & int_rows$grr_opt]), "lung"),
+  identical(sort(EPS_REP)[1:2],
+            sort(unique(kpi_summary$epsilon[is.finite(kpi_summary$epsilon)]))[1:2])
+)
+cat(sprintf("Experiment F: %d quoted figures re-derived, all within tolerance.\n", nrow(grr_quoted)))
+
+rec_lines <- read_record_doc("internal-record.md")
+eps_chr   <- as.character(EPS_REP)
+
+exp_budget <- grr_grid %>%
+  filter(role != "Interval index") %>%
+  distinct(dataset, q, phase, epsilon, eps_j) %>%
+  mutate(epsilon = as.character(epsilon), eps_j = fmt_g(eps_j)) %>%
+  pivot_wider(names_from = epsilon, values_from = eps_j) %>%
+  arrange(factor(dataset, levels = DATASET_ORDER), phase) %>%
+  mutate(q = as.character(q)) %>%
+  select(dataset, q, phase, all_of(eps_chr)) %>%
+  as.matrix() %>% unname()
+md_check(md_table(rec_lines, "データセット", "$q$"), exp_budget, "§2")
+
+norm_mech <- function(x) vapply(x, function(s) {
+  v <- trimws(strsplit(s, ",", fixed = TRUE)[[1]])
+  v[v == "δ"] <- "delta (event indicator)"
+  paste(sort(v), collapse = ", ")
+}, character(1), USE.NAMES = FALSE)
+
+exp_cov <- grr_cov %>%
+  mutate(across(starts_with("eps"), ~ sprintf("%.3f", .x)),
+         k = as.character(k), targets = norm_mech(targets)) %>%
+  select(dataset, phase, k, targets, starts_with("eps")) %>%
+  as.matrix() %>% unname()
+act_cov <- md_table(rec_lines, "Dataset", "Phase")
+if (!is.null(act_cov) && ncol(act_cov) == ncol(exp_cov)) act_cov[, 4] <- norm_mech(act_cov[, 4])
+md_check(act_cov, exp_cov, "§3.1")
+
+exp_int <- grr_grid %>%
+  filter(role == "Interval index") %>%
+  transmute(dataset,
+            K        = as.character(k),
+            epsilon  = as.character(epsilon),
+            eps_j    = fmt_g(eps_j),
+            v_grr    = fmt_g(v_grr),
+            v_oue    = fmt_g(v_oue),
+            ratio    = sprintf("%.3f", ratio),
+            thresh   = fmt_g(thresh),
+            opt      = if_else(grr_opt, "Yes", "No"),
+            eps_star = sprintf("%.2f", eps_star)) %>%
+  as.matrix() %>% unname()
+md_check(md_table(rec_lines, "Dataset", "$K$"), exp_int, "§3.2")
+
+if (!is.null(rec_lines)) {
+  cat(sprintf("Experiment F: internal-record.md re-checked against tabS6 -- %d + %d + %d rows agree.\n",
+              nrow(exp_budget), nrow(exp_cov), nrow(exp_int)))
+}
+```
+
+```{r tab-fpr-full}
+fpr_full_detail <- read.csv(file.path(EVAL_DIR, "fpr_detail_reffix.csv"), stringsAsFactors = FALSE) %>%
+  unify_output() %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3"))
+fpr_full <- fpr_full_detail %>%
+  group_by(dataset, epsilon, phase) %>%
+  summarise(mean_fpr = mean(fpr, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(dataset, epsilon, phase)
+stopifnot(nrow(fpr_full) == length(DATASET_ORDER) * 15L * 3L,
+          all(fpr_full$mean_fpr[is.infinite(fpr_full$epsilon)] == 0))
+tabS3_full <- fpr_full %>%
+  mutate(mean_fpr = sprintf("%.3f", mean_fpr)) %>%
+  select(dataset, epsilon, phase, mean_fpr) %>%
+  pivot_wider(names_from = phase, values_from = mean_fpr) %>%
+  arrange(dataset, epsilon) %>%
+  mutate(dataset = as.character(dataset),
+         epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)))
+stopifnot(nrow(tabS3_full) == length(DATASET_ORDER) * 15L)
+
+tabS3_ref <- read.csv(file.path(OUT_DIR, "tabS3_fpr_summary_reffix.csv"),
+                      stringsAsFactors = FALSE, check.names = FALSE) %>%
+  mutate(epsilon = as.character(epsilon),
+         across(c(`Phase 1`, `Phase 2`, `Phase 3`), ~ sprintf("%.3f", as.numeric(.x))))
+tabS3_sub <- tabS3_full %>% semi_join(tabS3_ref, by = c("dataset", "epsilon")) %>%
+  arrange(match(dataset, DATASET_ORDER), as.numeric(epsilon))
+tabS3_ref <- tabS3_ref %>% arrange(match(dataset, DATASET_ORDER), as.numeric(epsilon))
+stopifnot(nrow(tabS3_sub) == length(DATASET_ORDER) * 6L,
+          identical(as.data.frame(tabS3_sub), as.data.frame(tabS3_ref)))
+cat(sprintf("tabS3_fpr_full: %d rows (5 datasets x 15 epsilon); the 30 shared rows agree with tabS3_fpr_summary_reffix.\n",
+            nrow(tabS3_full)))
+
+save_tbl(tabS3_full, "tabS3_fpr_full", digits = 3,
+         col.names = c("Dataset", "$\\varepsilon$", "Phase 1", "Phase 2", "Phase 3"))
+
+kable(tabS3_full,
+      caption = "Mean FPR by dataset, $\\varepsilon$ and phase over the full 15-point grid (input perturbation only; reference-level-fix arm). The six-budget digest is Table S3.",
+      col.names = c("Dataset", "$\\varepsilon$", "Phase 1", "Phase 2", "Phase 3"),
+      escape = FALSE, booktabs = TRUE, linesep = "") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE, font_size = 9) %>%
+  scroll_box(height = "400px")
+```
+
+```{r phase3-discordance-load}
+h_base     <- read.csv(file.path(EVAL_DIR, "phase3_discordance_baseline.csv"), stringsAsFactors = FALSE)
+h_ladder   <- read.csv(file.path(EVAL_DIR, "phase3_discordance_ladder.csv"), stringsAsFactors = FALSE)
+h_decomp   <- read.csv(file.path(EVAL_DIR, "phase3_discordance_decomp.csv"), stringsAsFactors = FALSE)
+h_ksweep   <- read.csv(file.path(EVAL_DIR, "phase3_discordance_ksweep.csv"), stringsAsFactors = FALSE)
+h_haz      <- read.csv(file.path(EVAL_DIR, "phase3_discordance_hazard.csv"), stringsAsFactors = FALSE)
+h_boundary <- read.csv(file.path(EVAL_DIR, "phase3_discordance_boundary.csv"), stringsAsFactors = FALSE)
+h_lev      <- read.csv(file.path(EVAL_DIR, "phase3_discordance_leverage.csv"), stringsAsFactors = FALSE)
+h_sampleyr <- read.csv(file.path(EVAL_DIR, "phase3_discordance_sampleyr.csv"), stringsAsFactors = FALSE)
+
+H_TARGETS <- data.frame(
+  dataset  = c("flchain", "lung", "flchain"),
+  variable = c("kappa", "ph.karno", "sample.yr"),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(h_base) == 53, sum(h_base$discordant) == 3,
+  setequal(paste(h_base$dataset[h_base$discordant], h_base$variable[h_base$discordant]),
+           paste(H_TARGETS$dataset, H_TARGETS$variable)),
+  nrow(h_ladder) == 5 * 14, nrow(h_decomp) == 14,
+  all(c("D_logit_ns", "C_logit_factor", "B_cloglog_factor", "Ap_cox_coarsened") %in% h_ksweep$model_id),
+  nrow(h_haz) == 5, nrow(h_boundary) == 53, nrow(h_lev) == 3, nrow(h_sampleyr) == 9
+)
+
+H_PRODUCER <- file.path(PROJECT_DIR, "main/04_evaluation/phase3_discordance.Rmd")
+h_inputs <- file.path(EVAL_DIR, paste0("phase3_discordance_",
+  c("baseline", "ladder", "decomp", "ksweep", "hazard", "boundary", "leverage", "sampleyr"),
+  ".csv"))
+if (min(file.mtime(h_inputs)) < file.mtime(H_PRODUCER)) {
+  stop("phase3_discordance_*.csv is older than phase3_discordance.Rmd; re-knit the producer.",
+       call. = FALSE)
+}
+
+h_step <- function(ds, v, col) h_decomp[[col]][h_decomp$dataset == ds & h_decomp$variable == v]
+h_kp <- function(ds, v, K) {
+  r <- h_ksweep[h_ksweep$dataset == ds & h_ksweep$variable == v &
+                h_ksweep$model_id == "D_logit_ns" & h_ksweep$K_actual == K & h_ksweep$usable, ]
+  stopifnot(nrow(r) == 1)
+  r$p_value
+}
+h_sampleyr_cor <- h_sampleyr$cor_censored[1]
+```
+
+```{r tab-phase3-discordance}
+H_MODEL_LABEL <- c(
+  D_logit_ns       = "D. Discrete-time, logit, spline baseline (Phase 3)",
+  C_logit_factor   = "C. Discrete-time, logit, saturated baseline",
+  B_cloglog_factor = "B. Discrete-time, cloglog, saturated baseline",
+  Ap_cox_coarsened = "A'. Cox, times grouped into K intervals",
+  A_cox            = "A. Cox, exact times"
+)
+
+h_block_ladder <- h_ladder %>%
+  semi_join(H_TARGETS, by = c("dataset", "variable")) %>%
+  transmute(dataset, variable, model_id,
+            model = H_MODEL_LABEL[model_id],
+            K = ifelse(is.na(K_actual), NA_integer_, as.integer(K_actual)),
+            beta, se, z, p_value, block = 1L,
+            order_in_block = match(model_id, names(H_MODEL_LABEL)))
+
+h_kmax <- h_ksweep %>%
+  filter(usable, model_id == "D_logit_ns") %>%
+  group_by(dataset) %>% summarise(K_max = max(K_actual), .groups = "drop")
+
+h_block_k <- h_ksweep %>%
+  filter(usable, model_id == "D_logit_ns") %>%
+  semi_join(H_TARGETS, by = c("dataset", "variable")) %>%
+  left_join(h_kmax, by = "dataset") %>%
+  filter(K_target == K_base - 2L | K_target == K_base + 2L | K_actual == K_max) %>%
+  transmute(dataset, variable, model_id,
+            model = sprintf("D at K = %d%s", as.integer(K_actual),
+                            ifelse(K_actual == K_max, " (largest swept)", "")),
+            K = as.integer(K_actual), beta, se, z, p_value, block = 2L,
+            order_in_block = as.integer(K_actual))
+
+tab_h <- bind_rows(h_block_ladder, h_block_k) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(match(paste(dataset, variable), paste(H_TARGETS$dataset, H_TARGETS$variable)),
+          block, order_in_block) %>%
+  transmute(Dataset = as.character(dataset), Variable = variable, Model = model,
+            K = ifelse(is.na(K), "--", as.character(K)),
+            Beta = sprintf("%.4f", beta), SE = sprintf("%.4f", se),
+            z = sprintf("%.3f", z), p = sprintf("%.4f", p_value),
+            Sig = ifelse(p_value < 0.05, "Yes", "No"))
+
+save_tbl(tab_h, "tabS7_phase3_baseline_discordance", label = "tab:phase3-discordance")
+
+kable(tab_h, booktabs = TRUE, align = "llllrrrrl",
+      caption = paste0("Cox against the discrete-time model at $\\varepsilon = \\infty$ for the three ",
+                       "coefficients whose significance verdict differs. Rows D to A remove, one at a ",
+                       "time, the four respects in which the Phase 3 specification differs from the Cox ",
+                       "fit; the last rows repeat the Phase 3 specification at other numbers of ",
+                       "intervals. No Monte Carlo replication is involved: at $\\varepsilon = \\infty$ ",
+                       "the Phase 3 pipeline applies no perturbation and its output is deterministic.")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, font_size = 12) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+
+```{r phase3-decomposition-digest}
+h_dec_tbl <- h_decomp %>%
+  semi_join(H_TARGETS, by = c("dataset", "variable")) %>%
+  arrange(match(paste(dataset, variable), paste(H_TARGETS$dataset, H_TARGETS$variable))) %>%
+  transmute(Dataset = dataset, Variable = variable,
+            `z (Phase 3)` = sprintf("%.3f", z_D), `z (Cox)` = sprintf("%.3f", z_A),
+            `Baseline (%)`       = sprintf("%+.1f", 100 * (exp(d_baseline) - 1)),
+            `Link (%)`           = sprintf("%+.1f", 100 * (exp(d_link) - 1)),
+            `Estimator (%)`      = sprintf("%+.1f", 100 * (exp(d_estimator) - 1)),
+            `Discretization (%)` = sprintf("%+.1f", 100 * (exp(d_discretization) - 1)),
+            `Total (%)`          = sprintf("%+.1f", 100 * (exp(d_total) - 1)))
+
+kable(h_dec_tbl, booktabs = TRUE,
+      caption = paste0("Decomposition of the change in $|z|$ between the Phase 3 specification and ",
+                       "the Cox fit. Each column is the percentage change produced by removing one ",
+                       "difference; a positive value means $|z|$ grows as that difference is removed.")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r phase3-ksweep-digest}
+h_k_tbl <- h_ksweep %>%
+  filter(usable, model_id == "D_logit_ns") %>%
+  left_join(h_base %>% select(dataset, variable, sig_cox), by = c("dataset", "variable")) %>%
+  mutate(discordant = (p_value < 0.05) != sig_cox) %>%
+  group_by(dataset, K_actual, K_base) %>%
+  summarise(n_coef = n(), n_discordant = sum(discordant),
+            which = paste(variable[discordant], collapse = ", "), .groups = "drop") %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         K = ifelse(K_actual == K_base, sprintf("%d (used)", K_actual), as.character(K_actual))) %>%
+  arrange(dataset, K_actual) %>%
+  transmute(Dataset = as.character(dataset), K, `Coefficients` = as.character(n_coef),
+            `Discordant` = as.character(n_discordant), `Which` = ifelse(which == "", "--", which),
+            K_actual, K_base)
+
+kable(h_k_tbl %>% select(-K_actual, -K_base), booktabs = TRUE,
+      caption = paste0("Discordant coefficients per dataset as the number of intervals is varied, ",
+                       "under the unchanged Phase 3 specification and $\\alpha = 0.05$. Fits that did ",
+                       "not converge are omitted; all of them are at $K \\le 6$.")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+```{r phase3-prose-check}
+h_quoted <- tibble::tribble(
+  ~what,                              ~quoted,  ~actual,                                                   ~tol,
+  "median |z| ratio over 53 coefs",   0.975,    median(h_base$z_ratio),                                     5e-4,
+  "sample.yr |z| change (%)",         42.48,       100 * abs(h_boundary$observed_change[
+                                                  h_boundary$dataset == "flchain" &
+                                                  h_boundary$variable == "sample.yr"]),                     0.05,
+  "sample.yr discretization step (%)", 72.50,      100 * (exp(h_step("flchain", "sample.yr",
+                                                  "d_discretization")) - 1),                                0.05,
+  "sample.yr link step (%)",          0.5,      100 * (exp(h_step("flchain", "sample.yr", "d_link")) - 1),  0.05,
+  "sample.yr baseline step (%)",      0.7,      100 * (exp(h_step("flchain", "sample.yr",
+                                                  "d_baseline")) - 1),                                      0.05,
+  "sample.yr p at K=13",              0.070,    h_kp("flchain", "sample.yr", 13),                           5e-4,
+  "sample.yr p at K=20",              0.035,    h_kp("flchain", "sample.yr", 20),                           5e-4,
+  "sample.yr p at K=100",             0.0051,   h_kp("flchain", "sample.yr", 100),                          5e-5,
+  "ph.karno link step (%)",           29,       100 * (exp(h_step("lung", "ph.karno", "d_link")) - 1),      0.5,
+  "ph.karno discretization step (%)", 5.8,      100 * (exp(h_step("lung", "ph.karno",
+                                                  "d_discretization")) - 1),                                0.05,
+  "lung median fitted hazard",        0.1145,   h_haz$h_fit_med[h_haz$dataset == "lung"],                   5e-4,
+  "lung rows with hazard > 0.1 (%)",  58,       100 * h_haz$frac_h_gt_10pct[h_haz$dataset == "lung"],       0.5,
+  "kappa logit inflation (%)",        21.72,    100 * (1 / exp(h_step("flchain", "kappa", "d_link")) - 1),  0.05,
+  "kappa |z| change (%)",             9.48,        100 * abs(h_boundary$observed_change[
+                                                  h_boundary$dataset == "flchain" &
+                                                  h_boundary$variable == "kappa"]),                         0.05,
+  "kappa p_cox",                      0.0532,   h_boundary$p_cox[h_boundary$dataset == "flchain" &
+                                                  h_boundary$variable == "kappa"],                          5e-5,
+  "kappa p_cox / alpha",              1.06,     h_boundary$p_over_alpha[h_boundary$dataset == "flchain" &
+                                                  h_boundary$variable == "kappa"],                          5e-3,
+  "kappa flip margin (%)",            1.4,      100 * h_boundary$margin_needed[h_boundary$dataset == "flchain" &
+                                                  h_boundary$variable == "kappa"],                          0.05,
+  "kappa max fitted hazard, top decile", 0.84,  h_lev$h_max_top10[h_lev$variable == "kappa"],               5e-3,
+  "sample.yr correlation with time (censored)", -0.83, h_sampleyr_cor,                                      5e-3
+) %>%
+  mutate(diff = abs(actual - quoted), ok = diff <= tol)
+
+stopifnot(all(h_quoted$ok))
+
+h_near <- h_boundary %>% mutate(near = abs(margin_needed) <= 0.10)
+stopifnot(
+  sum(h_near$near) == 6, sum(h_near$near & h_near$discordant) == 2,
+  sum(!h_near$near) == 47, sum(!h_near$near & h_near$discordant) == 1,
+  identical(h_near$variable[!h_near$near & h_near$discordant], "sample.yr"),
+  all(h_ksweep %>% filter(usable, model_id == "D_logit_ns", dataset == "lung",
+                          variable == "ph.karno") %>% pull(p_value) >= 0.05),
+  min(h_ksweep %>% filter(usable, model_id == "D_logit_ns", dataset == "flchain",
+                          variable == "sample.yr", p_value < 0.05) %>% pull(K_actual)) == 20,
+  min(h_ksweep$K_actual[h_ksweep$usable & h_ksweep$dataset == "lung" &
+                        h_ksweep$model_id == "D_logit_ns"]) == 6,
+  max(h_ksweep$K_actual[h_ksweep$usable & h_ksweep$dataset == "lung" &
+                        h_ksweep$model_id == "D_logit_ns"]) == 99,
+  any(h_k_tbl$Which == "edema" & h_k_tbl$Dataset == "pbc"),
+  any(grepl("hormon", h_k_tbl$Which) & h_k_tbl$Dataset == "rotterdam"),
+  all((h_k_tbl %>% group_by(Dataset) %>%
+         summarise(ok = all(as.integer(Discordant)[K_actual < K_base] >=
+                              as.integer(Discordant)[K_actual == K_base]),
+                   .groups = "drop"))$ok),
+  identical(as.integer(h_k_tbl$Discordant)[h_k_tbl$Dataset == "flchain" & h_k_tbl$K_actual >= 20],
+            c(0L, 1L, 0L, 0L, 0L)),
+  !grepl("sample.yr", paste(h_k_tbl$Which[h_k_tbl$Dataset == "flchain" &
+                                            h_k_tbl$K_actual >= 20], collapse = " ")),
+  all(as.integer(h_k_tbl$Discordant)[h_k_tbl$Dataset == "lung"] == 1)
+)
+cat(sprintf("Experiment H: %d quoted figures re-derived, all within tolerance.\n", nrow(h_quoted)))
+
+h_rec <- read_record_doc("internal-record.md")
+
+md_check(md_table(h_rec, "データセット", "変数"),
+         unname(as.matrix(tab_h)), "§3.1 (tabS7)", "internal-record.md", "tabS7")
+md_check(md_table(h_rec, "Dataset", "Variable"),
+         unname(as.matrix(h_dec_tbl)), "§3.2 (decomposition)", "internal-record.md", "phase3_discordance_decomp.csv")
+md_check(md_table(h_rec, "データセット", "K"),
+         unname(as.matrix(h_k_tbl %>% select(-K_actual, -K_base))), "§3.3 (K sweep)", "internal-record.md", "phase3_discordance_ksweep.csv")
+
+h_verdict <- h_ksweep %>%
+  filter(usable, model_id %in% c("D_logit_ns", "B_cloglog_factor"), K_actual == K_base) %>%
+  semi_join(H_TARGETS, by = c("dataset", "variable")) %>%
+  select(dataset, variable, model_id, p_value) %>%
+  pivot_wider(names_from = model_id, values_from = p_value) %>%
+  left_join(h_base %>% select(dataset, variable, p_cox, sig_cox), by = c("dataset", "variable")) %>%
+  arrange(match(paste(dataset, variable), paste(H_TARGETS$dataset, H_TARGETS$variable)))
+fmt_pv <- function(p) sprintf("p=%.4f %s", p, ifelse(p < 0.05, "有意", "非有意"))
+exp_verdict <- h_verdict %>%
+  transmute(target = paste(dataset, variable),
+            cox = fmt_pv(p_cox), logit = fmt_pv(D_logit_ns), cloglog = fmt_pv(B_cloglog_factor),
+            verdict = ifelse((B_cloglog_factor < 0.05) == sig_cox, "解消", "残る")) %>%
+  as.matrix() %>% unname()
+md_check(md_table(h_rec, "対象", "Cox"), exp_verdict, "§8", "internal-record.md", "phase3_discordance_ksweep.csv")
+
+if (!is.null(h_rec)) {
+  cat(sprintf("Experiment H: internal-record.md re-checked -- %d + %d + %d + %d rows agree.\n",
+              nrow(tab_h), nrow(h_dec_tbl), nrow(h_k_tbl), nrow(exp_verdict)))
+}
+```
+
+```{r expc-load}
+EXPC_ARMS <- c("data-driven", "fixed", "widened")
+expc_paths <- c(
+  `data-driven` = file.path(SIM_DIR, "reffix/all_phase1_reffix.parquet"),
+  `fixed`       = file.path(SIM_DIR, "phase1_bounds_fixed/all_phase1_fixed.parquet"),
+  `widened`     = file.path(SIM_DIR, "phase1_bounds_widened/all_phase1_widened.parquet"))
+stopifnot(all(file.exists(expc_paths)))
+
+expc_raw <- map_dfr(EXPC_ARMS, function(a)
+  read_parquet(expc_paths[[a]]) %>%
+    select(dataset, variable, epsilon, iteration, beta, se, p_value, c_index, converged) %>%
+    mutate(arm = a))
+
+expc_base <- read.csv(file.path(PREP_DIR, "baseline_cox_reffix.csv"), stringsAsFactors = FALSE)
+expc_sig  <- expc_base %>% filter(p_value < 0.05) %>% select(dataset, variable)
+expc_cbase <- expc_base %>% distinct(dataset, c_index) %>% rename(c_baseline = c_index)
+
+expc_join_chk <- expc_raw %>%
+  distinct(arm, dataset, variable) %>%
+  inner_join(expc_sig, by = c("dataset", "variable")) %>%
+  count(arm, dataset, name = "n_joined") %>%
+  left_join(expc_sig %>% count(dataset, name = "n_sig"), by = "dataset")
+stopifnot(nrow(expc_join_chk) == length(EXPC_ARMS) * length(DATASET_ORDER),
+          all(expc_join_chk$n_joined == expc_join_chk$n_sig))
+
+expc_names <- expc_raw %>% distinct(arm, dataset, variable) %>%
+  group_by(arm, dataset) %>% summarise(vars = paste(sort(variable), collapse = "|"), .groups = "drop") %>%
+  pivot_wider(names_from = arm, values_from = vars)
+expc_name_bad <- expc_names %>%
+  filter(`data-driven` != fixed | `data-driven` != widened)
+if (nrow(expc_name_bad) > 0) {
+  print(expc_name_bad)
+  stop("Experiment C: the arms do not share the same coefficient names. A shared name can denote a ",
+       "different contrast, and the LSR comparison would silently mix them.")
+}
+cat(sprintf("Experiment C: all %d datasets carry identical coefficient name sets across the %d arms.\n",
+            nrow(expc_names), length(EXPC_ARMS)))
+cat(sprintf("Experiment C: %d rows over %d arms; all %d baseline-significant coefficients join in every arm.\n",
+            nrow(expc_raw), length(EXPC_ARMS), nrow(expc_sig)))
+
+expc_lsr <- expc_raw %>%
+  filter(converged) %>%
+  inner_join(expc_sig, by = c("dataset", "variable")) %>%
+  group_by(arm, dataset, epsilon, variable) %>%
+  summarise(lsr = mean(p_value >= 0.05), .groups = "drop") %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(mean_lsr = mean(lsr), max_lsr = max(lsr), .groups = "drop")
+
+expc_c <- expc_raw %>%
+  filter(converged) %>%
+  distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(mean_c = mean(c_index), sd_c = sd(c_index), .groups = "drop") %>%
+  left_join(expc_cbase, by = "dataset") %>%
+  mutate(delta_c = c_baseline - mean_c)
+
+expc <- expc_lsr %>%
+  left_join(expc_c %>% select(arm, dataset, epsilon, mean_c, sd_c, delta_c),
+            by = c("arm", "dataset", "epsilon")) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         arm = factor(arm, levels = EXPC_ARMS))
+
+expc_lsr_mcse <- expc_raw %>%
+  filter(converged) %>%
+  inner_join(expc_sig, by = c("dataset", "variable")) %>%
+  group_by(arm, dataset, epsilon, iteration) %>%
+  summarise(lsr_iter = mean(p_value >= 0.05), n_coef = n(), .groups = "drop") %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(n_iter = n(), n_coef = first(n_coef), n_coef_min = min(n_coef), n_coef_max = max(n_coef),
+            mean_lsr = mean(lsr_iter), sd_iter = sd(lsr_iter),
+            se_lsr = sd(lsr_iter) / sqrt(n()),
+            se_binomial = sqrt(mean(lsr_iter) * (1 - mean(lsr_iter)) / n()),
+            .groups = "drop") %>%
+  arrange(match(dataset, DATASET_ORDER), match(arm, EXPC_ARMS), epsilon)
+stopifnot(nrow(expc_lsr_mcse) == length(EXPC_ARMS) * length(DATASET_ORDER) * 15L,
+          all(expc_lsr_mcse$n_coef_min == expc_lsr_mcse$n_coef_max))
+expc_mcse_chk <- expc_lsr_mcse %>%
+  inner_join(expc_lsr %>% select(arm, dataset, epsilon, mean_lsr_coef = mean_lsr),
+             by = c("arm", "dataset", "epsilon"))
+stopifnot(nrow(expc_mcse_chk) == nrow(expc_lsr_mcse),
+          max(abs(expc_mcse_chk$mean_lsr - expc_mcse_chk$mean_lsr_coef)) < 1e-12)
+write.csv(expc_lsr_mcse %>%
+            select(dataset, arm, epsilon, n_iter, n_coef, mean_lsr, sd_iter, se_lsr, se_binomial) %>%
+            mutate(epsilon  = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)),
+                   mean_lsr = vapply(mean_lsr,    function(x) sprintf("%.6f", x), character(1)),
+                   sd_iter  = vapply(sd_iter,     function(x) sprintf("%.6f", x), character(1)),
+                   se_lsr   = vapply(se_lsr,      function(x) sprintf("%.6f", x), character(1)),
+                   se_binomial = vapply(se_binomial, function(x) sprintf("%.6f", x), character(1))),
+          file.path(EVAL_DIR, "expc_lsr_mcse.csv"), row.names = FALSE)
+expc_mcse_pbc250 <- expc_lsr_mcse %>% filter(dataset == "pbc", arm == "fixed", epsilon == 250)
+stopifnot(nrow(expc_mcse_pbc250) == 1L)
+cat(sprintf("wrote expc_lsr_mcse.csv (%d rows). pbc / fixed / eps = 250: mean LSR %.4f, per-iteration SD %.4f, MC SE %.5f (binomial approx. %.5f), B = %d.\n",
+            nrow(expc_lsr_mcse), expc_mcse_pbc250$mean_lsr, expc_mcse_pbc250$sd_iter,
+            expc_mcse_pbc250$se_lsr, expc_mcse_pbc250$se_binomial, expc_mcse_pbc250$n_iter))
+```
+
+```{r expc-epsstar}
+eps_star <- function(df, thr) {
+  df %>% filter(is.finite(epsilon), mean_lsr <= thr) %>%
+    group_by(arm, dataset) %>% summarise(eps = min(epsilon), .groups = "drop")
+}
+expc_star <- full_join(eps_star(expc, 0.50) %>% rename(eps_lsr50 = eps),
+                       eps_star(expc, 0.10) %>% rename(eps_lsr10 = eps),
+                       by = c("arm", "dataset")) %>%
+  complete(arm, dataset) %>%
+  mutate(across(c(eps_lsr50, eps_lsr10), ~ ifelse(is.na(.x), Inf, .x)))
+
+expc_shift <- expc_star %>%
+  select(arm, dataset, eps_lsr50) %>%
+  pivot_wider(names_from = arm, values_from = eps_lsr50) %>%
+  mutate(`fixed / data-driven` = fixed / `data-driven`,
+         `widened / data-driven` = widened / `data-driven`)
+kable(expc_shift, digits = 3,
+      caption = "$\\varepsilon^{*}_{\\rm LSR \\le 0.50}$ by arm, and the multiplicative shift relative to data-driven bounds.") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+expc_shift_txt <- expc_shift %>%
+  mutate(txt = sprintf("%s: %s -> %s (x%s)", dataset,
+                       ifelse(is.finite(`data-driven`), as.character(`data-driven`), "> 1000"),
+                       ifelse(is.finite(fixed), as.character(fixed), "> 1000"),
+                       ifelse(is.finite(`fixed / data-driven`),
+                              formatC(`fixed / data-driven`, format = "g", digits = 3), "Inf")))
+cat("epsilon*_{LSR<=0.50}, data-driven -> fixed:\n")
+cat(paste0("  ", expc_shift_txt$txt, collapse = "\n"), "\n")
+
+write.csv(expc_star %>%
+            mutate(across(c(eps_lsr50, eps_lsr10),
+                          ~ ifelse(is.finite(.x), as.character(.x), "> 1000"))) %>%
+            arrange(match(dataset, DATASET_ORDER), arm),
+          file.path(EVAL_DIR, "expc_eps_star.csv"), row.names = FALSE)
+write.csv(expc %>%
+            filter(epsilon %in% c(1, 10, 30, 100)) %>%
+            select(dataset, epsilon, arm, mean_lsr) %>%
+            mutate(mean_lsr = sprintf("%.4f", mean_lsr)) %>%
+            arrange(match(dataset, DATASET_ORDER), epsilon, arm),
+          file.path(EVAL_DIR, "expc_lsr_summary.csv"), row.names = FALSE)
+write.csv(expc %>%
+            filter(is.infinite(epsilon)) %>%
+            select(dataset, arm, mean_c, delta_c) %>%
+            mutate(mean_c = sprintf("%.7f", mean_c), delta_c = sprintf("%.7f", delta_c)) %>%
+            arrange(match(dataset, DATASET_ORDER), arm),
+          file.path(EVAL_DIR, "expc_inf_cindex.csv"), row.names = FALSE)
+cat("wrote expc_eps_star.csv / expc_lsr_summary.csv / expc_inf_cindex.csv\n")
+```
+
+```{r fig-bounds-comparison, fig.cap="Loss of Significance Rate (LSR) vs privacy budget under three ways of choosing the clipping bounds, for all five datasets (Phase 1, covariates only, B=1000). Only the bounds differ between arms; the mechanism, budget split, seeds and model are identical. The fixed arm is the one for which covariate-level local DP formally holds. The dashed line marks LSR = 0.5.", fig.width=12, fig.height=5}
+ARM_COLORS <- c("data-driven" = "#0072B2", "fixed" = "#D55E00", "widened" = "#009E73")
+ARM_LABELS <- c("data-driven" = "data-driven", "fixed" = "fixed", "widened" = "widened")
+
+p_bounds <- expc %>%
+  filter(is.finite(epsilon)) %>%
+  ggplot(aes(x = epsilon, y = mean_lsr, colour = arm, shape = arm)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey45", linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.7) +
+  facet_wrap(~ dataset, nrow = 1, labeller = labeller(dataset = DATASET_LABELS)) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1000")) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+  scale_colour_manual(values = ARM_COLORS, labels = ARM_LABELS, name = NULL) +
+  scale_shape_manual(values = c(16, 17, 15), labels = ARM_LABELS, name = NULL) +
+  labs(x = expression(paste("Privacy budget ", epsilon, " (log scale)")),
+       y = "Mean LSR") +
+  theme_main_fig() +
+  theme(legend.position = "bottom",
+        panel.spacing.x = unit(14, "pt")) +
+  guides(colour = guide_legend(nrow = 1), shape = guide_legend(nrow = 1))
+p_bounds
+save_fig(p_bounds, "fig5_bounds_comparison", width = 12, height = 5)
+```
+
+```{r expc-traintest}
+expc_tt_paths <- c(
+  `data-driven` = file.path(SIM_DIR, "reffix_traintest/all_phase1_reffix_traintest.parquet"),
+  `fixed`       = file.path(SIM_DIR, "phase1_bounds_fixed/all_phase1_fixed_traintest.parquet"),
+  `widened`     = file.path(SIM_DIR, "phase1_bounds_widened/all_phase1_widened_traintest.parquet"))
+has_expc_tt <- all(file.exists(expc_tt_paths))
+cat(sprintf("Experiment C train/test artifacts present: %s\n", has_expc_tt))
+```
+
+```{r expc-traintest-summary, eval=has_expc_tt}
+expc_tt <- map_dfr(EXPC_ARMS, function(a)
+  read_parquet(expc_tt_paths[[a]]) %>%
+    select(dataset, variable, epsilon, iteration, p_value, c_index, c_index_test, converged) %>%
+    mutate(arm = a))
+
+expc_tt_c <- expc_tt %>%
+  filter(converged) %>%
+  distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(mean_c_test = mean(c_index_test, na.rm = TRUE),
+            sd_c_test = sd(c_index_test, na.rm = TRUE),
+            overfit_gap = mean(c_index - c_index_test, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         arm = factor(arm, levels = EXPC_ARMS))
+
+kable(expc_tt_c %>% filter(epsilon %in% c(1, 10, 30, 100, Inf)) %>%
+        select(dataset, epsilon, arm, mean_c_test) %>%
+        pivot_wider(names_from = arm, values_from = mean_c_test) %>%
+        arrange(dataset, epsilon) %>%
+        mutate(epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon))),
+      digits = 4,
+      caption = "Experiment C, out-of-sample: mean test C-index by arm over B=1000 train/test splits.") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  scroll_box(width = "100%", height = "360px")
+```
+
+```{r expc-cells, eval=has_expc_tt}
+local({
+  ins <- expc %>%
+    filter(as.character(dataset) == "pbc", as.character(arm) == "fixed") %>%
+    select(epsilon, mean_c, mean_lsr)
+  tt <- expc_tt_c %>%
+    filter(as.character(dataset) == "pbc", as.character(arm) == "fixed") %>%
+    select(epsilon, mean_c_test)
+  cells <- full_join(ins, tt, by = "epsilon") %>%
+    arrange(epsilon) %>%
+    mutate(epsilon    = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)),
+           mean_c      = vapply(mean_c,      function(x) sprintf("%.6f", x), character(1)),
+           mean_lsr    = vapply(mean_lsr,    function(x) sprintf("%.4f", x), character(1)),
+           mean_c_test = vapply(mean_c_test, function(x) sprintf("%.6f", x), character(1)))
+  stopifnot(nrow(cells) == 15L,
+            !any(is.na(cells$mean_c)), !any(is.na(cells$mean_lsr)), !any(is.na(cells$mean_c_test)))
+  write.csv(cells, file.path(EVAL_DIR, "expc_cells.csv"), row.names = FALSE)
+  cat(sprintf("wrote expc_cells.csv (%d epsilon rows)\n",
+              nrow(cells)))
+})
+```
+
+```{r expc-thresholds, eval=has_expc_tt}
+expc_nonsig <- expc_base %>% filter(p_value >= 0.05) %>% select(dataset, variable)
+expc_fpr <- expc_raw %>%
+  filter(converged, is.finite(epsilon)) %>%
+  inner_join(expc_nonsig, by = c("dataset", "variable")) %>%
+  group_by(arm, dataset, epsilon, variable) %>%
+  summarise(fpr = mean(p_value < 0.05), .groups = "drop") %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(mean_fpr = mean(fpr), .groups = "drop")
+fpr_ref_p1 <- read.csv(file.path(EVAL_DIR, "fpr_detail_reffix.csv"), stringsAsFactors = FALSE) %>%
+  filter(phase == "Phase 1", is.finite(epsilon)) %>%
+  group_by(dataset, epsilon) %>% summarise(mean_fpr_ref = mean(fpr), .groups = "drop")
+fpr_chk <- expc_fpr %>% filter(arm == "data-driven") %>%
+  inner_join(fpr_ref_p1, by = c("dataset", "epsilon"))
+stopifnot(nrow(fpr_chk) == length(DATASET_ORDER) * 14L,
+          max(abs(fpr_chk$mean_fpr - fpr_chk$mean_fpr_ref)) < 1e-12)
+
+expc_min_eps <- min(expc_fpr$epsilon)
+expc_thr_fpr <- expc_fpr %>%
+  arrange(arm, dataset, desc(epsilon)) %>%
+  group_by(arm, dataset) %>%
+  mutate(max_fpr_above = cummax(mean_fpr)) %>%
+  ungroup() %>%
+  filter(max_fpr_above <= 0.10) %>%
+  group_by(arm, dataset) %>%
+  summarise(eps_fpr10 = min(epsilon), .groups = "drop")
+expc_thr_c <- expc_tt_c %>%
+  mutate(arm = as.character(arm), dataset = as.character(dataset)) %>%
+  left_join(expc_tt_c %>% filter(is.infinite(epsilon)) %>%
+              transmute(arm = as.character(arm), dataset = as.character(dataset), base_c = mean_c_test),
+            by = c("arm", "dataset")) %>%
+  mutate(delta = base_c - mean_c_test) %>%
+  filter(is.finite(epsilon), delta <= 0.05) %>%
+  group_by(arm, dataset) %>%
+  summarise(eps_c05 = min(epsilon), .groups = "drop")
+expc_thr <- expand_grid(arm = EXPC_ARMS, dataset = DATASET_ORDER) %>%
+  left_join(expc_thr_c, by = c("arm", "dataset")) %>%
+  left_join(expc_star %>%
+              transmute(arm = as.character(arm), dataset = as.character(dataset),
+                        eps_lsr50 = ifelse(is.finite(eps_lsr50), eps_lsr50, NA_real_),
+                        eps_lsr10 = ifelse(is.finite(eps_lsr10), eps_lsr10, NA_real_)),
+            by = c("arm", "dataset")) %>%
+  left_join(expc_thr_fpr %>% mutate(arm = as.character(arm), dataset = as.character(dataset)),
+            by = c("arm", "dataset")) %>%
+  mutate(across(c(eps_c05, eps_lsr50, eps_lsr10), ~ ifelse(is.na(.x), "> 1000", as.character(.x))),
+         eps_fpr10 = case_when(is.na(eps_fpr10) ~ "> 1000",
+                               eps_fpr10 <= expc_min_eps ~ "---",
+                               TRUE ~ as.character(eps_fpr10)))
+stopifnot(nrow(expc_thr) == length(EXPC_ARMS) * length(DATASET_ORDER), !anyNA(expc_thr))
+
+tab4_ref <- read.csv(file.path(OUT_DIR, "tab4_threshold_reffix.csv"), stringsAsFactors = FALSE,
+                     colClasses = "character") %>%
+  filter(phase == "Phase 1") %>%
+  select(dataset, eps_c05, eps_lsr50, eps_lsr10, eps_fpr10) %>%
+  arrange(match(dataset, DATASET_ORDER))
+dd_chk <- expc_thr %>% filter(arm == "data-driven") %>%
+  select(dataset, eps_c05, eps_lsr50, eps_lsr10, eps_fpr10) %>%
+  arrange(match(dataset, DATASET_ORDER))
+stopifnot(nrow(tab4_ref) == length(DATASET_ORDER),
+          identical(as.data.frame(dd_chk), as.data.frame(tab4_ref)))
+cat("expc thresholds: the data-driven arm reproduces the Phase 1 rows of tab4_threshold_reffix (4 criteria x 5 datasets).\n")
+
+tabS8b <- expc_thr %>%
+  pivot_longer(c(eps_c05, eps_lsr50, eps_lsr10, eps_fpr10), names_to = "criterion", values_to = "eps") %>%
+  mutate(criterion = factor(criterion, levels = c("eps_c05", "eps_lsr50", "eps_lsr10", "eps_fpr10")),
+         arm = factor(arm, levels = EXPC_ARMS)) %>%
+  arrange(criterion, arm) %>%
+  unite("col", criterion, arm, sep = "_") %>%
+  pivot_wider(names_from = col, values_from = eps) %>%
+  arrange(match(dataset, DATASET_ORDER))
+stopifnot(ncol(tabS8b) == 1L + 4L * length(EXPC_ARMS))
+save_tbl(as.data.frame(tabS8b), "tabS8_bounds_thresholds", digits = 0,
+         tex_transform = function(d) {
+           d[] <- lapply(d, function(x) if (is.character(x)) gsub("> 1000", "$>$ 1000", x, fixed = TRUE) else x)
+           d })
+
+kable(expc_thr %>% arrange(match(dataset, DATASET_ORDER), match(arm, EXPC_ARMS)),
+      caption = "Experiment C: $\\varepsilon^{*}$ by bound strategy under the four criteria of Table IV (definitions as in `tab4_threshold`; `> 1000` = not met within the grid; `---` = FPR never exceeds 0.10).",
+      col.names = c("Dataset", "Arm", "$\\varepsilon^*_{\\Delta C \\leq 0.05}$", "$\\varepsilon^*_{\\text{LSR} \\leq 0.5}$",
+                    "$\\varepsilon^*_{\\text{LSR} \\leq 0.1}$", "$\\varepsilon^*_{\\text{FPR} \\leq 0.10}$"),
+      escape = FALSE, booktabs = TRUE, linesep = "") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE, font_size = 10)
+```
+
+```{r tab-bounds-comparison}
+EPS_SHOW_C <- c(1, 5, 10, 30, 100, 1000, Inf)
+tabS8 <- expc %>%
+  filter(epsilon %in% EPS_SHOW_C) %>%
+  select(dataset, epsilon, arm, mean_lsr, mean_c, delta_c) %>%
+  pivot_wider(names_from = arm, values_from = c(mean_lsr, mean_c, delta_c)) %>%
+  arrange(dataset, epsilon) %>%
+  mutate(epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)))
+
+if (has_expc_tt) {
+  tabS8 <- tabS8 %>%
+    left_join(expc_tt_c %>%
+                filter(epsilon %in% EPS_SHOW_C) %>%
+                select(dataset, epsilon, arm, mean_c_test) %>%
+                pivot_wider(names_from = arm, values_from = mean_c_test,
+                            names_prefix = "mean_c_test_") %>%
+                mutate(epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)),
+                       dataset = as.character(dataset)),
+              by = c("dataset", "epsilon"))
+}
+
+save_tbl(as.data.frame(tabS8), "tabS8_bounds_comparison", digits = 4)
+
+kable(tabS8, digits = 4,
+      caption = "Experiment C: mean LSR, mean C-index and $\\Delta C$ by arm at representative $\\varepsilon$. $\\Delta C$ is measured against the non-private, unclipped baseline (`baseline\\_cox\\_reffix.csv`), which is shared by all three arms; the fixed arm on rotterdam therefore shows a slightly negative $\\Delta C$ at $\\varepsilon = \\infty$ because clipping `pgr`/`er` removes outliers. That is not an error.",
+      booktabs = TRUE, linesep = "") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 10) %>%
+  scroll_box(width = "100%", height = "420px")
+```
+
+```{r tab-fixed-bounds}
+tabS9_raw <- read.csv(
+  file.path(SIM_DIR, "phase1_bounds_fixed/tabS9_fixed_bounds_draft.csv"),
+  stringsAsFactors = FALSE, check.names = FALSE)
+tabS9_cont <- tabS9_raw %>%
+  mutate(domain = sprintf("[%s, %s]", format(lower, trim = TRUE), format(upper, trim = TRUE))) %>%
+  select(dataset, variable, tier, rule, domain, unit_data, source_value, unit_source,
+         conversion, source_citation, source_url, access_date, obs_ref)
+stopifnot(nrow(tabS9_cont) == 27)
+
+stopifnot(!any(grepl("第 0 条|第0条|Clause 0", tabS9_cont$rule)))
+
+OBS_REF_NONE <- "No reference"
+
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_bounds_comparison.R"))
+
+local({
+  stopifnot(all(c("lower", "upper") %in% names(tabS9_raw)))
+  mism <- character(0)
+  for (i in seq_len(nrow(tabS9_raw))) {
+    ds <- tabS9_raw$dataset[i]; v <- tabS9_raw$variable[i]
+    b  <- CLIPPING_BOUNDS_FIXED[[ds]][[v]]
+    if (is.null(b)) { mism <- c(mism, sprintf("%s/%s: CLIPPING_BOUNDS_FIXED に無い", ds, v)); next }
+    got <- c(tabS9_raw$lower[i], tabS9_raw$upper[i])
+    if (length(got) != 2L) { mism <- c(mism, sprintf("%s/%s: draft CSV の lower/upper が読めない", ds, v)); next }
+    if (!isTRUE(all.equal(as.numeric(b), got)))
+      mism <- c(mism, sprintf("%s/%s: draft CSV [%g, %g] / 定数 [%g, %g]",
+                              ds, v, got[1], got[2], b[1], b[2]))
+  }
+  key_csv <- paste(tabS9_raw$dataset, tabS9_raw$variable)
+  key_const <- unlist(lapply(names(COVARIATE_TYPES), function(ds) {
+    tt <- COVARIATE_TYPES[[ds]]; paste(ds, names(tt)[tt == "continuous"])
+  }))
+  if (!setequal(key_csv, key_const))
+    mism <- c(mism, sprintf("連続共変量の集合が一致しません（draft CSV のみ: %s ／ 定数のみ: %s）",
+                            paste(setdiff(key_csv, key_const), collapse = ", "),
+                            paste(setdiff(key_const, key_csv), collapse = ", ")))
+  if (length(mism))
+    stop("tabS9 の draft CSV が CLIPPING_BOUNDS_FIXED と一致しません。\n",
+         "main/03_simulation/simulation_bounds_comparison.Rmd を先に knit してください。\n  ",
+         paste(mism, collapse = "\n  "))
+})
+
+TIER0_SOURCE <- c(
+  lung      = "R survival::lung help page (variable coding)",
+  pbc       = "R survival::pbc help page (variable coding)",
+  colon     = "R survival::colon help page (variable coding)",
+  rotterdam = "R survival::rotterdam help page (variable coding)",
+  flchain   = "R survival::flchain help page (variable coding)")
+TIER0_URL <- "https://cran.r-project.org/web/packages/survival/"
+
+tabS9_tier0 <- map_dfr(DATASET_ORDER, function(ds) {
+  ty <- COVARIATE_TYPES[[ds]]
+  vars <- names(ty)[unlist(ty) %in% c("binary", "categorical")]
+  map_dfr(vars, function(v) {
+    dom <- CLIPPING_BOUNDS_FIXED[[ds]][[v]]
+    tibble(
+      dataset = ds, variable = v, tier = 0L,
+      rule = if (ty[[v]] == "binary")
+               "Domain of the coding convention (binary; support of the randomized response)"
+             else
+               paste("Domain of the coding convention (category set;",
+                     "support of the categorical randomized response)"),
+      domain = paste0("{", paste(dom, collapse = ", "), "}"),
+      unit_data = ty[[v]], source_value = paste(dom, collapse = ", "),
+      unit_source = ty[[v]], conversion = "None",
+      source_citation = TIER0_SOURCE[[ds]], source_url = TIER0_URL,
+      access_date = "2026-08-25", obs_ref = OBS_REF_NONE)
+  })
+})
+stopifnot(nrow(tabS9_tier0) == 24)
+
+tabS9 <- bind_rows(tabS9_tier0, tabS9_cont) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(dataset, tier, variable) %>%
+  mutate(dataset = as.character(dataset))
+
+n_cov <- sum(vapply(DATASET_ORDER, function(d) length(COVARIATE_TYPES[[d]]), integer(1)))
+stopifnot(nrow(tabS9) == n_cov, n_cov == 51,
+          !any(duplicated(paste(tabS9$dataset, tabS9$variable))),
+          all(tabS9$obs_ref == OBS_REF_NONE))
+
+local({
+  cjk  <- "[\u3000-\u30ff\u4e00-\u9fff\uff00-\uffef]"
+  cols <- c("dataset", "variable", "rule", "domain", "unit_data", "source_value",
+            "unit_source", "conversion", "source_citation", "source_url", "access_date",
+            "obs_ref")
+  stopifnot(all(cols %in% names(tabS9)))
+  bad <- Filter(function(cc) any(grepl(cjk, tabS9[[cc]], perl = TRUE)), cols)
+  if (length(bad))
+    stop("Table S9 still contains Japanese in: ", paste(bad, collapse = ", "),
+         ". Translate FIXED_BOUNDS_SOURCES in main/02_dp_mechanisms/R/dp_bounds_comparison.R, ",
+         "re-write data/03_simulation/phase1_bounds_fixed/tabS9_fixed_bounds_draft.csv from it, ",
+         "and translate the Tier 0 block above.", call. = FALSE)
+  cat("Table S9: no CJK character in any of the", length(cols), "shipped columns, all",
+      nrow(tabS9), "rows.\n")
+})
+
+save_tbl(tabS9, "tabS9_fixed_bounds", digits = 0)
+
+kable(tabS9 %>% select(dataset, variable, tier, rule, domain, source_value, unit_source,
+                       conversion, obs_ref),
+      caption = sprintf("Experiment C: derivation of every fixed bound (%d covariates: %d in Tier 0 = coding conventions, %d continuous in Tiers 1--5). The `obs\\_ref` column records whether the observed data were consulted; it is \"no reference\" for every row.",
+                        nrow(tabS9), nrow(tabS9_tier0), nrow(tabS9_cont)),
+      booktabs = TRUE, linesep = "") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9) %>%
+  scroll_box(width = "100%", height = "460px")
+
+kable(tabS9 %>% count(tier, name = "n"),
+      caption = "Rows per tier of evidence.") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r expc-checks}
+inf_id <- read.csv(file.path(SIM_DIR, "phase1_bounds_fixed/inf_identity_production.csv"),
+                   stringsAsFactors = FALSE)
+kable(inf_id, digits = 10,
+      caption = "At $\\varepsilon = \\infty$ the mechanism only clips, so the arms may differ only where a bound actually cuts the data.") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+expc_cfr <- expc_raw %>%
+  distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(n = n(), fail = sum(!converged), .groups = "drop") %>%
+  filter(fail > 0) %>%
+  mutate(cfr_pct = 100 * fail / n) %>%
+  arrange(desc(cfr_pct))
+kable(expc_cfr, digits = 3,
+      caption = "Conditions with any non-converged iteration (all three arms).") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+cat(sprintf("Overall CFR across the three arms: %.4f%%\n",
+            100 * sum(expc_cfr$fail) /
+              nrow(expc_raw %>% distinct(arm, dataset, epsilon, iteration))))
+```
+
+```{r expg-load}
+EXPG_DIR <- EVAL_DIR
+expg_design <- read.csv(file.path(EXPG_DIR, "exp_g_pilot_flchain_design.csv"),
+                        stringsAsFactors = FALSE)
+expg_fixed  <- read.csv(file.path(EXPG_DIR, "exp_g_pilot_flchain_fixedlam.csv"),
+                        stringsAsFactors = FALSE)
+expg_comp   <- read.csv(file.path(EXPG_DIR, "exp_g_pilot_flchain_compare.csv"),
+                        stringsAsFactors = FALSE)
+stopifnot(nrow(expg_design) == 1)
+EXPG_SPECS <- c("formal_q200", "datadriven_K13", "datadriven_q200", "formal_K13")
+stopifnot(identical(strsplit(expg_design$specs, "|", fixed = TRUE)[[1]], EXPG_SPECS),
+          setequal(unique(expg_fixed$spec), EXPG_SPECS))
+EXPG_REF_C_K13 <- expg_design$ref_c_nonprivate_formal_K13
+
+EXPG_REF_C  <- expg_design$ref_c_nonprivate
+EXPG_LAMBDA <- expg_design$lambda_fixed
+
+kable(expg_design %>%
+        select(`non-private C (test)` = ref_c_nonprivate, `Lambda (fixed)` = lambda_fixed,
+               `q` = q_intervals, `t_max (days)` = t_max_days, B, `run date` = run_date),
+      digits = 4,
+      caption = "Experiment G: design constants read from the run that produced the figures (not transcribed).") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r fig-exp-g, fig.cap="Out-of-sample C-index on flchain for the four approaches of this work (dashed lines) and four specifications of Nguyen \\& Hui's Algorithm 1 (solid lines), over the same B=1000 Monte-Carlo train/test splits. The line type separates the two families and does not encode the guarantee; whether a specification carries a formal DP guarantee end to end is written in its legend label. The two formal specifications use equal-width intervals on the fixed 5,223-day horizon (200 and 13 intervals) and share every normalization constant. The data-dependent-normalization specification shares the 200-interval grid and the time normalization with the formal one and differs only in computing the covariate normalization from the training data; the customary implementation uses 13 quantile intervals and training-data normalization. The upper grey line is the non-private test C-index and the lower one is random prediction.", fig.width=10, fig.height=7.4}
+expg_all <- expg_comp %>%
+  filter(is.finite(epsilon)) %>%
+  mutate(arm = factor(arm, levels = c(
+           "Phase 1", "Phase 2", "Phase 3",
+           "Out (Laplace)", "Out (std)", "Out (dfbeta)",
+           "Nguyen Alg.1 (v2, 非 formal)",
+           "Nguyen Alg.1 (data-dependent normalisation only, q=200)",
+           "Nguyen Alg.1 (formal, q=200)",
+           "Nguyen Alg.1 (formal, K=13)")))
+stopifnot(!any(is.na(expg_all$arm)),
+          nlevels(droplevels(expg_all$arm)) == 10L - !("Out (Laplace)" %in% expg_all$arm))
+
+EXPG_DROPPED <- c("Out (Laplace)", "Out (std)")
+EXPG_NGUYEN  <- c("Nguyen Alg.1 (formal, q=200)",
+                  "Nguyen Alg.1 (formal, K=13)",
+                  "Nguyen Alg.1 (data-dependent normalisation only, q=200)",
+                  "Nguyen Alg.1 (v2, 非 formal)")
+EXPG_OURS    <- c("Phase 1", "Phase 2", "Phase 3", "Out (dfbeta)")
+expg_plot <- expg_all %>% filter(!arm %in% EXPG_DROPPED) %>% mutate(arm = droplevels(arm))
+stopifnot(setequal(levels(expg_plot$arm), c(EXPG_NGUYEN, EXPG_OURS)),
+          nlevels(expg_plot$arm) == 8L,
+          nrow(expg_plot) == 8L * 14L,
+          identical(expg_plot$c_test, expg_all$c_test[!expg_all$arm %in% EXPG_DROPPED]))
+
+EXPG_COLORS <- c(
+  "Phase 1" = "#0072B2", "Phase 2" = "#E69F00", "Phase 3" = "#009E73",
+  "Out (dfbeta)" = "#D55E00",
+  "Nguyen Alg.1 (v2, 非 formal)" = "#8C6D31",
+  "Nguyen Alg.1 (data-dependent normalisation only, q=200)" = "#CC79A7",
+  "Nguyen Alg.1 (formal, q=200)" = "#000000",
+  "Nguyen Alg.1 (formal, K=13)" = "#B22222")
+EXPG_LABELS <- c(
+  "Nguyen Alg.1 (formal, q=200)" = "Nguyen Alg. 1, formal (200 intervals)",
+  "Nguyen Alg.1 (formal, K=13)" = "Nguyen Alg. 1, formal (13 intervals)",
+  "Nguyen Alg.1 (data-dependent normalisation only, q=200)" = "Nguyen Alg. 1, data-dependent normalization (200 intervals)",
+  "Nguyen Alg.1 (v2, 非 formal)" = "Nguyen Alg. 1, customary (13 quantile intervals)",
+  "Phase 1" = "Phase 1", "Phase 2" = "Phase 2", "Phase 3" = "Phase 3",
+  "Out (dfbeta)" = "Output (dfbeta)")
+EXPG_LINETYPES <- c(setNames(rep("solid", 4), EXPG_NGUYEN), setNames(rep("22", 4), EXPG_OURS))
+EXPG_LEGEND_ORDER <- c(EXPG_NGUYEN, EXPG_OURS)
+stopifnot(setequal(names(EXPG_COLORS), levels(expg_plot$arm)),
+          setequal(names(EXPG_LABELS), levels(expg_plot$arm)),
+          setequal(names(EXPG_LINETYPES), levels(expg_plot$arm)),
+          !any(grepl("q *= *200|K *= *13", EXPG_LABELS)))
+
+p_expg <- ggplot(expg_plot, aes(epsilon, c_test, colour = arm, linetype = arm)) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", colour = "grey45", linewidth = 0.4) +
+  geom_hline(yintercept = EXPG_REF_C, linetype = "dashed", colour = "grey30", linewidth = 0.4) +
+  annotate("text", x = 0.1, y = EXPG_REF_C + 0.012, hjust = 0, size = 3, colour = "grey25",
+           label = sprintf("non-private = %.3f", EXPG_REF_C)) +
+  geom_line(linewidth = 0.75) +
+  geom_point(size = 1.5) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1000")) +
+  scale_colour_manual(values = EXPG_COLORS, labels = EXPG_LABELS, breaks = EXPG_LEGEND_ORDER, name = NULL) +
+  scale_linetype_manual(values = EXPG_LINETYPES, labels = EXPG_LABELS, breaks = EXPG_LEGEND_ORDER, name = NULL) +
+  coord_cartesian(ylim = c(0.45, 0.82)) +
+  labs(x = expression(paste("Privacy budget ", epsilon, " (log scale)")),
+       y = "Out-of-sample C-index (test)") +
+  theme_paper() +
+  theme(legend.position = "bottom",
+        legend.margin = margin(t = 0, b = 0), legend.spacing.y = unit(2, "pt"),
+        legend.key.width = unit(2.2, "lines"),
+        legend.text = element_text(size = rel(0.85))) +
+  guides(colour = guide_legend(ncol = 2, byrow = FALSE),
+         linetype = guide_legend(ncol = 2, byrow = FALSE))
+p_expg
+save_fig(p_expg, "fig6_exp_g", width = 10, height = 7.4)
+```
+
+```{r tab-exp-g}
+EPS_SHOW_G <- c(0.1, 0.5, 1, 5, 10, 30, Inf)
+expg_gap <- expg_fixed %>%
+  filter(epsilon %in% EPS_SHOW_G) %>%
+  select(spec, epsilon, c_test) %>%
+  pivot_wider(names_from = spec, values_from = c_test) %>%
+  mutate(`price of the guarantee` = datadriven_q200 - formal_q200,
+         `gap to non-private` = EXPG_REF_C - formal_q200) %>%
+  arrange(epsilon) %>%
+  select(epsilon,
+         `data-dependent normalization only (not formal)` = datadriven_q200,
+         `fully data-independent (formal)` = formal_q200,
+         `price of the guarantee`, `gap to non-private`,
+         `customary implementation (K = 13, not formal)` = datadriven_K13,
+         `fully data-independent (formal, K = 13)` = formal_K13) %>%
+  mutate(epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)))
+stopifnot(nrow(expg_gap) == length(EPS_SHOW_G), !anyNA(expg_gap), ncol(expg_gap) == 7L)
+
+save_tbl(as.data.frame(expg_gap), "tabS10_exp_g", digits = 4)
+
+kable(expg_gap, digits = 4,
+      caption = sprintf("Experiment G on flchain at $\\Lambda = %g$ fixed in advance, B = %d. \"Price of the guarantee\" is the test C-index that the specification whose covariate normalization is computed from the training data gains over the fully data-independent specification; the two share the interval grid (200 equal-width intervals on a fixed 5,223-day horizon) and the time normalization, so the difference isolates the normalization. \"Gap to non-private\" is what the formal arm gives up in total against the unregularised fit (%.4f). The sixth column is the customary implementation (K = 13 quantile intervals, training-data normalization), which differs from the formal arm in the interval grid as well and is shown for reference only. The last column is the fully data-independent specification with 13 equal-width intervals on the same fixed horizon and the same normalization as the 200-interval formal arm; its non-private reference is %.4f.",
+                        EXPG_LAMBDA, expg_design$B, EXPG_REF_C, EXPG_REF_C_K13),
+      booktabs = TRUE, linesep = "") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+
+g_prac <- expg_gap %>% filter(epsilon %in% c("0.5", "1"))
+g_inf  <- expg_gap %>% filter(epsilon == "Inf")
+cat(sprintf("Price of the guarantee (normalization only): %.4f at eps=0.5, %.4f at eps=1, %.4f with the noise removed (eps=Inf).\n",
+            g_prac$`price of the guarantee`[g_prac$epsilon == "0.5"],
+            g_prac$`price of the guarantee`[g_prac$epsilon == "1"],
+            g_inf$`price of the guarantee`))
+expg_all <- expg_fixed %>% select(spec, epsilon, c_test) %>%
+  pivot_wider(names_from = spec, values_from = c_test) %>%
+  mutate(price = datadriven_q200 - formal_q200)
+cat(sprintf("Over the practical range eps = 1..10 the price runs from %.4f to %.4f; the former definition (K = 13 minus formal) ran from %.4f to %.4f.\n",
+            min(expg_all$price[expg_all$epsilon >= 1 & expg_all$epsilon <= 10]),
+            max(expg_all$price[expg_all$epsilon >= 1 & expg_all$epsilon <= 10]),
+            min((expg_all$datadriven_K13 - expg_all$formal_q200)[expg_all$epsilon >= 1 & expg_all$epsilon <= 10]),
+            max((expg_all$datadriven_K13 - expg_all$formal_q200)[expg_all$epsilon >= 1 & expg_all$epsilon <= 10])))
+k13 <- expg_all %>% mutate(d_k13 = formal_K13 - formal_q200)
+cat(sprintf("formal_K13 minus formal_q200 (interval count only, guarantee kept): %+.4f at eps=1, %+.4f at eps=10, %+.4f at eps=Inf; formal_K13 gap to its own non-private reference %.4f at eps=1.\n",
+            k13$d_k13[k13$epsilon == 1], k13$d_k13[k13$epsilon == 10], k13$d_k13[is.infinite(k13$epsilon)],
+            EXPG_REF_C_K13 - k13$formal_K13[k13$epsilon == 1]))
+cat(sprintf("The formal arm tops out at %.4f against a non-private %.4f (gap %.4f).\n",
+            expg_fixed$c_test[expg_fixed$spec == "formal_q200" & is.infinite(expg_fixed$epsilon)],
+            EXPG_REF_C,
+            EXPG_REF_C - expg_fixed$c_test[expg_fixed$spec == "formal_q200" &
+                                             is.infinite(expg_fixed$epsilon)]))
+```
+
+```{r tab-phase3-exclusion}
+th_path <- file.path(EVAL_DIR, "phase3_exclusion_thresholds.csv")
+stopifnot(file.exists(th_path))
+tabS12 <- read.csv(th_path, stringsAsFactors = FALSE, check.names = FALSE) %>%
+  rename(arm = アーム, threshold = 閾値,
+         submitted = `投稿版（除外あり）`, no_exclusion = `除外なし`,
+         self_referential = `自己参照ベースライン`) %>%
+  mutate(threshold = recode(threshold,
+                            eps_lsr50 = "eps*_{LSR<=0.50}",
+                            eps_lsr10 = "eps*_{LSR<=0.10}",
+                            eps_fpr10 = "eps*_{FPR<=0.10}"),
+         same_without_exclusion = submitted == no_exclusion,
+         same_self_referential  = submitted == self_referential) %>%
+  select(arm, dataset, threshold, submitted, no_exclusion, self_referential,
+         same_without_exclusion, same_self_referential)
+
+TABS12_THRESHOLD_TEX <- c(
+  "eps*_{LSR<=0.50}" = "$\\varepsilon^{*}_{\\mathrm{LSR} \\leq 0.50}$",
+  "eps*_{LSR<=0.10}" = "$\\varepsilon^{*}_{\\mathrm{LSR} \\leq 0.10}$",
+  "eps*_{FPR<=0.10}" = "$\\varepsilon^{*}_{\\mathrm{FPR} \\leq 0.10}$")
+save_tbl(as.data.frame(tabS12), "tabS12_phase3_exclusion", digits = 0,
+         sanitize_text = identity,
+         tex_transform = function(d) {
+           stopifnot(all(d$threshold %in% names(TABS12_THRESHOLD_TEX)))
+           d$threshold <- unname(TABS12_THRESHOLD_TEX[d$threshold])
+           for (cl in c("submitted", "no_exclusion", "self_referential"))
+             d[[cl]] <- ifelse(d[[cl]] == "> 1000", "$>$ 1000", d[[cl]])
+           stopifnot(!any(grepl("[<>]", unlist(d[c("arm", "dataset", "submitted", "no_exclusion", "self_referential")])) &
+                          !grepl("\\$[<>]\\$", unlist(d[c("arm", "dataset", "submitted", "no_exclusion", "self_referential")]))))
+           d
+         })
+
+kable(tabS12,
+      caption = "Experiment H-2: the published $\\varepsilon^{*}$ thresholds for Phase 3 under three treatments of the two/one discordant coefficients. `no\\_exclusion` keeps them in the denominator; `self\\_referential` replaces the Cox baseline by Phase 3's own $\\varepsilon = \\infty$ output and needs no exclusion at all.",
+      booktabs = TRUE, linesep = "") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 10) %>%
+  scroll_box(width = "100%", height = "420px")
+
+cat(sprintf("Thresholds unchanged when the exclusion is dropped: %d / %d\n",
+            sum(tabS12$same_without_exclusion), nrow(tabS12)))
+cat(sprintf("Thresholds reproduced by the self-referential baseline: %d / %d\n",
+            sum(tabS12$same_self_referential), nrow(tabS12)))
+stopifnot(nrow(tabS12) == 30)
+```
+
+```{r session-info, echo=TRUE}
+sessionInfo()
+```
+

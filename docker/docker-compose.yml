@@ -1,0 +1,34 @@
+services:
+  rstudio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dp-surv-util-rstudio
+    ports:
+      - "127.0.0.1:8788:8787"
+    environment:
+      - PASSWORD=${RSTUDIO_PASSWORD:-rstudio}
+      # ROOT=TRUE lets the RStudio user install packages interactively; it is not needed to render the documents
+      - ROOT=TRUE
+      - TZ=Asia/Tokyo
+    volumes:
+      - ..:/home/rstudio/project
+    restart: unless-stopped
+
+  rstudio-renv:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.renv
+    container_name: dp-surv-util-rstudio-renv
+    ports:
+      - "127.0.0.1:8789:8787"
+    environment:
+      - PASSWORD=${RSTUDIO_PASSWORD:-rstudio}
+      # the renv container is for reproduction only and runs without root
+      - ROOT=FALSE
+      - TZ=Asia/Tokyo
+    volumes:
+      - ..:/home/rstudio/project
+    restart: unless-stopped
+    profiles:
+      - renv

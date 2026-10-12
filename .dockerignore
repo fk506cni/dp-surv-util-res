@@ -1,0 +1,9 @@
+# Docker build context exclusions.
+# Applies to docker/Dockerfile.renv, whose build context is the repository root.
+data/
+.git/
+main/
+docs/
+.Rproj.user/
+.vscode/
+*.Rproj

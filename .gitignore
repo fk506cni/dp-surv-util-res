@@ -1,0 +1,110 @@
+# ============================================
+# R / RStudio
+# ============================================
+
+# History files
+.Rhistory
+.Rapp.history
+
+# Session Data files
+.RData
+.RDataTmp
+
+# User-specific files
+.Ruserdata
+
+# Example code in package build process
+*-Ex.R
+
+# Output files from R CMD build
+/*.tar.gz
+
+# Output files from R CMD check
+/*.Rcheck/
+
+# RStudio files
+.Rproj.user/
+*.Rproj
+
+# renv local cache (renv.lock is tracked)
+renv/
+packrat/
+
+# produced vignettes
+vignettes/*.html
+vignettes/*.pdf
+
+# OAuth2 token
+.httr-oauth
+
+# knitr and R markdown default cache directories
+*_cache/
+/cache/
+
+# Temporary files created by R markdown
+*.utf8.md
+*.knit.md
+
+# R markdown generated intermediate files
+*_files/
+
+# R Environment Variables
+.Renviron
+
+# Docker / environment secrets
+.env
+.env.*
+
+# translation temp files
+po/*~
+
+# RStudio Connect folder
+rsconnect/
+
+# ============================================
+# Project-specific
+# ============================================
+
+# Data directory (simulation outputs, intermediate data; written by the documents listed in README.md).
+# Ignore the contents, but keep the .gitkeep of each subdirectory (a file under an ignored directory
+# cannot be re-included, so the directory itself must stay un-ignored).
+data/*
+!data/*/
+data/*/*
+!data/*/.gitkeep
+
+# Written by rendering the documents, not published: the HTML of each document and the SVG, PNG
+# and XLSX versions of the printed outputs (the published PDF, CSV and TeX files are tracked).
+main/**/*.html
+main/06_report/output/*.svg
+main/06_report/output/*.png
+main/06_report/output/*.xlsx
+main/06_report/output/.artifact_names.txt
+
+# ============================================
+# LaTeX intermediate files
+# ============================================
+*.aux
+*.log
+*.toc
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+texput.*
+
+# ============================================
+# Docker
+# ============================================
+docker/volumes/
+
+# ============================================
+# OS / Editor
+# ============================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

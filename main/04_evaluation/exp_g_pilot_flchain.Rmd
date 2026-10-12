@@ -1,0 +1,487 @@
+---
+title: "実験 G パイロット v3 — Nguyen & Hui (2017) Algorithm 1 を formal DP が成立する仕様で flchain に適用する"
+author: "dp-surv-util"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M:%S')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5.5)
+options(stringsAsFactors = FALSE, scipen = 6)
+```
+
+```{r libs}
+library(survival); library(splines); library(dplyr); library(ggplot2); library(knitr)
+
+PROJ <- "/home/rstudio/project"
+if (!dir.exists(PROJ)) PROJ <- normalizePath(file.path(getwd(), "..", ".."))
+for (f in c("main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R",
+            "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R",
+            "main/02_dp_mechanisms/R/dp_bounds_comparison.R",
+            "main/02_dp_mechanisms/R/survival_stacking.R",
+            "main/03_simulation/R/data_split.R",
+            "main/03_simulation/R/simulation_engine.R",
+            "main/04_evaluation/R/nguyen2017_outpert.R")) source(file.path(PROJ, f))
+
+DATASET      <- "flchain"
+B_RUN        <- 1000L
+LAMBDA_GRID  <- c(0.1, 1, 10, 100, 1000)
+NG_BASE_SEED <- 3100000L
+Q_PAPER      <- 200L
+
+flchain <- read.csv(file.path(PROJ, "data/01_prepared/flchain_prepared.csv"))
+stopifnot(nrow(flchain) == 6524L, !anyNA(flchain))
+
+SPECS <- list(
+  list(name = "formal_q200",   type = "formal",
+       bounds = FIXED_BOUNDS_NGUYEN[[DATASET]], t_max = T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER),
+  list(name = "datadriven_K13", type = "datadriven",
+       K = K_VALUES[[DATASET]], standardize = FALSE),
+  list(name = "datadriven_q200", type = "datadriven", K = NA_integer_, standardize = FALSE,
+       fixed_time = list(t_max = T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER)),
+  list(name = "formal_K13",   type = "formal",
+       bounds = FIXED_BOUNDS_NGUYEN[[DATASET]], t_max = T_MAX_FIXED_NGUYEN[[DATASET]], q = K_VALUES[[DATASET]])
+)
+SPEC_NAMES <- vapply(SPECS, `[[`, character(1), "name")
+stopifnot(identical(SPEC_NAMES, c("formal_q200", "datadriven_K13", "datadriven_q200", "formal_K13")))
+stopifnot(identical(SPECS[[4]]$q, K_VALUES[[DATASET]]), K_VALUES[[DATASET]] == 13L)
+```
+
+```{r independence-table}
+bt <- FIXED_BOUNDS_NGUYEN[[DATASET]]
+obs <- flchain %>% transmute(age, sexM = as.integer(sex == "M"), sample.yr,
+                             kappa, lambda, creatinine, mgus)
+ind <- data.frame(
+  変数 = names(bt),
+  固定境界 = vapply(bt, function(b) sprintf("[%g, %g]", b[1], b[2]), character(1)),
+  観測範囲 = vapply(names(bt), function(v)
+    sprintf("[%g, %g]", min(obs[[v]]), max(obs[[v]])), character(1)),
+  階層と根拠 = vapply(names(bt), function(v) {
+    src_v <- if (identical(v, "sexM")) "sex" else v
+    r <- FIXED_BOUNDS_SOURCES[FIXED_BOUNDS_SOURCES$dataset == DATASET &
+                              FIXED_BOUNDS_SOURCES$variable == src_v, ]
+    if (nrow(r) == 1L) sprintf("Tier %s: %s", r$tier, r$rule)
+    else "Tier 0: 符号化規約の定義域（ダミー変数 {0, 1}。本標本に依存しない）"
+  }, character(1)),
+  row.names = NULL)
+kable(ind, caption = paste("固定境界とその根拠（根拠は規約の正本 FIXED_BOUNDS_SOURCES から生成。",
+                           "）"))
+
+cat(sprintf("固定の観察期間上限: %.2f 日（ベースライン取得開始 1995-03-13 → 追跡打ち切り 2009-06-30。規約 Tier 6）。観測最大 %.0f 日\n",
+            T_MAX_FIXED_NGUYEN[[DATASET]], max(flchain$time)))
+cat(sprintf("区間数 q = %d（既報 §6.1）、境界は [0,1] の等幅分割\n", Q_PAPER))
+cat(sprintf("正則化パラメータ Λ = %g（既報 Table 2 が FL について報告した最良値）\n", 0.1))
+
+clip_by_var <- vapply(names(bt), function(v) {
+  ctr <- (bt[[v]][1] + bt[[v]][2]) / 2; half <- (bt[[v]][2] - bt[[v]][1]) / 2
+  mean(abs((obs[[v]] - ctr) / half) > 1)
+}, numeric(1))
+kable(data.frame(変数 = names(bt), クリップ発生率 = sprintf("%.4f%%", 100 * clip_by_var),
+                 row.names = NULL),
+      caption = "変数別のクリップ発生率（規約の手続き (2) の開示。境界の変更は行わない）")
+
+.sp <- stratified_train_test_split(flchain, 0.3, SPLIT_BASE_SEED + 1L)
+.tr <- set_reference_levels(.sp$train, DATASET)
+.te <- align_factor_levels(.tr, .sp$test, DATASET)
+.tr2 <- .tr; .tr2[1, c("age", "kappa", "lambda", "creatinine")] <- c(101, 999, 999, 99)
+.tr2$time[1] <- 99999; .tr2$status[1] <- 1L
+.d1 <- build_nguyen_design_formal(.tr, .te, COX_FORMULAS[[DATASET]], bt,
+                                  T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER)
+.d2 <- build_nguyen_design_formal(.tr2, .te, COX_FORMULAS[[DATASET]], bt,
+                                  T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER)
+stopifnot(identical(.d1$t_s, .d2$t_s), identical(.d1$scale_unit, .d2$scale_unit),
+          identical(.d1$sd_vec, .d2$sd_vec), identical(.d1$X_test_cov, .d2$X_test_cov))
+cat("データ非依存性 OK: 1 レコードを置き換えても t_s / scale_unit / 半幅 / test 変換行列が不変\n")
+```
+
+```{r design-check-q200}
+.sp <- stratified_train_test_split(flchain, 0.3, SPLIT_BASE_SEED + 1L)
+.tr <- set_reference_levels(.sp$train, DATASET)
+.te <- align_factor_levels(.tr, .sp$test, DATASET)
+.d_formal <- build_nguyen_design_formal(.tr, .te, COX_FORMULAS[[DATASET]], bt,
+                                        T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER)
+.d_k13    <- build_nguyen_design_traintest(.tr, .te, K_VALUES[[DATASET]], COX_FORMULAS[[DATASET]],
+                                           standardize = FALSE)
+.d_q200   <- build_nguyen_design_traintest(.tr, .te, NA_integer_, COX_FORMULAS[[DATASET]],
+                                           standardize = FALSE,
+                                           fixed_time = list(t_max = T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER))
+.d_k13b   <- build_nguyen_design_traintest(.tr, .te, K_VALUES[[DATASET]], COX_FORMULAS[[DATASET]],
+                                           standardize = FALSE, fixed_time = NULL)
+stopifnot(identical(.d_k13[c("X", "X_orig", "yr", "y01", "X_test_cov", "t_s", "scale_unit", "sd_vec", "ctr")],
+                    .d_k13b[c("X", "X_orig", "yr", "y01", "X_test_cov", "t_s", "scale_unit", "sd_vec", "ctr")]))
+
+e_k <- 3L
+chk <- list(
+  `区間数 actual_K: q200 = formal = 200`        = identical(.d_q200$actual_K, .d_formal$actual_K) && .d_q200$actual_K == Q_PAPER,
+  `区間代表時刻 t_s: q200 = formal`             = identical(.d_q200$t_s, .d_formal$t_s),
+  `展開行数と y_ik: q200 = formal`              = identical(.d_q200$rows, .d_formal$rows) && identical(.d_q200$y01, .d_formal$y01),
+  `スプライン列 A(t): q200 = formal`            = identical(.d_q200$X[, seq_len(e_k)], .d_formal$X[, seq_len(e_k)]),
+  `中心化ベクトル ctr: q200 = K13`              = identical(.d_q200$ctr, .d_k13$ctr),
+  `尺度 scale_unit: q200 = K13`                 = identical(.d_q200$scale_unit, .d_k13$scale_unit),
+  `SD 因子 sd_vec: q200 = K13（= 1）`           = identical(.d_q200$sd_vec, .d_k13$sd_vec),
+  `test 変換行列 X_test_cov: q200 = K13`        = identical(.d_q200$X_test_cov, .d_k13$X_test_cov),
+  `中心化 ctr: q200 ≠ formal`                   = !identical(.d_q200$ctr, .d_formal$ctr),
+  `尺度 scale_unit: q200 ≠ formal`              = !identical(.d_q200$scale_unit, .d_formal$scale_unit),
+  `区間 actual_K: q200 ≠ K13`                   = !identical(.d_q200$actual_K, .d_k13$actual_K),
+  `時間正規化 t_s: q200 ≠ K13`                  = !identical(.d_q200$t_s, .d_k13$t_s)
+)
+kable(data.frame(照合 = names(chk), 結果 = ifelse(unlist(chk), "✅", "❌"), row.names = NULL),
+      caption = "第 3 変種の設計照合（1 分割）。q200 は区間・時間が formal と同一、正規化が K13 と同一である")
+stopifnot(all(unlist(chk)))
+cat(sprintf("設計照合 OK: q200 の展開行数 %d（formal %d・K13 %d）、scale_unit %.6f（K13 と同一）、d = %d\n",
+            .d_q200$rows, .d_formal$rows, .d_k13$rows, .d_q200$scale_unit, .d_q200$d))
+rm(.sp, .tr, .te, .d_formal, .d_k13, .d_q200, .d_k13b)
+```
+
+```{r design-check-K13}
+.sp <- stratified_train_test_split(flchain, 0.3, SPLIT_BASE_SEED + 1L)
+.tr <- set_reference_levels(.sp$train, DATASET)
+.te <- align_factor_levels(.tr, .sp$test, DATASET)
+.d_q200 <- build_nguyen_design_formal(.tr, .te, COX_FORMULAS[[DATASET]], bt,
+                                      T_MAX_FIXED_NGUYEN[[DATASET]], q = Q_PAPER)
+.d_k13f <- build_nguyen_design_formal(.tr, .te, COX_FORMULAS[[DATASET]], bt,
+                                      T_MAX_FIXED_NGUYEN[[DATASET]], q = K_VALUES[[DATASET]])
+chk4 <- list(
+  `区間数 actual_K: formal_K13 = 13`                 = .d_k13f$actual_K == K_VALUES[[DATASET]],
+  `区間代表時刻 t_s = (1..13)/13`                    = identical(.d_k13f$t_s, seq_len(K_VALUES[[DATASET]]) / K_VALUES[[DATASET]]),
+  `中心化 ctr: formal_K13 = formal_q200`             = identical(.d_k13f$ctr, .d_q200$ctr),
+  `尺度 scale_unit: formal_K13 = formal_q200`        = identical(.d_k13f$scale_unit, .d_q200$scale_unit),
+  `SD 因子 sd_vec: formal_K13 = formal_q200`         = identical(.d_k13f$sd_vec, .d_q200$sd_vec),
+  `test 変換行列 X_test_cov: formal_K13 = formal_q200` = identical(.d_k13f$X_test_cov, .d_q200$X_test_cov),
+  `クリップ率: formal_K13 = formal_q200`             = identical(.d_k13f$clip_rate, .d_q200$clip_rate),
+  `区間 actual_K: formal_K13 ≠ formal_q200`          = !identical(.d_k13f$actual_K, .d_q200$actual_K),
+  `展開行数: formal_K13 < formal_q200`               = .d_k13f$rows < .d_q200$rows
+)
+kable(data.frame(照合 = names(chk4), 結果 = ifelse(unlist(chk4), "✅", "❌"), row.names = NULL),
+      caption = "第 4 変種の設計照合（1 分割）。formal_K13 は formal_q200 と区間数だけが違う")
+stopifnot(all(unlist(chk4)))
+cat(sprintf("設計照合 OK: formal_K13 の展開行数 %d（formal_q200 %d）、d = %d（formal_q200 %d）\n",
+            .d_k13f$rows, .d_q200$rows, .d_k13f$d, .d_q200$d))
+rm(.sp, .tr, .te, .d_q200, .d_k13f)
+```
+
+```{r smoke}
+run_pilot_isolated <- function(B, base_seed, lambda_grid, specs) {
+  callr::r(
+    function(B, base_seed, lambda_grid, PROJ, Q_PAPER, specs) {
+      Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1",
+                 MKL_NUM_THREADS = "1", VECLIB_MAXIMUM_THREADS = "1",
+                 RCPP_PARALLEL_NUM_THREADS = "1")
+      suppressMessages({ library(survival); library(splines); library(dplyr); library(furrr) })
+      for (f in c("main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R",
+                  "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R",
+            "main/02_dp_mechanisms/R/dp_bounds_comparison.R",
+                  "main/02_dp_mechanisms/R/survival_stacking.R",
+                  "main/03_simulation/R/data_split.R",
+                  "main/03_simulation/R/simulation_engine.R",
+                  "main/04_evaluation/R/nguyen2017_outpert.R")) source(file.path(PROJ, f))
+      data <- read.csv(file.path(PROJ, "data/01_prepared/flchain_prepared.csv"))
+      stopifnot(is.list(specs), length(specs) >= 1L, all(vapply(specs, function(x) is.character(x$name), logical(1))))
+      n_workers <- max(1L, as.integer(floor(parallel::detectCores() * 0.7)))
+      plan(multisession, workers = n_workers)
+      on.exit(plan(sequential), add = TRUE)
+      res <- future_map_dfr(seq_len(B), function(i)
+        run_nguyen_iteration(data = data, iteration = i, specs = specs,
+          cox_formula = COX_FORMULAS$flchain, dataset_name = "flchain",
+          epsilon_values = EPSILON_VALUES, lambda_grid = lambda_grid,
+          base_seed = base_seed, split_base_seed = SPLIT_BASE_SEED),
+        .options = furrr_options(seed = FALSE))
+      list(result = res, n_workers = n_workers)
+    },
+    args = list(B = B, base_seed = base_seed, lambda_grid = lambda_grid,
+                PROJ = PROJ, Q_PAPER = Q_PAPER, specs = specs)
+  )
+}
+
+t_smoke <- system.time(smoke <- run_pilot_isolated(10L, NG_BASE_SEED, LAMBDA_GRID, SPECS))
+cat(sprintf("スモーク(B=10): %.1f 秒 / ワーカー %d / 行数 %d\n",
+            t_smoke[["elapsed"]], smoke$n_workers, nrow(smoke$result)))
+sm <- smoke$result
+stopifnot(nrow(sm) == 10L * length(SPECS) * length(LAMBDA_GRID) * length(EPSILON_VALUES))
+stopifnot(!anyNA(sm$c_index_test))
+stopifnot(identical(unique(sm$spec), SPEC_NAMES))
+kable(sm %>% distinct(spec, .keep_all = TRUE) %>%
+        select(spec, formal, d, S, actual_K, stacked_rows, clip_rate),
+      digits = 4, caption = "spec 別の設計諸元。clip_rate は固定境界によるクリップ発生率（train）")
+```
+
+```{r production}
+res_path <- file.path(PROJ, "data/04_evaluation/exp_g_pilot_flchain_raw.csv")
+fp_path  <- file.path(PROJ, "data/04_evaluation/exp_g_pilot_flchain_raw.fingerprint")
+
+gen_fingerprint <- digest::digest(list(
+  dataset = DATASET,
+  bounds  = FIXED_BOUNDS_NGUYEN[[DATASET]],
+  t_max   = T_MAX_FIXED_NGUYEN[[DATASET]],
+  q       = Q_PAPER,
+  K       = K_VALUES[[DATASET]],
+  lambda_grid = LAMBDA_GRID,
+  epsilon = EPSILON_VALUES,
+  B       = B_RUN,
+  base_seed  = NG_BASE_SEED,
+  split_seed = SPLIT_BASE_SEED,
+  cox_formula = deparse(COX_FORMULAS[[DATASET]]),
+  specs = SPECS
+), algo = "sha256")
+
+if (file.exists(res_path)) {
+  raw <- read.csv(res_path)
+  if (file.exists(fp_path)) {
+    stored <- readLines(fp_path, warn = FALSE)[1]
+    if (!identical(stored, gen_fingerprint))
+      stop("生データの生成設定が現在の設定と一致しない（指紋不一致）。\n",
+           "  保存済み: ", stored, "\n  現在    : ", gen_fingerprint, "\n",
+           "  ", res_path, " を削除して再実行するか、設定を戻すこと。")
+    cat(sprintf("既存結果を読み込み: %d 行（設定指紋 %s… 一致）\n",
+                nrow(raw), substr(gen_fingerprint, 1, 12)))
+  } else {
+    writeLines(gen_fingerprint, fp_path)
+    cat(sprintf("既存結果を読み込み: %d 行。指紋ファイルが無かったため現在の設定で作成した（%s…）\n",
+                nrow(raw), substr(gen_fingerprint, 1, 12)))
+  }
+} else {
+  t_prod <- system.time(prod <- run_pilot_isolated(B_RUN, NG_BASE_SEED, LAMBDA_GRID, SPECS))
+  raw <- prod$result
+  cat(sprintf("本番(B=%d): %.1f 秒 = %.1f 分 / ワーカー %d\n",
+              B_RUN, t_prod[["elapsed"]], t_prod[["elapsed"]]/60, prod$n_workers))
+  write.csv(raw, res_path, row.names = FALSE)
+  writeLines(gen_fingerprint, fp_path)
+}
+
+expected_rows <- B_RUN * length(SPECS) * length(LAMBDA_GRID) * length(EPSILON_VALUES)
+stopifnot(nrow(raw) == expected_rows, !anyNA(raw$c_index_test), !anyNA(raw$mre))
+stopifnot(all(raw$c_index_test > 0 & raw$c_index_test < 1))
+stopifnot(length(unique(raw$iteration)) == B_RUN)
+cat(sprintf("検算 OK（%d 行 = %d 反復 × %d spec × %d Λ × %d ε）\n",
+            expected_rows, B_RUN, length(SPECS), length(LAMBDA_GRID), length(EPSILON_VALUES)))
+
+ref <- raw %>% distinct(iteration, spec, c_index_test_ref) %>%
+  tidyr::pivot_wider(names_from = spec, values_from = c_index_test_ref)
+stopifnot(identical(sort(setdiff(names(ref), "iteration")), sort(SPEC_NAMES)))
+ref_pairs <- data.frame(
+  組 = c("formal_q200 − datadriven_K13（4 要素すべて）",
+         "datadriven_q200 − datadriven_K13（区間・時間正規化だけ）",
+         "datadriven_q200 − formal_q200（正規化だけ）",
+         "formal_K13 − formal_q200（区間数だけ）"),
+  平均絶対差 = c(mean(abs(ref$formal_q200 - ref$datadriven_K13)),
+                 mean(abs(ref$datadriven_q200 - ref$datadriven_K13)),
+                 mean(abs(ref$datadriven_q200 - ref$formal_q200)),
+                 mean(abs(ref$formal_K13 - ref$formal_q200))),
+  最大絶対差 = c(max(abs(ref$formal_q200 - ref$datadriven_K13)),
+                 max(abs(ref$datadriven_q200 - ref$datadriven_K13)),
+                 max(abs(ref$datadriven_q200 - ref$formal_q200)),
+                 max(abs(ref$formal_K13 - ref$formal_q200))),
+  row.names = NULL)
+kable(ref_pairs, digits = 5, caption = "非私的（正則化なし）test C-index の変種間差（B = 1,000 分割）")
+stopifnot(all(ref_pairs$平均絶対差 < 0.02))
+
+kable(raw %>% group_by(spec) %>%
+        summarise(CFR = mean(!converged), `非私的 C-index` = mean(c_index_test_ref),
+                  `SD` = sd(c_index_test_ref), clip_rate = mean(clip_rate),
+                  stacked_rows = first(stacked_rows), .groups = "drop"),
+      digits = 5, caption = "収束失敗率・非私的基準値・クリップ率")
+
+cfr_lam <- raw %>% distinct(spec, lambda, iteration, converged, grad_norm) %>%
+  group_by(spec, lambda) %>%
+  summarise(CFR = mean(!converged), n_fail = sum(!converged), max_grad = max(grad_norm), .groups = "drop") %>%
+  arrange(spec, lambda)
+kable(cfr_lam, digits = c(0, 4, 5, 0, 8),
+      caption = "収束失敗率（spec × Λ）。CFR は 1,000 分割中の非収束の割合、max_grad は相対勾配ノルムの最大")
+```
+
+```{r agg}
+agg <- raw %>% group_by(spec, formal, lambda, epsilon) %>%
+  summarise(c_test = mean(c_index_test), c_test_sd = sd(c_index_test),
+            c_test_lambda = mean(c_index_test_lambda),
+            mre = mean(mre), beta_ratio = mean(beta_norm_ratio),
+            c_test_median = median(c_index_test), c_test_below_half = mean(c_index_test < 0.5),
+            .groups = "drop")
+ref_c <- mean(raw$c_index_test_ref[raw$spec == "formal_q200"])
+```
+
+```{r lambda-grid}
+kable(agg %>% filter(spec == "formal_q200",
+                     epsilon %in% c(0.1, 0.5, 1, 2, 5, 10, 30, 100, Inf)) %>%
+        select(lambda, epsilon, c_test) %>% mutate(c_test = round(c_test, 4)) %>%
+        tidyr::pivot_wider(names_from = epsilon, values_from = c_test, names_prefix = "eps=") %>%
+        arrange(lambda),
+      caption = sprintf("formal_q200 の test C-index（行 = Λ）。非私的（正則化なし）= %.4f", ref_c))
+```
+
+```{r fixed-vs-oracle}
+LAM_FIXED <- 0.1
+best <- agg %>% group_by(spec, epsilon) %>%
+  slice_max(c_test, n = 1, with_ties = FALSE) %>% ungroup()
+fixed <- agg %>% filter(abs(lambda - LAM_FIXED) < 1e-9)
+
+cmp <- bind_rows(
+  fixed %>% mutate(sel = sprintf("Λ=%g 事前固定", LAM_FIXED)),
+  best  %>% mutate(sel = "Λ oracle 選択（参考）")) %>%
+  filter(epsilon %in% c(0.1, 0.5, 1, 2, 5, 10, 30, 100, Inf)) %>%
+  select(spec, sel, epsilon, c_test) %>% mutate(c_test = round(c_test, 4)) %>%
+  tidyr::pivot_wider(names_from = epsilon, values_from = c_test, names_prefix = "eps=")
+kable(cmp, caption = "事前固定 Λ と oracle 選択。差が小さければ oracle に依存していない。oracle は非収束の当てはめを含む（Λ=10・1000 の q=200 変種。主結果 Λ=0.1 は非収束 0）")
+```
+
+```{r formal-vs-dd}
+kable(fixed %>% filter(epsilon %in% c(0.1, 0.5, 1, 5, 10, 30, Inf)) %>%
+        select(spec, epsilon, c_test, c_test_sd) %>%
+        mutate(across(c(c_test, c_test_sd), ~ round(.x, 4))) %>%
+        tidyr::pivot_wider(names_from = epsilon, values_from = c(c_test, c_test_sd)),
+      caption = sprintf("Λ = %g 固定（既報 Table 2 の FL 最良値）。formal_q200 が正当な数値、datadriven_K13 / datadriven_q200 は formal ではない参照値", LAM_FIXED))
+
+gap <- fixed %>% select(spec, epsilon, c_test) %>%
+  tidyr::pivot_wider(names_from = spec, values_from = c_test) %>%
+  mutate(price_norm_only = datadriven_q200 - formal_q200,
+         price_K13_old   = datadriven_K13  - formal_q200,
+         interval_effect = datadriven_K13  - datadriven_q200,
+         interval_count_formal = formal_K13 - formal_q200)
+kable(gap %>% filter(epsilon %in% c(0.1, 0.5, 1, 5, 10, 30, Inf)) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 4))),
+      caption = "保証の値段 price_norm_only = datadriven_q200 − formal_q200（現行）。price_K13_old は旧定義、interval_effect は区間の置き方の効果")
+cat(sprintf("保証の値段（正規化だけ）: ε=0.5 %.4f / ε=1 %.4f / ε=10 %.4f / ε=∞ %.4f。実用域 ε=1〜10 で %.3f〜%.3f\n",
+            gap$price_norm_only[gap$epsilon == 0.5], gap$price_norm_only[gap$epsilon == 1],
+            gap$price_norm_only[gap$epsilon == 10], gap$price_norm_only[is.infinite(gap$epsilon)],
+            min(gap$price_norm_only[gap$epsilon >= 1 & gap$epsilon <= 10]),
+            max(gap$price_norm_only[gap$epsilon >= 1 & gap$epsilon <= 10])))
+
+dist <- fixed %>% select(spec, epsilon, c_test_median, c_test_below_half) %>%
+  tidyr::pivot_wider(names_from = spec, values_from = c(c_test_median, c_test_below_half)) %>%
+  mutate(median_diff = c_test_median_datadriven_q200 - c_test_median_formal_q200)
+kable(dist %>% filter(epsilon %in% c(0.1, 0.5, 1, 2, 3, 5, 10, 30, Inf)) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 4))),
+      caption = "test C-index の中央値と C < 0.5 の分割の割合（Λ = 0.1）。datadriven_q200 は低 ε で二峰（年齢の係数の符号反転）")
+h1 <- raw %>% filter(abs(lambda - LAM_FIXED) < 1e-9, epsilon == 1)
+cnt <- function(s, a, b) sum(h1$c_index_test[h1$spec == s] >= a & h1$c_index_test[h1$spec == s] < b)
+cat(sprintf("ε=1 の度数: datadriven_q200 は [0.2,0.3) %d / [0.7,0.8) %d / [0.4,0.6) %d、formal_q200 は [0.6,0.7) %d / [0.4,0.6) %d\n",
+            cnt("datadriven_q200", 0.2, 0.3), cnt("datadriven_q200", 0.7, 0.8), cnt("datadriven_q200", 0.4, 0.6),
+            cnt("formal_q200", 0.6, 0.7), cnt("formal_q200", 0.4, 0.6)))
+```
+
+```{r compare-arms}
+summ_ctest <- function(x, nm) {
+  x %>% distinct(epsilon, iteration, .keep_all = TRUE) %>%
+    group_by(epsilon) %>% summarise(c_test = mean(c_index_test, na.rm = TRUE), .groups = "drop") %>%
+    mutate(arm = nm, formal = FALSE)
+}
+rf <- file.path(PROJ, "data/03_simulation/reffix_traintest")
+fs_rf <- c(`Phase 1` = "all_phase1_reffix_traintest.parquet", `Phase 2` = "all_phase2_reffix_traintest.parquet",
+           `Phase 3` = "all_phase3_reffix_traintest.parquet",
+           `Out (std)` = "all_output_std_reffix_traintest.parquet",
+           `Out (dfbeta)` = "all_output_dfbeta_reffix_traintest.parquet")
+ARM_ORDER <- c("Phase 1", "Phase 2", "Phase 3", "Out (Laplace)", "Out (std)", "Out (dfbeta)")
+laplace_csv <- file.path(PROJ, "data/03_simulation/traintest/flchain_output_traintest.csv")
+existing <- bind_rows(
+  lapply(names(fs_rf), function(nm) {
+    p <- file.path(rf, fs_rf[[nm]]); stopifnot(file.exists(p))
+    arrow::read_parquet(p, col_select = c("dataset", "epsilon", "iteration", "c_index_test")) %>%
+      filter(dataset == "flchain") %>% summ_ctest(nm)
+  }),
+  if (file.exists(laplace_csv)) summ_ctest(read.csv(laplace_csv), "Out (Laplace)")) %>%
+  arrange(match(arm, ARM_ORDER), epsilon)
+
+ARM_NAMES_G <- c(formal_q200     = "Nguyen Alg.1 (formal, q=200)",
+                 formal_K13      = "Nguyen Alg.1 (formal, K=13)",
+                 datadriven_K13  = "Nguyen Alg.1 (v2, 非 formal)",
+                 datadriven_q200 = "Nguyen Alg.1 (data-dependent normalisation only, q=200)")
+stopifnot(setequal(names(ARM_NAMES_G), SPEC_NAMES))
+SPEC_FORMAL <- setNames(vapply(SPECS, function(sp) identical(sp$type, "formal"), logical(1)),
+                        SPEC_NAMES)
+stopifnot(sum(SPEC_FORMAL) == 2L,
+          setequal(names(which(SPEC_FORMAL)), c("formal_q200", "formal_K13")))
+ours <- fixed %>% transmute(epsilon, c_test,
+  arm = unname(ARM_NAMES_G[spec]),
+  formal = unname(SPEC_FORMAL[spec]))
+stopifnot(!anyNA(ours$arm), !anyNA(ours$formal))
+comp <- bind_rows(existing, ours)
+
+kable(comp %>% filter(epsilon %in% c(0.1, 0.5, 1, 5, 10, 30, 100, Inf)) %>%
+        select(arm, epsilon, c_test) %>% mutate(c_test = round(c_test, 4)) %>%
+        tidyr::pivot_wider(names_from = epsilon, values_from = c_test, names_prefix = "eps="),
+      caption = paste0("flchain・同一の都度分割・B = 1000 でのテスト C-index。formal 保証があるのは ",
+                       "Nguyen Alg.1 の完全データ非依存な 2 仕様（formal, q=200 と formal, K=13）である"))
+```
+
+```{r fig-compare, fig.height=5.5}
+ggplot(comp %>% filter(is.finite(epsilon)),
+       aes(epsilon, c_test, colour = arm, linetype = formal)) +
+  geom_hline(yintercept = 0.5, linetype = 3, colour = "grey40") +
+  geom_hline(yintercept = ref_c, linetype = 2, colour = "grey30") +
+  geom_line(linewidth = 0.75) + geom_point(size = 1.6) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000)) +
+  scale_linetype_manual(values = c(`FALSE` = "22", `TRUE` = "solid"),
+                        labels = c("no (data-dependent preprocessing)",
+                                   "yes (fully data-independent)")) +
+  coord_cartesian(ylim = c(0.45, 0.82)) +
+  labs(x = expression(epsilon), y = "test C-index", colour = NULL, linetype = "formal DP",
+       title = "flchain: Nguyen & Hui Algorithm 1（formal 仕様）と本研究の各アーム",
+       subtitle = sprintf("B = 1000、同一の都度分割。破線 = 非私的 %.3f。Λ = %g 事前固定（既報 Table 2 の FL 最良値）",
+                          ref_c, LAM_FIXED)) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", legend.box = "vertical")
+```
+
+```{r mre}
+kable(fixed %>% filter(spec == "formal_q200",
+                       epsilon %in% c(0.1, 0.5, 1, 5, 10, Inf)) %>%
+        select(epsilon, mre, beta_ratio, c_test) %>%
+        mutate(mre = round(mre, 4), beta_ratio = signif(beta_ratio, 3), c_test = round(c_test, 4)),
+      caption = "formal 版での MRE・係数ノルム比・test C-index")
+```
+
+```{r formal-k13-table}
+mc_se <- function(sd) sd / sqrt(B_RUN)
+k13 <- fixed %>% filter(spec %in% c("formal_q200", "formal_K13")) %>%
+  select(spec, epsilon, c_test, c_test_sd) %>%
+  tidyr::pivot_wider(names_from = spec, values_from = c(c_test, c_test_sd)) %>%
+  mutate(se_formal_K13 = mc_se(c_test_sd_formal_K13), se_formal_q200 = mc_se(c_test_sd_formal_q200),
+         diff_K13_minus_q200 = c_test_formal_K13 - c_test_formal_q200,
+         ref_c_formal_K13  = mean(raw$c_index_test_ref[raw$spec == "formal_K13"]),
+         ref_c_formal_q200 = mean(raw$c_index_test_ref[raw$spec == "formal_q200"]),
+         gap_K13 = ref_c_formal_K13 - c_test_formal_K13) %>%
+  arrange(epsilon) %>%
+  select(epsilon, c_test_formal_K13, se_formal_K13, c_test_formal_q200, se_formal_q200,
+         diff_K13_minus_q200, gap_K13, ref_c_formal_K13, ref_c_formal_q200)
+stopifnot(nrow(k13) == length(EPSILON_VALUES), !anyNA(k13))
+kable(k13 %>% mutate(across(where(is.numeric) & !epsilon, ~ round(.x, 4))),
+      caption = "formal_K13（Λ = 0.1）: test C-index の平均と MC 標準誤差、formal_q200 との差、非私的参照値（K = 13 等幅・正則化なし）")
+write.csv(k13 %>% mutate(epsilon = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon))),
+          file.path(PROJ, "data/04_evaluation/exp_g_formal_K13.csv"), row.names = FALSE)
+cat(sprintf("formal_K13: ε=1 %.4f（formal_q200 %.4f、差 %+.4f）、ε=∞ %.4f、非私的 %.4f\n",
+            k13$c_test_formal_K13[k13$epsilon == 1], k13$c_test_formal_q200[k13$epsilon == 1],
+            k13$diff_K13_minus_q200[k13$epsilon == 1], k13$c_test_formal_K13[is.infinite(k13$epsilon)],
+            k13$ref_c_formal_K13[1]))
+```
+
+```{r save}
+OUT <- file.path(PROJ, "data/04_evaluation")
+write.csv(agg,   file.path(OUT, "exp_g_pilot_flchain_agg.csv"),     row.names = FALSE)
+write.csv(fixed, file.path(OUT, "exp_g_pilot_flchain_fixedlam.csv"), row.names = FALSE)
+write.csv(comp,  file.path(OUT, "exp_g_pilot_flchain_compare.csv"),  row.names = FALSE)
+
+write.csv(data.frame(
+  ref_c_nonprivate = ref_c,
+  lambda_fixed     = LAM_FIXED,
+  q_intervals      = Q_PAPER,
+  t_max_days       = T_MAX_FIXED_NGUYEN$flchain,
+  B                = B_RUN,
+  n_lambda         = length(LAMBDA_GRID),
+  n_epsilon        = length(EPSILON_VALUES),
+  specs            = paste(SPEC_NAMES, collapse = "|"),
+  ref_c_nonprivate_formal_K13 = mean(raw$c_index_test_ref[raw$spec == "formal_K13"]),
+  run_date         = format(Sys.Date())
+), file.path(OUT, "exp_g_pilot_flchain_design.csv"), row.names = FALSE)
+cat("saved\n")
+```
+
+```{r session}
+sessionInfo()
+```
+

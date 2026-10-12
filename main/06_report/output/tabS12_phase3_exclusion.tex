@@ -1,0 +1,36 @@
+\begin{tabular}{llllllll}
+  \toprule
+arm & dataset & threshold & submitted & no\_exclusion & self\_referential & same\_without\_exclusion & same\_self\_referential \\ 
+  \midrule
+in-sample & lung & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 60 & 60 & 60 & TRUE & TRUE \\ 
+  in-sample & lung & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 250 & $>$ 1000 & 250 & FALSE & TRUE \\ 
+  in-sample & lung & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 0.1 & 0.1 & 0.1 & TRUE & TRUE \\ 
+  in-sample & pbc & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 100 & 100 & 100 & TRUE & TRUE \\ 
+  in-sample & pbc & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 1000 & 1000 & 1000 & TRUE & TRUE \\ 
+  in-sample & pbc & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 250 & 250 & 250 & TRUE & TRUE \\ 
+  in-sample & colon & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 30 & 30 & 30 & TRUE & TRUE \\ 
+  in-sample & colon & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 1000 & 1000 & 1000 & TRUE & TRUE \\ 
+  in-sample & colon & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 250 & 250 & 250 & TRUE & TRUE \\ 
+  in-sample & rotterdam & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 30 & 30 & 30 & TRUE & TRUE \\ 
+  in-sample & rotterdam & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 250 & 250 & 250 & TRUE & TRUE \\ 
+  in-sample & rotterdam & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 60 & 60 & 60 & TRUE & TRUE \\ 
+  in-sample & flchain & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 30 & 60 & 30 & FALSE & TRUE \\ 
+  in-sample & flchain & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 60 & $>$ 1000 & 60 & FALSE & TRUE \\ 
+  in-sample & flchain & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 1000 & $>$ 1000 & 1000 & FALSE & TRUE \\ 
+  train/test & lung & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 60 & 250 & 60 & FALSE & TRUE \\ 
+  train/test & lung & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & $>$ 1000 & $>$ 1000 & $>$ 1000 & TRUE & TRUE \\ 
+  train/test & lung & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 0.1 & 0.1 & $>$ 1000 & TRUE & FALSE \\ 
+  train/test & pbc & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 250 & 250 & 250 & TRUE & TRUE \\ 
+  train/test & pbc & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & $>$ 1000 & $>$ 1000 & $>$ 1000 & TRUE & TRUE \\ 
+  train/test & pbc & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 1000 & 1000 & 1000 & TRUE & TRUE \\ 
+  train/test & colon & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 60 & 60 & 60 & TRUE & TRUE \\ 
+  train/test & colon & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & $>$ 1000 & $>$ 1000 & $>$ 1000 & TRUE & TRUE \\ 
+  train/test & colon & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 1000 & 1000 & 1000 & TRUE & TRUE \\ 
+  train/test & rotterdam & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 30 & 30 & 30 & TRUE & TRUE \\ 
+  train/test & rotterdam & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 1000 & 1000 & 1000 & TRUE & TRUE \\ 
+  train/test & rotterdam & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & $>$ 1000 & $>$ 1000 & $>$ 1000 & TRUE & TRUE \\ 
+  train/test & flchain & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.50}$ & 30 & 60 & 30 & FALSE & TRUE \\ 
+  train/test & flchain & $\varepsilon^{*}_{\mathrm{LSR} \leq 0.10}$ & 60 & $>$ 1000 & 60 & FALSE & TRUE \\ 
+  train/test & flchain & $\varepsilon^{*}_{\mathrm{FPR} \leq 0.10}$ & 1000 & $>$ 1000 & 1000 & FALSE & TRUE \\ 
+   \bottomrule
+\end{tabular}

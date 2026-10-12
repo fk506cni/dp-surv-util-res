@@ -1,0 +1,837 @@
+---
+title: "Quantifying Utility Degradation under DP-Inspired Noise in Cox Proportional Hazards Models"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    fig_caption: true
+    self_contained: true
+bibliography: references.bib
+link-citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  out.width = "90%",
+  dpi = 300
+)
+
+library(tidyverse)
+library(knitr)
+options(kableExtra.latex.load_packages = FALSE)
+library(kableExtra)
+library(survival)
+library(scales)
+library(openxlsx)
+library(xtable)
+library(arrow)
+library(ragg)
+library(svglite)
+
+source("/home/rstudio/project/main/06_report/R/revise_helpers.R")
+
+project_dir <- PROJECT_DIR
+eval_dir <- EVAL_DIR
+sim_dir <- SIM_DIR
+out_dir <- OUT_DIR
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+is_html <- knitr::is_html_output()
+is_latex <- knitr::is_latex_output()
+
+options(knitr.kable.linesep = "")
+
+RF <- "_reffix"
+stopifnot(nzchar(RF))
+```
+
+```{r load-data}
+kpi_summary <- read.csv(file.path(eval_dir, "kpi_summary_reffix.csv"),
+                        stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         epsilon_label = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)))
+
+kpi_var <- read.csv(file.path(eval_dir, "kpi_variable_detail_reffix.csv"),
+                    stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+lsr_detail <- read.csv(file.path(eval_dir, "lsr_detail_reffix.csv"),
+                       stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+fpr_detail <- read.csv(file.path(eval_dir, "fpr_detail_reffix.csv"),
+                       stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER))
+
+kpi_tt <- read.csv(file.path(eval_dir, "kpi_traintest_reffix.csv"),
+                   stringsAsFactors = FALSE) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER),
+         epsilon_label = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon)))
+
+baseline_all <- read.csv(file.path(project_dir, "data/01_prepared/baseline_cox_reffix.csv"),
+                         stringsAsFactors = FALSE)
+
+baselines_insample <- sapply(DATASET_ORDER, function(ds)
+  get_kpi(kpi_summary, ds, Inf, "Phase 1", "mean_c"))
+
+baselines_test <- sapply(DATASET_ORDER, function(ds)
+  get_kpi(kpi_tt, ds, Inf, "Phase 1", "mean_c_test"))
+```
+
+```{r baseline}
+Q_VALUES <- c(lung = 7L, pbc = 17L, colon = 11L, rotterdam = 9L, flchain = 7L)
+
+N_COEF_TBL <- read.csv(file.path(project_dir, "main/06_report/output/tabS5_variable_types.csv"),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+N_COEF <- setNames(as.integer(N_COEF_TBL[["Cox coef."]]), N_COEF_TBL$Dataset)
+stopifnot(setequal(names(N_COEF), DATASET_ORDER),
+          identical(unname(N_COEF[DATASET_ORDER]),
+                    as.integer(table(baseline_all$dataset)[DATASET_ORDER])))
+stopifnot(all(N_COEF[DATASET_ORDER] >= Q_VALUES[DATASET_ORDER]))
+
+sig_vars_str <- function(ds) {
+  sub <- baseline_all[baseline_all$dataset == ds, ]
+  sig <- sub[sub$p_value < 0.05, ]
+  sprintf("%d/%d (%s)", nrow(sig), N_COEF[ds], paste(sig$variable, collapse = ", "))
+}
+
+datasets_tbl <- tibble(
+  Dataset = DATASET_ORDER,
+  N = as.integer(c(168, 312, 929, 2982, 6524)),
+  Events = as.integer(c(121, 125, 468, 1518, 1962)),
+  q = as.integer(c(7, 17, 11, 9, 7)),
+  `Event rate` = round(Events / N, 3),
+  `C-index` = baselines_insample,
+  `Test C-index` = baselines_test,
+  `Sig. coef.` = sapply(DATASET_ORDER, sig_vars_str)
+)
+
+save_tbl(datasets_tbl, paste0("tab1_baseline", RF), digits = c(0, 0, 0, 0, 0, 3, 3, 3, 0),
+         tex_transform = function(d) { d[["Sig. coef."]] <- gsub(">", "$>$", d[["Sig. coef."]], fixed = TRUE); d })
+
+kable(datasets_tbl,
+      caption = "Dataset characteristics and baseline Cox regression results.",
+      digits = 3,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r fig-lsr, fig.cap="Loss of Significance Rate (LSR) by privacy budget across three input perturbation approaches and five datasets. Triangular markers at the rightmost position denote the non-private baseline (epsilon = infinity), where the LSR is 0 for all three approaches and the markers coincide.", fig.width=12, fig.height=5}
+lsr_plot_data <- kpi_summary %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3")) %>%
+  mutate(
+    x_pos = ifelse(is.infinite(epsilon), 10000, epsilon),
+    is_inf = is.infinite(epsilon),
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    phase = factor(phase, levels = names(PHASE_COLORS))
+  )
+
+stopifnot(sum(lsr_plot_data$is_inf) == 3L * length(DATASET_ORDER),
+          all(lsr_plot_data$mean_lsr[lsr_plot_data$is_inf] == 0))
+cat(sprintf("fig1: LSR at epsilon = Inf is exactly 0 in all %d cells (dataset x phase)\n",
+            sum(lsr_plot_data$is_inf)))
+
+p_lsr <- ggplot(lsr_plot_data,
+       aes(x = x_pos, y = mean_lsr, color = phase, shape = phase)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(data = function(d) d[!d$is_inf, ], size = 1.5) +
+  geom_point(data = function(d) d[d$is_inf, ], shape = 17, size = 2.4, show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = c(3, 10), linetype = "dotted", color = "grey70", linewidth = 0.3) +
+  facet_wrap(~ dataset_label, nrow = 1) +
+  scale_x_log10(breaks = c(0.1, 1, 3, 10, 100, 1000, 10000),
+                labels = c("0.1", "1", "3", "10", "100", "1k",
+                           expression(infinity))) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+  scale_color_manual(values = PHASE_COLORS, labels = PHASE_LABELS) +
+  scale_shape_manual(values = c(16, 17, 15), labels = PHASE_LABELS) +
+  labs(x = expression(paste("Privacy budget  ", epsilon)),
+       y = "Loss of Significance Rate (LSR)",
+       color = NULL, shape = NULL) +
+  theme_main_fig() +
+  guides(color = guide_legend(nrow = 1))
+
+save_fig(p_lsr, paste0("fig1_lsr", RF), width = 12, height = 5)
+p_lsr
+```
+
+```{r tab-lsr}
+lsr_tbl <- kpi_summary %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3")) %>%
+  select(dataset, epsilon, phase, mean_lsr) %>%
+  mutate(epsilon_label = ifelse(is.infinite(epsilon), "Inf",
+                                as.character(epsilon))) %>%
+  pivot_wider(names_from = phase, values_from = mean_lsr) %>%
+  select(dataset, epsilon_label, `Phase 1`, `Phase 2`, `Phase 3`) %>%
+  arrange(dataset, as.numeric(ifelse(epsilon_label == "Inf", Inf, epsilon_label)))
+
+save_tbl(lsr_tbl, paste0("tab2_lsr", RF), digits = 3,
+        col.names = c("Dataset", "$\\varepsilon$", "Phase 1", "Phase 2", "Phase 3"))
+
+lsr_tbl_display <- lsr_tbl %>%
+  mutate(epsilon_label = ifelse(epsilon_label == "Inf", "$\\infty$", epsilon_label))
+
+tbl <- kable(lsr_tbl_display,
+      caption = "Loss of Significance Rate by $\\varepsilon$ and approach.",
+      col.names = c("Dataset", "$\\varepsilon$", "Phase 1", "Phase 2", "Phase 3"),
+      digits = 3,
+      escape = FALSE,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+if (is_html) tbl <- tbl %>% collapse_rows(columns = 1, valign = "top")
+tbl
+```
+
+```{r fig-cindex-test, fig.cap="Out-of-sample C-index (test set) vs. privacy budget for four approaches and five datasets. Ribbons show plus/minus 1 SD over B=1000 train/test splits. Triangular markers at the rightmost position denote the non-private baseline (epsilon = infinity). Grey horizontal lines indicate the baseline C-index (solid) and random prediction at 0.5 (dashed).", fig.width=12, fig.height=5}
+cindex_data <- kpi_tt %>%
+  unify_output() %>%
+  mutate(
+    x_pos = ifelse(is.infinite(epsilon), 10000, epsilon),
+    is_inf = is.infinite(epsilon),
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    phase = factor(phase, levels = names(PHASE_COLORS))
+  )
+
+baselines_df <- tibble(
+  dataset = factor(DATASET_ORDER, levels = DATASET_ORDER),
+  dataset_label = factor(DATASET_ORDER, levels = DATASET_ORDER, labels = DATASET_LABELS),
+  baseline = baselines_test
+)
+
+p_cindex <- ggplot(cindex_data,
+       aes(x = x_pos, y = mean_c_test, color = phase, fill = phase)) +
+  geom_ribbon(aes(ymin = mean_c_test - sd_c_test,
+                  ymax = mean_c_test + sd_c_test),
+              alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(shape = is_inf), size = 1.8) +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 17), guide = "none") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_hline(data = baselines_df, aes(yintercept = baseline),
+             linetype = "solid", color = "grey60", linewidth = 0.4) +
+  facet_wrap(~ dataset_label, nrow = 1, scales = "free_y",
+             labeller = labeller(dataset_label = function(x) sub(" (", "\n(", x, fixed = TRUE))) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000, 10000),
+                labels = c("0.1", "1", "10", "100", "1k",
+                           expression(infinity))) +
+  scale_color_manual(values = PHASE_COLORS, labels = PHASE_LABELS) +
+  scale_fill_manual(values = PHASE_COLORS, labels = PHASE_LABELS) +
+  labs(x = expression(paste("Privacy budget  ", epsilon)),
+       y = "Test C-index",
+       color = NULL, fill = NULL) +
+  theme_main_fig() +
+  guides(color = guide_legend(nrow = 1),
+         fill = guide_legend(nrow = 1))
+
+save_fig(p_cindex, paste0("fig2_cindex_test", RF), width = 12, height = 5)
+p_cindex
+```
+
+```{r tab-cindex-test}
+ct_tbl <- kpi_tt %>%
+  unify_output() %>%
+  mutate(
+    c_display = sprintf("%.3f (%.3f)", mean_c_test, sd_c_test),
+    epsilon_label = ifelse(is.infinite(epsilon), "Inf", as.character(epsilon))
+  ) %>%
+  select(dataset, epsilon_label, phase, c_display) %>%
+  pivot_wider(names_from = phase, values_from = c_display) %>%
+  arrange(dataset, as.numeric(ifelse(epsilon_label == "Inf", Inf, epsilon_label)))
+
+save_tbl(ct_tbl, paste0("tab3_cindex_test", RF), digits = 3,
+        col.names = c("Dataset", "$\\varepsilon$",
+                       intersect(c("Phase 1", "Phase 2", "Phase 3", "Output"), names(ct_tbl))))
+
+ct_tbl_display <- ct_tbl %>%
+  mutate(epsilon_label = ifelse(epsilon_label == "Inf", "$\\infty$", epsilon_label))
+
+col_names <- c("Dataset", "$\\varepsilon$",
+               intersect(c("Phase 1", "Phase 2", "Phase 3", "Output"), names(ct_tbl_display)))
+
+tbl <- kable(ct_tbl_display,
+      caption = "Out-of-sample C-index (mean (SD)) by $\\varepsilon$ and approach.",
+      col.names = col_names,
+      escape = FALSE,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 10)
+if (is_html) tbl <- tbl %>% collapse_rows(columns = 1, valign = "top")
+tbl
+```
+
+```{r cfr-summary}
+cfr_summary <- kpi_tt %>%
+  group_by(phase) %>%
+  summarise(
+    max_cfr = max(cfr, na.rm = TRUE),
+    mean_cfr = mean(cfr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r beta-data}
+beta_detail <- kpi_var %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3")) %>%
+  mutate(phase = factor(phase, levels = names(PHASE_COLORS)))
+
+TOP_N_VARS <- 5
+
+sig_vars_all <- baseline_all %>%
+  filter(p_value < 0.05) %>%
+  select(dataset, variable) %>%
+  mutate(is_sig = TRUE)
+
+top_vars <- baseline_all %>%
+  group_by(dataset) %>%
+  slice_max(abs(beta), n = TOP_N_VARS, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(sig_vars_all, by = c("dataset", "variable")) %>%
+  mutate(
+    is_sig = ifelse(is.na(is_sig), FALSE, TRUE),
+    var_label = ifelse(is_sig, paste0(variable, "*"), variable)
+  ) %>%
+  select(dataset, variable, beta_baseline = beta, is_sig, var_label)
+```
+
+```{r fig-hr-distribution, fig.cap="Hazard ratio (HR) under Phase 1 (covariates-only) perturbation for the top 5 covariates by absolute baseline coefficient in each dataset. Dots show mean HR over B=1000 iterations; error bars show plus/minus 1 SD. Cross marks denote the non-private baseline HR (epsilon = infinity). The dashed line at HR = 1.0 is the null hypothesis of no effect. At low epsilon, all HRs collapse toward 1.0, indicating complete loss of effect size. Variables are sorted by descending baseline coefficient.", fig.width=12, fig.height=7}
+hr_raw <- as.data.frame(arrow::read_parquet(
+  file.path(sim_dir, "reffix_traintest/all_phase1_reffix_traintest.parquet")))
+stopifnot(setequal(unique(hr_raw$dataset), DATASET_ORDER))
+
+eps_show_hr <- c(1, 10, 100, 1000, Inf)
+
+hr_summary <- hr_raw %>%
+  semi_join(top_vars, by = c("dataset", "variable")) %>%
+  filter(epsilon %in% eps_show_hr,
+         converged == TRUE) %>%
+  group_by(dataset, variable, epsilon) %>%
+  summarise(
+    mean_hr = mean(hr, na.rm = TRUE),
+    sd_hr = sd(hr, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(top_vars, by = c("dataset", "variable")) %>%
+  mutate(
+    is_baseline = is.infinite(epsilon),
+    epsilon_label = factor(
+      ifelse(is.infinite(epsilon), "\u221E", as.character(epsilon)),
+      levels = EPSILON_LEVELS
+    ),
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    pt_shape = ifelse(is_baseline, "baseline", "dp"),
+    sd_hr = ifelse(is_baseline, 0, sd_hr)
+  )
+
+pd <- position_dodge(width = 0.6)
+
+p_hr_dist <- ggplot(hr_summary,
+       aes(x = reorder(var_label, -beta_baseline), y = mean_hr,
+           color = epsilon_label, group = epsilon_label)) +
+  geom_errorbar(
+    aes(ymin = mean_hr - sd_hr, ymax = mean_hr + sd_hr),
+    position = pd, width = 0.3, linewidth = 0.4
+  ) +
+  geom_point(
+    aes(shape = pt_shape),
+    position = pd, size = 2, stroke = 0.7
+  ) +
+  scale_shape_manual(values = c("dp" = 16, "baseline" = 4), guide = "none") +
+  geom_hline(yintercept = 1.0, linetype = "dashed", color = "grey50",
+             linewidth = 0.4) +
+  coord_flip() +
+  facet_wrap(~ dataset_label, scales = "free", nrow = 2) +
+  scale_color_manual(
+    values = EPSILON_COLORS,
+    name = expression(epsilon)
+  ) +
+  labs(x = NULL, y = "Hazard Ratio (HR)") +
+  theme_paper() +
+  theme(
+    legend.position = c(0.85, 0.18),
+    legend.background = element_rect(fill = "white", color = "grey80"),
+    legend.key.size = unit(0.45, "cm")
+  ) +
+  guides(color = guide_legend(
+    reverse = TRUE,
+    override.aes = list(shape = c(4, 16, 16, 16, 16))
+  ))
+
+save_fig(p_hr_dist, paste0("fig3_hr_distribution", RF), width = 12, height = 7)
+p_hr_dist
+```
+
+```{r fig-beta-bias-allvars, fig.cap="Signed relative HR bias (HR_DP / HR_baseline - 1) for the top 5 covariates per dataset under Phase 1 perturbation at four epsilon levels. Asterisks mark covariates significant at baseline (p < 0.05). Variables are sorted by descending baseline coefficient (same order as the preceding HR distribution figure). Lower epsilon produces stronger attenuation toward HR = 1.0, but the sign of bias is always toward the null.", fig.width=12, fig.height=7}
+EPS_LEVELS_FINITE <- c("1", "10", "100", "1000")
+
+hr_bias_data <- kpi_var %>%
+  filter(phase == "Phase 1",
+         !is.infinite(epsilon),
+         epsilon %in% c(1, 10, 100, 1000)) %>%
+  semi_join(top_vars, by = c("dataset", "variable")) %>%
+  left_join(top_vars, by = c("dataset", "variable")) %>%
+  mutate(
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    epsilon_label = factor(as.character(epsilon), levels = EPS_LEVELS_FINITE)
+  )
+
+p_hr <- ggplot(hr_bias_data,
+       aes(x = reorder(var_label, -beta_baseline), y = hr_rel_bias,
+           fill = epsilon_label)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  facet_wrap(~ dataset_label, scales = "free", nrow = 2) +
+  coord_flip() +
+  scale_fill_manual(
+    values = EPSILON_COLORS[EPS_LEVELS_FINITE],
+    name = expression(epsilon)
+  ) +
+  labs(x = NULL,
+       y = "Relative HR bias (HR_DP / HR_baseline - 1)") +
+  theme_paper() +
+  theme(
+    legend.position = c(0.85, 0.18),
+    legend.background = element_rect(fill = "white", color = "grey80"),
+    legend.key.size = unit(0.45, "cm")
+  ) +
+  guides(fill = guide_legend(reverse = TRUE))
+
+save_fig(p_hr, paste0("fig4_hr_bias", RF), width = 12, height = 7)
+p_hr
+```
+
+```{r threshold-table}
+thresh_c <- kpi_tt %>%
+  unify_output() %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3", "Output")) %>%
+  left_join(
+    kpi_tt %>%
+      unify_output() %>%
+      filter(is.infinite(epsilon)) %>%
+      select(dataset, phase, base_c = mean_c_test),
+    by = c("dataset", "phase")
+  ) %>%
+  mutate(delta = base_c - mean_c_test) %>%
+  filter(!is.infinite(epsilon), delta <= 0.05) %>%
+  group_by(dataset, phase) %>%
+  summarise(eps_c05 = min(epsilon), .groups = "drop")
+
+thresh_lsr <- kpi_summary %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3"),
+         !is.infinite(epsilon),
+         mean_lsr <= 0.5) %>%
+  group_by(dataset, phase) %>%
+  summarise(eps_lsr50 = min(epsilon), .groups = "drop")
+
+thresh_lsr10 <- kpi_summary %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3"),
+         !is.infinite(epsilon),
+         mean_lsr <= 0.1) %>%
+  group_by(dataset, phase) %>%
+  summarise(eps_lsr10 = min(epsilon), .groups = "drop")
+
+fpr_agg_thresh <- fpr_detail %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3"),
+         is.finite(epsilon)) %>%
+  group_by(dataset, phase, epsilon) %>%
+  summarise(mean_fpr = mean(fpr, na.rm = TRUE), .groups = "drop")
+
+thresh_fpr <- fpr_agg_thresh %>%
+  arrange(dataset, phase, desc(epsilon)) %>%
+  group_by(dataset, phase) %>%
+  mutate(max_fpr_above = cummax(mean_fpr)) %>%
+  ungroup() %>%
+  filter(max_fpr_above <= 0.10) %>%
+  group_by(dataset, phase) %>%
+  summarise(eps_fpr10 = min(epsilon), .groups = "drop")
+
+min_eps_tested <- min(fpr_agg_thresh$epsilon)
+
+thresh_combined <- thresh_c %>%
+  full_join(thresh_lsr, by = c("dataset", "phase")) %>%
+  full_join(thresh_lsr10, by = c("dataset", "phase")) %>%
+  full_join(thresh_fpr, by = c("dataset", "phase")) %>%
+  mutate(
+    across(c(eps_c05, eps_lsr50, eps_lsr10),
+           ~ ifelse(is.na(.x), "> 1000", as.character(.x))),
+    across(c(eps_lsr50, eps_lsr10), ~ ifelse(phase == "Output", "---", .x)),
+    eps_fpr10 = case_when(
+      phase == "Output" ~ "---",
+      is.na(eps_fpr10) ~ "> 1000",
+      eps_fpr10 <= min_eps_tested ~ "---",
+      TRUE ~ as.character(eps_fpr10)
+    )
+  ) %>%
+  arrange(dataset, phase)
+
+save_tbl(thresh_combined, paste0("tab4_threshold", RF), digits = 0,
+        col.names = c("Dataset", "Phase",
+                       "$\\varepsilon^*_{\\Delta C \\leq 0.05}$",
+                       "$\\varepsilon^*_{\\text{LSR} \\leq 0.5}$",
+                       "$\\varepsilon^*_{\\text{LSR} \\leq 0.1}$",
+                       "$\\varepsilon^*_{\\text{FPR} \\leq 0.10}$"))
+
+kable(thresh_combined,
+      caption = "Minimum $\\varepsilon$ to achieve utility thresholds. The FPR threshold ($\\varepsilon^*_{\\text{FPR}}$) is the minimum $\\varepsilon$ beyond which mean FPR remains at or below 10\\%, i.e., the right tail of the FPR hump.",
+      col.names = c("Dataset", "Phase",
+                     "$\\varepsilon^*_{\\Delta C \\leq 0.05}$",
+                     "$\\varepsilon^*_{\\text{LSR} \\leq 0.5}$",
+                     "$\\varepsilon^*_{\\text{LSR} \\leq 0.1}$",
+                     "$\\varepsilon^*_{\\text{FPR} \\leq 0.10}$"),
+      escape = FALSE,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r transition-zone}
+tz_eps <- c(3, 5, 7, 10)
+tz_data <- kpi_summary %>%
+  filter(phase == "Phase 1", epsilon %in% tz_eps) %>%
+  select(dataset, epsilon, mean_lsr) %>%
+  pivot_wider(names_from = epsilon, values_from = mean_lsr, names_prefix = "lsr_eps_") %>%
+  mutate(lsr_drop = lsr_eps_3 - lsr_eps_10) %>%
+  arrange(dataset)
+
+kable(tz_data,
+      caption = "Phase 1 LSR in the transition zone ($\\varepsilon = 3$--$10$).",
+      col.names = c("Dataset",
+                     paste0("$\\varepsilon = ", tz_eps, "$"),
+                     "Drop ($3 \\to 10$)"),
+      digits = 3,
+      escape = FALSE,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+save_tbl(tz_data, paste0("tab5_transition_zone", RF), digits = 3,
+        col.names = c("Dataset",
+                       paste0("$\\varepsilon = ", tz_eps, "$"),
+                       "Drop ($3 \\to 10$)"))
+```
+
+```{r fig-lsr-per-variable, fig.cap="Per-variable LSR for the lung dataset across Phases 1--3.", fig.width=8, fig.height=4}
+lsr_lung <- lsr_detail %>%
+  filter(dataset == "lung",
+         phase %in% c("Phase 1", "Phase 2", "Phase 3"),
+         !is.na(lsr),
+         !is.infinite(epsilon)) %>%
+  mutate(phase = factor(phase, levels = names(PHASE_COLORS)))
+
+p_lsr_var <- ggplot(lsr_lung,
+       aes(x = epsilon, y = lsr, color = phase, shape = phase)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  facet_wrap(~ variable, nrow = 1) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+  scale_color_manual(values = PHASE_COLORS, labels = PHASE_LABELS) +
+  scale_shape_manual(values = c(16, 17, 15), labels = PHASE_LABELS) +
+  labs(x = expression(epsilon), y = "LSR", color = NULL, shape = NULL) +
+  theme_paper()
+
+save_fig(p_lsr_var, paste0("figS1_lsr_per_variable", RF), width = 8, height = 4)
+p_lsr_var
+```
+
+```{r fig-overfit, fig.cap="Overfitting gap (C_train minus C_test) vs. privacy budget, faceted by approach. Each line represents one dataset. The y-axis range is unified across all four panels to enable direct comparison. Phase 2 and Output (dfbeta) exhibit large negative gaps at intermediate epsilon, indicating worse-than-random in-sample performance due to noise.", fig.width=12, fig.height=8}
+gap_data <- kpi_tt %>%
+  unify_output() %>%
+  filter(!is.infinite(epsilon)) %>%
+  mutate(
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    phase = factor(phase, levels = names(PHASE_COLORS)),
+    phase_label = factor(phase, levels = names(PHASE_COLORS), labels = PHASE_LABELS)
+  )
+
+y_range <- range(gap_data$overfit_gap, na.rm = TRUE)
+y_pad <- diff(y_range) * 0.05
+y_lim <- c(y_range[1] - y_pad, y_range[2] + y_pad)
+
+p_gap <- ggplot(gap_data,
+       aes(x = epsilon, y = overfit_gap, color = dataset_label,
+           shape = dataset_label)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~ phase_label, nrow = 2) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1k")) +
+  coord_cartesian(ylim = y_lim) +
+  labs(x = expression(epsilon),
+       y = expression(C[train] - C[test]),
+       color = NULL, shape = NULL) +
+  theme_paper() +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 1),
+         shape = guide_legend(nrow = 1))
+
+save_fig(p_gap, paste0("figS2_overfit_gap", RF), width = 12, height = 8)
+p_gap
+```
+
+```{r fig-fpr-summary, fig.cap="Mean FPR vs privacy budget across five datasets (input perturbation only).", fig.width=12, fig.height=5}
+fpr_input <- fpr_detail %>%
+  unify_output() %>%
+  filter(phase %in% c("Phase 1", "Phase 2", "Phase 3"),
+         is.finite(epsilon))
+
+fpr_agg <- fpr_input %>%
+  group_by(dataset, epsilon, phase) %>%
+  summarise(mean_fpr = mean(fpr, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    dataset_label = factor(dataset, levels = DATASET_ORDER, labels = DATASET_LABELS),
+    phase = factor(phase, levels = names(PHASE_COLORS))
+  )
+
+p_fpr <- ggplot(fpr_agg, aes(x = epsilon, y = mean_fpr, color = phase, shape = phase)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey50") +
+  facet_wrap(~ dataset_label, nrow = 1) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_color_manual(values = PHASE_COLORS, labels = PHASE_LABELS) +
+  scale_shape_manual(values = c(16, 17, 15), labels = PHASE_LABELS) +
+  labs(x = expression(epsilon), y = "Mean FPR",
+       color = NULL, shape = NULL) +
+  theme_main_fig()
+
+save_fig(p_fpr, paste0("figS3_fpr", RF), width = 12, height = 5)
+p_fpr
+```
+
+```{r fig-fpr-by-variable, fig.cap="Per-variable false positive rate (FPR) for the PBC dataset (q=17, highest number of baseline non-significant variables), faceted by input perturbation phase. The y-axis range is unified across panels. The dashed line indicates the nominal alpha = 0.05 level. FPR peaks at intermediate epsilon (10--100) for variables whose baseline p-value is close to the significance threshold, then returns to zero as epsilon approaches infinity.", fig.width=12, fig.height=8}
+fpr_pbc <- fpr_input %>%
+  filter(dataset == "pbc") %>%
+  mutate(
+    phase = factor(phase, levels = names(PHASE_COLORS)),
+    phase_label = factor(phase, levels = names(PHASE_COLORS), labels = PHASE_LABELS)
+  )
+
+fpr_y_max <- max(fpr_pbc$fpr, na.rm = TRUE) * 1.05
+
+p_fpr_var <- ggplot(fpr_pbc,
+       aes(x = epsilon, y = fpr, color = variable)) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 1.2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey50") +
+  facet_wrap(~ phase_label, nrow = 2) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, fpr_y_max)) +
+  labs(x = expression(epsilon), y = "FPR",
+       color = "Variable") +
+  theme_paper() +
+  theme(legend.position = c(0.75, 0.25),
+        legend.background = element_rect(fill = "white", color = "grey80"),
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = rel(0.75)),
+        legend.title = element_text(size = rel(0.85)))
+
+save_fig(p_fpr_var, paste0("figS4_fpr_by_variable", RF), width = 12, height = 8)
+p_fpr_var
+```
+
+```{r tab-fpr-summary}
+fpr_summary_tbl <- fpr_agg %>%
+  filter(epsilon %in% c(0.1, 1, 5, 10, 30, 100)) %>%
+  mutate(mean_fpr = sprintf("%.3f", mean_fpr)) %>%
+  select(dataset, epsilon, phase, mean_fpr) %>%
+  pivot_wider(names_from = phase, values_from = mean_fpr) %>%
+  arrange(dataset, epsilon)
+
+save_tbl(fpr_summary_tbl, paste0("tabS3_fpr_summary", RF), digits = 3,
+        col.names = c("Dataset", "$\\varepsilon$", "Phase 1", "Phase 2", "Phase 3"))
+
+kable(fpr_summary_tbl,
+      caption = "Mean FPR by dataset, epsilon, and phase (input perturbation only).",
+      booktabs = TRUE, escape = FALSE, linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r tab-full-kpi}
+full_kpi <- kpi_tt %>%
+  unify_output() %>%
+  mutate(epsilon_label = ifelse(is.infinite(epsilon), "Inf",
+                                as.character(epsilon))) %>%
+  select(dataset, epsilon_label, phase,
+         mean_c_test, sd_c_test, delta_c_test, overfit_gap, cfr) %>%
+  arrange(dataset,
+          as.numeric(ifelse(epsilon_label == "Inf", Inf, epsilon_label)),
+          phase)
+
+save_tbl(full_kpi, paste0("tabS1_full_kpi", RF), digits = 3,
+        col.names = c("Dataset", "$\\varepsilon$", "Phase",
+                       "Test C", "SD", "$\\Delta$C (test)", "Gap", "CFR"))
+
+full_kpi_display <- full_kpi %>%
+  mutate(epsilon_label = ifelse(epsilon_label == "Inf", "$\\infty$", epsilon_label))
+
+tbl <- kable(full_kpi_display,
+      caption = "Full KPI summary for all conditions.",
+      col.names = c("Dataset", "$\\varepsilon$", "Phase",
+                     "Test C", "SD", "$\\Delta$C (test)", "Gap", "CFR"),
+      digits = 3,
+      escape = FALSE,
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 9)
+if (is_html) tbl <- tbl %>% collapse_rows(columns = 1:2, valign = "top")
+tbl
+```
+
+```{r sim-params}
+params <- tibble(
+  Parameter = c(
+    "Iterations (B)",
+    "Epsilon values",
+    "Datasets",
+    "Base seed",
+    "Train/test split",
+    "Split base seed",
+    "Phase 3 K (Sturges)",
+    "DP implementation",
+    "Clipping bounds",
+    "Parallel workers"
+  ),
+  Value = c(
+    "1,000",
+    "0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 30.0, 60.0, 100, 250, 1000, Inf (15 values)",
+    "lung (168), pbc (312), colon (929), rotterdam (2982), flchain (6524)",
+    "42",
+    "70/30 stratified by event status",
+    "100,000",
+    "lung=8, pbc=9, colon=10, rotterdam=12, flchain=13",
+    "Native R (rexp-based Laplace, runif-based RR)",
+    "Data-driven (observed min/max)",
+    "23"
+  )
+)
+
+save_tbl(params, paste0("tabS2_sim_params", RF), digits = 0)
+
+kable(params,
+      caption = "Simulation parameters.",
+      booktabs = TRUE,
+      linesep = "") %>%
+  kable_styling(latex_options = c("hold_position"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(2, width = "12cm")
+```
+
+```{r threshold-shift, eval=file.exists(file.path(out_dir, "tab4_threshold.csv"))}
+t4_old <- read.csv(file.path(out_dir, "tab4_threshold.csv"), stringsAsFactors = FALSE)
+t4_new <- read.csv(file.path(out_dir, "tab4_threshold_reffix.csv"), stringsAsFactors = FALSE)
+stopifnot(identical(dim(t4_old), dim(t4_new)), identical(names(t4_old), names(t4_new)),
+          identical(t4_old$dataset, t4_new$dataset), identical(t4_old$phase, t4_new$phase))
+
+eps_cols <- c("eps_c05", "eps_lsr50", "eps_lsr10", "eps_fpr10")
+diff_cells <- do.call(rbind, lapply(eps_cols, function(cl) {
+  idx <- which(as.character(t4_old[[cl]]) != as.character(t4_new[[cl]]))
+  if (!length(idx)) return(NULL)
+  data.frame(dataset = t4_old$dataset[idx], phase = t4_old$phase[idx], column = cl,
+             submitted = as.character(t4_old[[cl]])[idx],
+             reffix    = as.character(t4_new[[cl]])[idx], stringsAsFactors = FALSE)
+}))
+
+by_design <- if (is.null(diff_cells)) integer(0) else
+  which(diff_cells$phase == "Output" & diff_cells$column %in% c("eps_lsr50", "eps_lsr10") &
+        diff_cells$reffix == "---")
+substantive <- if (is.null(diff_cells)) NULL else
+  if (length(by_design)) diff_cells[-by_design, , drop = FALSE] else diff_cells
+
+cat(sprintf("tab4_threshold の全セル数（ε 列のみ）: %d\n", nrow(t4_old) * length(eps_cols)))
+cat(sprintf("  §4-2 の表記変更（Output 行の LSR 2 列 → `---`）: %d セル\n", length(by_design)))
+cat(sprintf("  **値そのものが動いたセル: %d**\n",
+            if (is.null(substantive)) 0L else nrow(substantive)))
+
+if (!is.null(substantive) && nrow(substantive) > 0) {
+  kable(substantive, caption = "**ε\\* 閾値が動いたセル**（投稿版 → 差し替え版）") %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+} else {
+  cat("\n→ **ε\\* 閾値は 1 セルも動かない。** 掲載する Table IV の数値はそのままでよい。\n")
+}
+```
+
+```{r phase3-exclusions}
+excl_new <- read.csv(file.path(eval_dir, "phase3_exclusions_reffix.csv"), stringsAsFactors = FALSE)
+excl_old <- data.frame(
+  kind     = c("lsr", "lsr", "fpr"),
+  dataset  = c("lung", "flchain", "flchain"),
+  variable = c("ph.karno", "sample.yr", "kappa"),
+  stringsAsFactors = FALSE
+)
+key <- function(d) sort(paste(d$kind, d$dataset, d$variable))
+same <- identical(key(excl_new), key(excl_old))
+
+kable(excl_new %>% arrange(kind, dataset, variable),
+      caption = "差し替え版で判定し直した Phase 3 除外集合") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat(sprintf("投稿版の除外集合と %s\n", ifelse(same, "**一致する（変わらない）**", "**食い違う**")))
+if (!same) {
+  cat("  投稿版のみ: ", paste(setdiff(key(excl_old), key(excl_new)), collapse = ", "), "\n")
+  cat("  差し替え版のみ: ", paste(setdiff(key(excl_new), key(excl_old)), collapse = ", "), "\n")
+}
+stopifnot(same)
+```
+
+```{r artifact-list}
+RF_ARTIFACTS <- c(
+  "tab1_baseline", "tab2_lsr", "tab3_cindex_test", "tab4_threshold", "tab5_transition_zone",
+  "tabS1_full_kpi", "tabS2_sim_params", "tabS3_fpr_summary",
+  "fig1_lsr", "fig2_cindex_test", "fig3_hr_distribution", "fig4_hr_bias",
+  "figS1_lsr_per_variable", "figS2_overfit_gap", "figS3_fpr", "figS4_fpr_by_variable")
+exts <- function(nm) if (startsWith(nm, "tab")) c("csv", "tex", "xlsx") else c("png", "svg", "pdf")
+files <- unlist(lapply(RF_ARTIFACTS, function(nm) file.path(out_dir, paste0(nm, "_reffix.", exts(nm)))))
+info <- file.info(files)
+kable(data.frame(file = basename(files), exists = file.exists(files),
+                 size = ifelse(is.na(info$size), NA, info$size)),
+      caption = sprintf("差し替え版の成果物（%d ファイル）", length(files))) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+stopifnot(length(files) == 48, all(file.exists(files)))
+cat("差し替え版 48 ファイルをすべて生成した ✅\n")
+
+paper_files <- unlist(lapply(RF_ARTIFACTS, function(nm) file.path(out_dir, paste0(nm, ".", exts(nm)))))
+if (!any(file.exists(paper_files))) {
+  cat("The original-submission artifacts are not present in this copy; this check is skipped.\n")
+} else {
+stopifnot(all(file.exists(paper_files)))
+cat(sprintf("投稿版 %d ファイルは存在し、本書は 1 つも上書きしていない（保存名はすべて `_reffix` 付き）\n",
+            length(paper_files)))
+}
+```
+

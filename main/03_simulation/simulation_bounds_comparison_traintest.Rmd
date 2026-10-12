@@ -1,0 +1,441 @@
+---
+title: "実験 C: クリッピング境界 3 方式比較（train/test 分割版）"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.width = 10, fig.height = 6, fig.path = "figures_traintest/"
+)
+
+B_SMOKE        <- 10L
+B_PRODUCTION   <- 1000L
+RUN_PRODUCTION <- TRUE
+
+PROJ <- "/home/rstudio/project"
+```
+
+```{r load-packages}
+library(survival)
+library(tidyverse)
+library(arrow)
+library(furrr)
+library(progressr)
+library(knitr)
+cat("[expC-tt] Packages loaded.\n")
+```
+
+```{r source-functions}
+source(file.path(PROJ, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJ, "main/02_dp_mechanisms/R/dp_bounds_comparison.R"))
+source(file.path(PROJ, "main/03_simulation/R/dp_fast.R"))
+source(file.path(PROJ, "main/03_simulation/R/simulation_engine.R"))
+source(file.path(PROJ, "main/03_simulation/R/data_split.R"))
+source(file.path(PROJ, "main/03_simulation/R/simulation_engine_traintest.R"))
+cat("[expC-tt] Functions sourced. epsilon grid =", length(EPSILON_VALUES), "values\n")
+cat("[expC-tt] SPLIT_BASE_SEED =", SPLIT_BASE_SEED, "/ TEST_RATIO = 0.3\n")
+```
+
+```{r load-data}
+DATASETS <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+data_list <- setNames(lapply(DATASETS, function(ds)
+  as.data.frame(read_csv(file.path(PROJ, sprintf("data/01_prepared/%s_prepared.csv", ds)),
+                         show_col_types = FALSE))), DATASETS)
+kable(tibble(dataset = DATASETS,
+             N = vapply(data_list, nrow, integer(1)),
+             events = vapply(data_list, function(d) sum(d$status), numeric(1))),
+      caption = "入力データ（in-sample 版と同一）")
+
+REF_TT_PARQUET <- file.path(PROJ, "data/03_simulation/reffix_traintest/all_phase1_reffix_traintest.parquet")
+stopifnot(file.exists(REF_TT_PARQUET))
+```
+
+```{r callr-helper}
+run_bounds_tt_isolated <- function(data, dataset_name, arm, eps_values, B, seed) {
+  callr::r(
+    function(data, dataset_name, arm, eps_values, B, seed) {
+      library(survival); library(dplyr); library(furrr); library(progressr)
+
+      source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+      source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_bounds_comparison.R")
+      source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+      source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+      source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+      source("/home/rstudio/project/main/03_simulation/R/simulation_engine_traintest.R")
+
+      n_workers <- min(10, parallel::detectCores() - 1)
+      Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+                 VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+      plan(multisession, workers = n_workers)
+
+      bounds_all <- get(BOUNDS_ARM_BOUNDS[[arm]])
+      bounds <- bounds_all[[dataset_name]]
+      types  <- COVARIATE_TYPES[[dataset_name]]
+      perturb_fn <- function(data, epsilon) {
+        perturb_covariates_phase1_fast(data, bounds, epsilon, types,
+                                       preserve_factor_levels = TRUE)
+      }
+
+      result <- run_simulation_batch_traintest(
+        data = data, perturb_fn = perturb_fn,
+        epsilon_values = eps_values, B = B,
+        base_seed = seed, cox_formula = COX_FORMULAS[[dataset_name]],
+        dataset_name = dataset_name,
+        split_base_seed = SPLIT_BASE_SEED
+      )
+      plan(sequential)
+      result$arm <- arm
+      result
+    },
+    args = list(data = data, dataset_name = dataset_name, arm = arm,
+                eps_values = eps_values, B = B, seed = seed)
+  )
+}
+
+run_arm_tt <- function(arm, B) {
+  map_dfr(DATASETS, function(ds) {
+    seed <- unname(BOUNDS_DATASET_BASE_SEED[ds] + BOUNDS_ARM_SEED_OFFSET[arm])
+    t0 <- Sys.time()
+    res <- run_bounds_tt_isolated(data_list[[ds]], ds, arm, EPSILON_VALUES, B, seed)
+    cat(sprintf("[%s/%s] traintest B=%d done in %.1f s (base_seed=%d)\n", arm, ds, B,
+                as.numeric(difftime(Sys.time(), t0, units = "secs")), seed))
+    res
+  })
+}
+```
+
+```{r check-functions}
+check_convergence_tt <- function(res, label, B_expected = NULL) {
+  by_eps <- res %>%
+    distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+    group_by(arm, dataset, epsilon) %>%
+    summarise(n_sims = n(), n_conv = sum(converged), .groups = "drop") %>%
+    mutate(cfr_pct = 100 * (1 - n_conv / n_sims))
+  conv <- by_eps %>% group_by(arm, dataset) %>%
+    summarise(n_sims = sum(n_sims), n_conv = sum(n_conv), .groups = "drop") %>%
+    mutate(cfr_pct = 100 * (1 - n_conv / n_sims))
+  print(kable(conv, digits = 4, caption = sprintf("%s: 収束率（arm × dataset）", label)))
+  fail_rows <- res %>% filter(!converged)
+  hard_fail <- fail_rows %>% filter(variable == "FAILED")
+
+  conv_ref <- res %>%
+    filter(converged, variable != "FAILED", is.finite(beta)) %>%
+    group_by(arm, dataset, epsilon, variable) %>%
+    summarise(ref_abs_beta = max(abs(beta)), .groups = "drop")
+
+  benign_iter <- fail_rows %>%
+    group_by(arm, dataset, epsilon, iteration) %>%
+    summarise(
+      shape_ok = all(variable != "FAILED") & all(is.finite(beta)) & all(is.finite(se)) &
+                 all(grepl("Loglik converged before variable", error_msg, fixed = TRUE)),
+      warn_idx = suppressWarnings(as.integer(
+        sub(".*variable\\s+([0-9]+).*", "\\1", error_msg[1]))),
+      .groups = "drop") %>%
+    left_join(fail_rows %>%
+                group_by(arm, dataset, epsilon, iteration) %>%
+                mutate(.pos = row_number()) %>%
+                ungroup() %>%
+                select(arm, dataset, epsilon, iteration, .pos, variable, beta),
+              by = c("arm", "dataset", "epsilon", "iteration")) %>%
+    filter(!is.na(warn_idx) & .pos == warn_idx) %>%
+    rename(warn_var = variable, warn_beta = beta) %>%
+    right_join(fail_rows %>% distinct(arm, dataset, epsilon, iteration),
+               by = c("arm", "dataset", "epsilon", "iteration")) %>%
+    left_join(conv_ref, by = c("arm", "dataset", "epsilon", "warn_var" = "variable")) %>%
+    mutate(benign = coalesce(shape_ok, FALSE) &
+                    !is.na(warn_beta) & !is.na(ref_abs_beta) &
+                    abs(warn_beta) <= ref_abs_beta) %>%
+    select(arm, dataset, epsilon, iteration, benign, warn_var, warn_beta, ref_abs_beta)
+  by_eps <- by_eps %>%
+    left_join(benign_iter %>% group_by(arm, dataset, epsilon) %>%
+                summarise(n_benign = sum(benign), .groups = "drop"),
+              by = c("arm", "dataset", "epsilon")) %>%
+    mutate(n_benign = coalesce(n_benign, 0L), n_fail = n_sims - n_conv,
+           n_nonbenign = n_fail - n_benign, cfr_nonbenign_pct = 100 * n_nonbenign / n_sims)
+  if (any(by_eps$n_fail > 0)) {
+    print(kable(by_eps %>% filter(n_fail > 0) %>%
+                  select(arm, dataset, epsilon, n_sims, n_fail, n_benign, n_nonbenign,
+                         cfr_pct, cfr_nonbenign_pct),
+                digits = 4, caption = sprintf("%s: 収束失敗の内訳", label)))
+  }
+  overall_cfr <- 100 * sum(by_eps$n_fail) / sum(by_eps$n_sims)
+  viol <- c(
+    if (nrow(hard_fail) > 0) sprintf("  (a) error 分岐の真の失敗が %d 行ある", nrow(hard_fail)),
+    { b <- by_eps %>% filter(cfr_nonbenign_pct > 1.0)
+      if (nrow(b) > 0) sprintf("  (b) %s / %s / eps=%g: 良性でない失敗 %d/%d (CFR %.2f%%)",
+                               b$arm, b$dataset, b$epsilon, b$n_nonbenign, b$n_sims, b$cfr_nonbenign_pct) },
+    { b <- by_eps %>% filter(cfr_pct > 5.0)
+      if (nrow(b) > 0) sprintf("  (c) %s / %s / eps=%g: 良性を含めても CFR %.2f%% が 5%% を超える",
+                               b$arm, b$dataset, b$epsilon, b$cfr_pct) },
+    if (overall_cfr > 0.1) sprintf("  (d) 全体 CFR %.4f%% が 0.1%% を超える", overall_cfr),
+    {
+      if (!is.null(B_expected)) {
+        b <- by_eps %>% filter(n_sims != B_expected)
+        if (nrow(b) > 0) sprintf("  (e) %s / %s / eps=%g: 反復数 %d（期待 %d）",
+                                 b$arm, b$dataset, b$epsilon, b$n_sims, B_expected)
+      }
+    })
+  if (length(viol) > 0) {
+    stop(sprintf("[%s] 収束の停止条件に触れた:\n%s", label, paste(viol, collapse = "\n")))
+  }
+  if (nrow(benign_iter %>% filter(!benign)) > 0) {
+    print(kable(benign_iter %>% filter(!benign) %>%
+                  select(arm, dataset, epsilon, iteration, warn_var, warn_beta, ref_abs_beta),
+                digits = 8,
+                caption = sprintf("%s: 良性と判定されなかった失敗", label)))
+  }
+  cat(sprintf("[%s 確認 1] 収束 OK（全体 CFR %.4f%% / 真の失敗 0 件 / 良性の警告 %d 件）\n",
+              label, overall_cfr, sum(by_eps$n_benign)))
+  invisible(conv)
+}
+
+check_schema_tt <- function(res, label) {
+  ref_cols <- arrow::open_dataset(REF_TT_PARQUET)$schema$names
+  new_cols <- names(res)
+  cat(sprintf("[%s] 既存 traintest の列: %s\n", label, paste(ref_cols, collapse = ", ")))
+  cat(sprintf("[%s] 新アームの列        : %s\n", label, paste(new_cols, collapse = ", ")))
+  stopifnot(identical(setdiff(new_cols, ref_cols), "arm"))
+  stopifnot(length(setdiff(ref_cols, new_cols)) == 0)
+  cat(sprintf("[%s 確認 2] スキーマ一致 OK（既存の全列 + arm 列のみ追加）\n", label))
+  invisible(TRUE)
+}
+
+clip_diff_datasets <- function(arm) {
+  bounds_all <- get(BOUNDS_ARM_BOUNDS[[arm]])
+  out <- character(0)
+  for (ds in DATASETS) {
+    d <- data_list[[ds]]
+    ty <- COVARIATE_TYPES[[ds]]
+    differs <- FALSE
+    for (v in names(ty)) {
+      if (ty[[v]] != "continuous") next
+      bd <- CLIPPING_BOUNDS[[ds]][[v]]
+      ba <- bounds_all[[ds]][[v]]
+      if (!identical(pmin(pmax(d[[v]], bd[1]), bd[2]),
+                     pmin(pmax(d[[v]], ba[1]), ba[2]))) { differs <- TRUE; break }
+    }
+    if (differs) out <- c(out, ds)
+  }
+  out
+}
+
+check_inf_identity_tt <- function(res, label, out_csv) {
+  dd_inf <- read_parquet(REF_TT_PARQUET) %>%
+    filter(is.infinite(epsilon), converged, variable != "FAILED") %>%
+    distinct(dataset, iteration, .keep_all = TRUE) %>%
+    select(dataset, iteration, dd_train = c_index, dd_test = c_index_test)
+
+  arm_inf <- res %>%
+    filter(is.infinite(epsilon), converged, variable != "FAILED") %>%
+    distinct(arm, dataset, iteration, .keep_all = TRUE) %>%
+    select(arm, dataset, iteration, arm_train = c_index, arm_test = c_index_test)
+
+  paired <- arm_inf %>% inner_join(dd_inf, by = c("dataset", "iteration"))
+  stopifnot(nrow(paired) == nrow(arm_inf))
+
+  n_inf_all <- res %>% filter(is.infinite(epsilon)) %>%
+    group_by(arm, dataset) %>% summarise(n_all = n_distinct(iteration), .groups = "drop")
+  n_inf_bad <- res %>% filter(is.infinite(epsilon), !converged) %>%
+    group_by(arm, dataset) %>% summarise(n_bad = n_distinct(iteration), .groups = "drop")
+  drop_chk <- paired %>% count(arm, dataset, name = "n_pairs") %>%
+    left_join(n_inf_all, by = c("arm", "dataset")) %>%
+    left_join(n_inf_bad, by = c("arm", "dataset")) %>%
+    mutate(n_bad = coalesce(n_bad, 0L), n_dropped = n_all - n_pairs)
+  if (any(drop_chk$n_dropped > 0)) {
+    print(kable(drop_chk %>% filter(n_dropped > 0), digits = 0,
+                caption = sprintf("%s: ε=∞ の照合から外れた反復（n_dropped は非収束反復数と一致すること）",
+                                  label)))
+  }
+  if (!all(drop_chk$n_dropped == drop_chk$n_bad)) {
+    b <- drop_chk %>% filter(n_dropped != n_bad)
+    stop(sprintf("[%s] ε=∞ の照合から説明できない反復の欠落がある:\n%s", label,
+                 paste(sprintf("  %s / %s: 欠落 %d / 非収束 %d（全 %d）",
+                               b$arm, b$dataset, b$n_dropped, b$n_bad, b$n_all), collapse = "\n")))
+  }
+
+  inf_tbl <- paired %>%
+    group_by(arm, dataset) %>%
+    summarise(n_pairs = n(),
+              max_abs_diff_train = max(abs(arm_train - dd_train)),
+              max_abs_diff_test  = max(abs(arm_test  - dd_test)),
+              .groups = "drop") %>%
+    mutate(identical = (max_abs_diff_train == 0) & (max_abs_diff_test == 0)) %>%
+    pivot_wider(names_from = arm,
+                values_from = c(n_pairs, max_abs_diff_train, max_abs_diff_test, identical))
+  print(kable(inf_tbl, digits = 12,
+              caption = sprintf("%s: ε=∞ での data-driven との反復単位の差（アーム間の一致検査）", label)))
+  write_csv(inf_tbl, out_csv)
+
+  may_fixed   <- clip_diff_datasets("fixed")
+  may_widened <- clip_diff_datasets("widened")
+  got_fixed   <- inf_tbl$dataset[!inf_tbl$identical_fixed]
+  got_widened <- inf_tbl$dataset[!inf_tbl$identical_widened]
+  cat(sprintf("[%s] クリップ結果が data-driven と違うデータセット: fixed = {%s} / widened = {%s}\n",
+              label, paste(may_fixed, collapse = ", "), paste(may_widened, collapse = ", ")))
+  cat(sprintf("[%s] 実際に C-index が動いたデータセット:         fixed = {%s} / widened = {%s}\n",
+              label, paste(got_fixed, collapse = ", "), paste(got_widened, collapse = ", ")))
+  unexplained <- c(setdiff(got_fixed, may_fixed), setdiff(got_widened, may_widened))
+  if (length(unexplained) > 0) {
+    stop(sprintf("[%s] クリップで説明できない差がある: %s", label,
+                 paste(unique(unexplained), collapse = ", ")))
+  }
+  cat(sprintf("[%s 確認 3b] ε=∞ の差はすべてクリップの違いで説明できる\n", label))
+  invisible(inf_tbl)
+}
+
+check_inf_refit_tt <- function(res, label) {
+  out <- map_dfr(names(BOUNDS_ARM_BOUNDS), function(arm) {
+    bounds_all <- get(BOUNDS_ARM_BOUNDS[[arm]])
+    map_dfr(DATASETS, function(ds) {
+      it  <- min(res$iteration[res$arm == arm & res$dataset == ds & is.infinite(res$epsilon)])
+      sp  <- stratified_train_test_split(data_list[[ds]], test_ratio = 0.3,
+                                         seed = SPLIT_BASE_SEED + it)
+      tr  <- set_reference_levels(sp$train, ds)
+      pd  <- perturb_covariates_phase1_fast(tr, bounds_all[[ds]], Inf, COVARIATE_TYPES[[ds]],
+                                            preserve_factor_levels = TRUE)
+      fit <- coxph(COX_FORMULAS[[ds]], data = pd)
+      ref <- tibble(variable = names(coef(fit)), beta_ref = unname(coef(fit)))
+      got <- res %>% filter(arm == !!arm, dataset == ds, is.infinite(epsilon),
+                            iteration == it) %>% select(variable, beta)
+      j <- inner_join(ref, got, by = "variable")
+      tibble(arm = arm, dataset = ds, iteration = it,
+             n_ref = nrow(ref), n_got = nrow(got), n_joined = nrow(j),
+             max_abs_diff_beta = if (nrow(j)) max(abs(j$beta - j$beta_ref)) else NA_real_)
+    })
+  })
+  print(kable(out, digits = 16,
+              caption = sprintf("%s: ε=∞ の成果物を各アームの箱から再計算して突合", label)))
+  stopifnot(all(out$n_ref == out$n_joined), all(out$n_got == out$n_joined))
+  bad <- out %>% filter(max_abs_diff_beta != 0)
+  if (nrow(bad) > 0) {
+    stop(sprintf("[%s] ε=∞ の成果物が宣言した箱から再現できない:\n%s", label,
+                 paste(sprintf("  %s / %s: |Δβ| = %g", bad$arm, bad$dataset,
+                               bad$max_abs_diff_beta), collapse = "\n")))
+  }
+  cat(sprintf("[%s 確認 3c] ε=∞ の成果物は各アームの箱からビット単位で再現できる\n", label))
+  invisible(out)
+}
+
+check_arm_results_tt <- function(res, label, out_csv, B_expected = NULL) {
+  check_convergence_tt(res, label, B_expected = B_expected)
+  check_schema_tt(res, label)
+  check_inf_identity_tt(res, label, out_csv)
+  check_inf_refit_tt(res, label)
+  cat(sprintf("\n=== [%s] 4 検査すべて合格 ===\n", label))
+  invisible(TRUE)
+}
+```
+
+```{r write-target-check}
+OUT_SUFFIX <- "traintest"
+write_dirs <- vapply(BOUNDS_ARM_OUTPUT_DIR, function(d)
+  file.path(PROJ, "data/03_simulation", d), character(1))
+protected <- file.path(PROJ, "data/03_simulation",
+                       c("phase1_covariates", "phase2_full_input", "phase3_discrete",
+                         "output_perturbation", "traintest", "reffix", "reffix_traintest"))
+stopifnot(length(intersect(write_dirs, protected)) == 0)
+cat("書き込み先:\n"); cat(paste0("  ", write_dirs, "\n"))
+cat("保護対象と交わらない ✅\n")
+cat(sprintf("ファイル名: {dataset}_phase1_{arm}_%s.{csv,parquet} / all_phase1_{arm}_%s.{csv,parquet}\n",
+            OUT_SUFFIX, OUT_SUFFIX))
+```
+
+```{r smoke-run, results='hide'}
+t_s0 <- Sys.time()
+smoke_fixed   <- run_arm_tt("fixed",   B_SMOKE)
+t_s1 <- Sys.time()
+smoke_widened <- run_arm_tt("widened", B_SMOKE)
+t_s2 <- Sys.time()
+smoke_results <- bind_rows(smoke_fixed, smoke_widened)
+smoke_secs_fixed   <- as.numeric(difftime(t_s1, t_s0, units = "secs"))
+smoke_secs_widened <- as.numeric(difftime(t_s2, t_s1, units = "secs"))
+```
+
+```{r smoke-report}
+cat(sprintf("fixed   (5 datasets x %d eps x B=%d): %.1f 秒\n",
+            length(EPSILON_VALUES), B_SMOKE, smoke_secs_fixed))
+cat(sprintf("widened (5 datasets x %d eps x B=%d): %.1f 秒\n",
+            length(EPSILON_VALUES), B_SMOKE, smoke_secs_widened))
+check_arm_results_tt(
+  smoke_results,
+  label   = sprintf("B=%d スモーク(traintest)", B_SMOKE),
+  out_csv = file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/inf_identity_traintest_smoke.csv"),
+  B_expected = B_SMOKE
+)
+```
+
+```{r smoke-cindex}
+cidx <- smoke_results %>%
+  filter(converged, variable != "FAILED") %>%
+  distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(mean_c_test = mean(c_index_test, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = arm, values_from = mean_c_test)
+kable(cidx, digits = 4,
+      caption = sprintf("B=%d スモーク: ε 別平均テスト C-index（参考値。B が小さいため推定精度は低い）",
+                        B_SMOKE))
+```
+
+```{r production-run, eval=RUN_PRODUCTION}
+t_p0 <- Sys.time()
+prod_fixed   <- run_arm_tt("fixed",   B_PRODUCTION)
+prod_widened <- run_arm_tt("widened", B_PRODUCTION)
+prod_results <- bind_rows(prod_fixed, prod_widened)
+cat(sprintf("production(traintest) done in %.1f min\n",
+            as.numeric(difftime(Sys.time(), t_p0, units = "mins"))))
+
+saveRDS(prod_results,
+        file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/.prod_tt_raw.rds"))
+cat("[退避] .prod_tt_raw.rds に生の結果を書き出した\n")
+
+check_arm_results_tt(
+  prod_results,
+  label   = sprintf("B=%d 本番(traintest)", B_PRODUCTION),
+  out_csv = file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/inf_identity_traintest_production.csv"),
+  B_expected = B_PRODUCTION
+)
+
+unlink(file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/.prod_tt_raw.rds"))
+cat("[退避] 4 検査に合格したため .prod_tt_raw.rds を削除した\n")
+
+for (a in c("fixed", "widened")) {
+  outdir <- file.path(PROJ, "data/03_simulation", BOUNDS_ARM_OUTPUT_DIR[[a]])
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  dat <- prod_results %>% filter(arm == a)
+  for (ds in DATASETS) {
+    sub <- dat %>% filter(dataset == ds)
+    write_csv(sub, file.path(outdir, sprintf("%s_phase1_%s_traintest.csv", ds, a)))
+    write_parquet(sub, file.path(outdir, sprintf("%s_phase1_%s_traintest.parquet", ds, a)))
+  }
+  write_csv(dat, file.path(outdir, sprintf("all_phase1_%s_traintest.csv", a)))
+  write_parquet(dat, file.path(outdir, sprintf("all_phase1_%s_traintest.parquet", a)))
+  cat("saved:", outdir, "\n")
+}
+```
+
+```{r production-summary, eval=RUN_PRODUCTION}
+summ <- prod_results %>%
+  filter(converged, variable != "FAILED") %>%
+  distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(c_train = mean(c_index), c_test = mean(c_index_test),
+            gap = mean(c_index - c_index_test), .groups = "drop")
+kable(summ %>% filter(epsilon %in% c(1, 10, 30, 100, Inf)) %>%
+        arrange(dataset, epsilon, arm), digits = 4,
+      caption = "本番: 代表的な ε でのテスト C-index と過適合ギャップ")
+```
+
+```{r session-info}
+sessionInfo()
+```
+

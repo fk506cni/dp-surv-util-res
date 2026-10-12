@@ -1,0 +1,1146 @@
+---
+title: "実験 A: 有意水準 α に対する LSR / FPR の感度分析"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 12,
+  fig.height = 5
+)
+set.seed(42)
+```
+
+```{r libraries}
+library(tidyverse)
+library(arrow)
+library(knitr)
+library(kableExtra)
+```
+
+```{r paths}
+project_dir <- "/home/rstudio/project"
+sim_dir     <- file.path(project_dir, "data/03_simulation")
+eval_dir    <- file.path(project_dir, "data/04_evaluation")
+prep_dir    <- file.path(project_dir, "data/01_prepared")
+
+ARM <- "reffix"
+stopifnot(ARM %in% c("submitted", "reffix"))
+
+ARM_SUFFIX <- if (ARM == "reffix") "_reffix" else ""
+
+SIM_FILES <- if (ARM == "reffix") {
+  c("Phase 1" = "reffix/all_phase1_reffix.parquet",
+    "Phase 2" = "reffix/all_phase2_reffix.parquet",
+    "Phase 3" = "reffix/all_phase3_reffix.parquet")
+} else {
+  c("Phase 1" = "phase1_covariates/all_phase1_results.parquet",
+    "Phase 2" = "phase2_full_input/all_phase2_results.parquet",
+    "Phase 3" = "phase3_discrete/all_phase3_results.parquet")
+}
+
+BASELINE_FILE <- if (ARM == "reffix") "baseline_cox_reffix.csv" else "baseline_cox_results.csv"
+
+KPI_FILE <- paste0("kpi_summary", ARM_SUFFIX, ".csv")
+LSR_FILE <- paste0("lsr_detail",  ARM_SUFFIX, ".csv")
+FPR_FILE <- paste0("fpr_detail",  ARM_SUFFIX, ".csv")
+TAB4_FILE <- paste0("tab4_threshold", ARM_SUFFIX, ".csv")
+
+cat("アーム:", ARM, " / 出力接尾辞:", if (ARM_SUFFIX == "") "(なし)" else ARM_SUFFIX, "\n")
+
+ALPHAS        <- c(0.01, 0.05, 0.10)
+ALPHA_REF     <- 0.05
+DATASET_ORDER <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+INPUT_PHASES  <- c("Phase 1", "Phase 2", "Phase 3")
+
+PEAK_EPS_RANGE  <- c(10, 100)
+PEAK_ALPHA_MULT <- 2
+```
+
+```{r load-simulation}
+sim_raw <- imap_dfr(SIM_FILES, function(rel, ph) {
+  read_parquet(file.path(sim_dir, rel)) %>% mutate(phase = ph)
+}) %>%
+  select(dataset, variable, epsilon, iteration, p_value, converged, phase)
+
+cat("読み込み行数:", nrow(sim_raw), "\n")
+sim_raw %>% count(phase) %>% kable() %>% kable_styling(full_width = FALSE)
+
+EPSILON_GRID <- sort(unique(sim_raw$epsilon))
+cat("ε グリッド:", paste(ifelse(is.infinite(EPSILON_GRID), "Inf", EPSILON_GRID),
+                         collapse = ", "), "\n")
+stopifnot(length(EPSILON_GRID) == 15L)
+```
+
+```{r load-baseline}
+baseline <- read.csv(file.path(prep_dir, BASELINE_FILE),
+                     stringsAsFactors = FALSE) %>%
+  select(dataset, variable, p_cox = p_value)
+
+cat("ベースライン Cox 係数:", nrow(baseline), "行\n")
+```
+
+```{r glm-baseline}
+glm_inf <- sim_raw %>%
+  filter(phase == "Phase 3", is.infinite(epsilon))
+
+glm_check <- glm_inf %>%
+  group_by(dataset, variable) %>%
+  summarise(n_iter = n(), n_uniq = n_distinct(round(p_value, 12)), .groups = "drop")
+
+stopifnot(nrow(glm_check) > 0, all(glm_check$n_uniq == 1L), all(glm_check$n_iter == 1000L))
+cat("ε=∞ の Phase 3 は決定的:", nrow(glm_check), "係数すべてで p 値が一意 ✅\n")
+
+glm_baseline <- glm_inf %>%
+  group_by(dataset, variable) %>%
+  summarise(p_glm = unique(p_value), .groups = "drop")
+```
+
+```{r name-alignment}
+sim_names <- sim_raw %>% distinct(dataset, variable)
+
+only_baseline <- anti_join(baseline, sim_names, by = c("dataset", "variable"))
+only_sim      <- anti_join(sim_names, baseline %>% select(dataset, variable),
+                           by = c("dataset", "variable"))
+
+bind_rows(
+  only_baseline %>% mutate(side = "baseline のみ") %>% select(side, dataset, variable, p_cox),
+  only_sim %>% mutate(side = "simulation のみ", p_cox = NA_real_) %>%
+    select(side, dataset, variable, p_cox)
+) %>%
+  kable(caption = "係数名が一致しない行（参照レベルの違いによる）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+EXPECTED_ONLY_BASELINE <- if (ARM == "reffix") {
+  character(0)
+} else {
+  c("pbc sexf", "colon rxLev")
+}
+
+stopifnot(
+  nrow(only_baseline) == length(EXPECTED_ONLY_BASELINE),
+  setequal(paste(only_baseline$dataset, only_baseline$variable), EXPECTED_ONLY_BASELINE),
+  all(only_baseline$p_cox > max(ALPHAS))
+)
+if (length(EXPECTED_ONLY_BASELINE) == 0L) {
+  cat("アーム", ARM, ": ベースラインのみに現れる係数は 0 件 ✅（参照水準の食い違いが解消）\n")
+} else {
+  cat("不一致", nrow(only_baseline), "係数はいずれも p >", max(ALPHAS), "→ 全 α で非有意側 ✅\n")
+}
+
+EXPECTED_ONLY_SIM <- if (ARM == "reffix") {
+  character(0)
+} else {
+  c("pbc sexm", "colon rxObs")
+}
+stopifnot(
+  nrow(only_sim) == length(EXPECTED_ONLY_SIM),
+  setequal(paste(only_sim$dataset, only_sim$variable), EXPECTED_ONLY_SIM)
+)
+
+baseline_used <- baseline %>% semi_join(sim_names, by = c("dataset", "variable"))
+cat("分母の母集団（照合可能なベースライン係数）:", nrow(baseline_used), "行\n")
+```
+
+```{r exclusion-sets}
+discord <- inner_join(baseline, glm_baseline, by = c("dataset", "variable"))
+cat("Cox / GLM の両方で p 値が得られる係数:", nrow(discord), "行\n")
+
+exclusions <- map_dfr(ALPHAS, function(a) {
+  bind_rows(
+    discord %>% filter(p_cox <  a, p_glm >= a) %>% mutate(kind = "LSR_EXCLUDE"),
+    discord %>% filter(p_cox >= a, p_glm <  a) %>% mutate(kind = "FPR_EXCLUDE")
+  ) %>%
+    mutate(alpha = a) %>%
+    select(alpha, kind, dataset, variable, p_cox, p_glm)
+})
+
+exclusions %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(alpha, kind, dataset) %>%
+  kable(caption = "α ごとに再判定した Phase 3 の除外集合（Cox と離散時間 GLM で有意性が食い違う係数）",
+        digits = 5) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  pack_rows(index = table(paste0("α = ", format(exclusions$alpha, nsmall = 2))))
+
+ex05_lsr <- exclusions %>% filter(alpha == ALPHA_REF, kind == "LSR_EXCLUDE")
+ex05_fpr <- exclusions %>% filter(alpha == ALPHA_REF, kind == "FPR_EXCLUDE")
+
+if (ARM == "reffix") {
+  ex_ref <- read.csv(file.path(eval_dir, "phase3_exclusions_reffix.csv"),
+                     stringsAsFactors = FALSE)
+  ref_lsr <- ex_ref %>% filter(kind == "lsr")
+  ref_fpr <- ex_ref %>% filter(kind == "fpr")
+  stopifnot(
+    nrow(ex_ref) == 3L,
+    nrow(ref_lsr) == 2L, nrow(ref_fpr) == 1L,
+    nrow(ex05_lsr) == nrow(ref_lsr),
+    nrow(ex05_fpr) == nrow(ref_fpr),
+    setequal(paste(ex05_lsr$dataset, ex05_lsr$variable),
+             paste(ref_lsr$dataset, ref_lsr$variable)),
+    setequal(paste(ex05_fpr$dataset, ex05_fpr$variable),
+             paste(ref_fpr$dataset, ref_fpr$variable))
+  )
+  cat("α=0.05 の除外集合は phase3_exclusions_reffix.csv と一致 ✅\n")
+} else {
+  stopifnot(
+    nrow(ex05_lsr) == 2L,
+    setequal(paste(ex05_lsr$dataset, ex05_lsr$variable), c("lung ph.karno", "flchain sample.yr")),
+    nrow(ex05_fpr) == 1L,
+    ex05_fpr$dataset == "flchain", ex05_fpr$variable == "kappa"
+  )
+  cat("α=0.05 の除外集合は evaluation.Rmd のハードコード値と一致 ✅\n")
+}
+```
+
+```{r denominators}
+classify <- map_dfr(ALPHAS, function(a) {
+  sig  <- baseline_used %>% filter(p_cox <  a) %>% select(dataset, variable)
+  nsig <- baseline_used %>% filter(p_cox >= a) %>% select(dataset, variable)
+  lex  <- exclusions %>% filter(alpha == a, kind == "LSR_EXCLUDE") %>% select(dataset, variable)
+  fex  <- exclusions %>% filter(alpha == a, kind == "FPR_EXCLUDE") %>% select(dataset, variable)
+
+  expand_grid(dataset = DATASET_ORDER, phase = INPUT_PHASES) %>%
+    mutate(
+      alpha = a,
+      n_sig_coef    = map2_int(dataset, phase, function(ds, ph) {
+        s <- sig %>% filter(dataset == ds)
+        if (ph == "Phase 3") s <- s %>% anti_join(lex, by = c("dataset", "variable"))
+        nrow(s)
+      }),
+      n_nonsig_coef = map2_int(dataset, phase, function(ds, ph) {
+        s <- nsig %>% filter(dataset == ds)
+        if (ph == "Phase 3") s <- s %>% anti_join(fex, by = c("dataset", "variable"))
+        nrow(s)
+      })
+    ) %>%
+    select(alpha, dataset, phase, n_sig_coef, n_nonsig_coef)
+})
+
+classify %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(alpha, dataset, phase) %>%
+  pivot_wider(names_from = alpha, values_from = c(n_sig_coef, n_nonsig_coef)) %>%
+  kable(caption = paste("α 別の分母サイズ。n_sig = LSR の分母（ベースライン有意な Cox 係数の数）、",
+                        "n_nonsig = FPR の分母（ベースライン非有意な Cox 係数の数）。",
+                        "Phase 3 は Cox/GLM 乖離係数を除外した後の値。")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+empty_denom <- classify %>% filter(n_sig_coef == 0 | n_nonsig_coef == 0)
+cat("分母が 0 になる dataset × phase × α の組:", nrow(empty_denom), "件\n")
+if (nrow(empty_denom) > 0) {
+  empty_denom %>% kable(caption = "分母が空の組（該当指標は NA とする）") %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% print()
+}
+
+small_denom <- classify %>%
+  filter(n_sig_coef <= 3 | n_nonsig_coef <= 3) %>%
+  mutate(
+    lsr_step = ifelse(n_sig_coef > 0, 1 / n_sig_coef, NA_real_),
+    fpr_step = ifelse(n_nonsig_coef > 0, 1 / n_nonsig_coef, NA_real_)
+  )
+small_denom %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(alpha, dataset, phase) %>%
+  kable(caption = "分母が 3 以下の組。平均 LSR / FPR の刻み幅（1/分母）を併記する。",
+        digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r expected-counts}
+EXPECTED_DENOM_SUBMITTED <- tibble::tribble(
+  ~alpha, ~dataset,    ~phase,    ~n_sig_coef, ~n_nonsig_coef,
+  0.01,   "lung",      "Phase 1",  2L,  5L,
+  0.01,   "lung",      "Phase 2",  2L,  5L,
+  0.01,   "lung",      "Phase 3",  2L,  5L,
+  0.01,   "pbc",       "Phase 1",  5L, 11L,
+  0.01,   "pbc",       "Phase 2",  5L, 11L,
+  0.01,   "pbc",       "Phase 3",  4L, 11L,
+  0.01,   "colon",     "Phase 1",  3L,  8L,
+  0.01,   "colon",     "Phase 2",  3L,  8L,
+  0.01,   "colon",     "Phase 3",  3L,  7L,
+  0.01,   "rotterdam", "Phase 1",  5L,  5L,
+  0.01,   "rotterdam", "Phase 2",  5L,  5L,
+  0.01,   "rotterdam", "Phase 3",  5L,  5L,
+  0.01,   "flchain",   "Phase 1",  4L,  3L,
+  0.01,   "flchain",   "Phase 2",  4L,  3L,
+  0.01,   "flchain",   "Phase 3",  3L,  3L,
+  0.05,   "lung",      "Phase 1",  3L,  4L,
+  0.05,   "lung",      "Phase 2",  3L,  4L,
+  0.05,   "lung",      "Phase 3",  2L,  4L,
+  0.05,   "pbc",       "Phase 1",  8L,  8L,
+  0.05,   "pbc",       "Phase 2",  8L,  8L,
+  0.05,   "pbc",       "Phase 3",  8L,  8L,
+  0.05,   "colon",     "Phase 1",  5L,  6L,
+  0.05,   "colon",     "Phase 2",  5L,  6L,
+  0.05,   "colon",     "Phase 3",  5L,  6L,
+  0.05,   "rotterdam", "Phase 1",  6L,  4L,
+  0.05,   "rotterdam", "Phase 2",  6L,  4L,
+  0.05,   "rotterdam", "Phase 3",  6L,  4L,
+  0.05,   "flchain",   "Phase 1",  4L,  3L,
+  0.05,   "flchain",   "Phase 2",  4L,  3L,
+  0.05,   "flchain",   "Phase 3",  3L,  2L,
+  0.10,   "lung",      "Phase 1",  4L,  3L,
+  0.10,   "lung",      "Phase 2",  4L,  3L,
+  0.10,   "lung",      "Phase 3",  3L,  3L,
+  0.10,   "pbc",       "Phase 1",  8L,  8L,
+  0.10,   "pbc",       "Phase 2",  8L,  8L,
+  0.10,   "pbc",       "Phase 3",  8L,  8L,
+  0.10,   "colon",     "Phase 1",  7L,  4L,
+  0.10,   "colon",     "Phase 2",  7L,  4L,
+  0.10,   "colon",     "Phase 3",  7L,  4L,
+  0.10,   "rotterdam", "Phase 1",  6L,  4L,
+  0.10,   "rotterdam", "Phase 2",  6L,  4L,
+  0.10,   "rotterdam", "Phase 3",  6L,  2L,
+  0.10,   "flchain",   "Phase 1",  5L,  2L,
+  0.10,   "flchain",   "Phase 2",  5L,  2L,
+  0.10,   "flchain",   "Phase 3",  5L,  2L
+)
+
+EXPECTED_DENOM_REFFIX <- tibble::tribble(
+  ~alpha, ~dataset,    ~phase,    ~n_sig_coef, ~n_nonsig_coef,
+  0.01,   "lung",      "Phase 1",  2L,  5L,
+  0.01,   "lung",      "Phase 2",  2L,  5L,
+  0.01,   "lung",      "Phase 3",  2L,  5L,
+  0.01,   "pbc",       "Phase 1",  5L, 12L,
+  0.01,   "pbc",       "Phase 2",  5L, 12L,
+  0.01,   "pbc",       "Phase 3",  4L, 12L,
+  0.01,   "colon",     "Phase 1",  3L,  9L,
+  0.01,   "colon",     "Phase 2",  3L,  9L,
+  0.01,   "colon",     "Phase 3",  3L,  8L,
+  0.01,   "rotterdam", "Phase 1",  5L,  5L,
+  0.01,   "rotterdam", "Phase 2",  5L,  5L,
+  0.01,   "rotterdam", "Phase 3",  5L,  5L,
+  0.01,   "flchain",   "Phase 1",  4L,  3L,
+  0.01,   "flchain",   "Phase 2",  4L,  3L,
+  0.01,   "flchain",   "Phase 3",  3L,  3L,
+  0.05,   "lung",      "Phase 1",  3L,  4L,
+  0.05,   "lung",      "Phase 2",  3L,  4L,
+  0.05,   "lung",      "Phase 3",  2L,  4L,
+  0.05,   "pbc",       "Phase 1",  8L,  9L,
+  0.05,   "pbc",       "Phase 2",  8L,  9L,
+  0.05,   "pbc",       "Phase 3",  8L,  9L,
+  0.05,   "colon",     "Phase 1",  5L,  7L,
+  0.05,   "colon",     "Phase 2",  5L,  7L,
+  0.05,   "colon",     "Phase 3",  5L,  7L,
+  0.05,   "rotterdam", "Phase 1",  6L,  4L,
+  0.05,   "rotterdam", "Phase 2",  6L,  4L,
+  0.05,   "rotterdam", "Phase 3",  6L,  4L,
+  0.05,   "flchain",   "Phase 1",  4L,  3L,
+  0.05,   "flchain",   "Phase 2",  4L,  3L,
+  0.05,   "flchain",   "Phase 3",  3L,  2L,
+  0.10,   "lung",      "Phase 1",  4L,  3L,
+  0.10,   "lung",      "Phase 2",  4L,  3L,
+  0.10,   "lung",      "Phase 3",  3L,  3L,
+  0.10,   "pbc",       "Phase 1",  8L,  9L,
+  0.10,   "pbc",       "Phase 2",  8L,  9L,
+  0.10,   "pbc",       "Phase 3",  8L,  9L,
+  0.10,   "colon",     "Phase 1",  7L,  5L,
+  0.10,   "colon",     "Phase 2",  7L,  5L,
+  0.10,   "colon",     "Phase 3",  7L,  5L,
+  0.10,   "rotterdam", "Phase 1",  6L,  4L,
+  0.10,   "rotterdam", "Phase 2",  6L,  4L,
+  0.10,   "rotterdam", "Phase 3",  6L,  2L,
+  0.10,   "flchain",   "Phase 1",  5L,  2L,
+  0.10,   "flchain",   "Phase 2",  5L,  2L,
+  0.10,   "flchain",   "Phase 3",  5L,  2L
+)
+
+EXPECTED_DENOM <- if (ARM == "reffix") EXPECTED_DENOM_REFFIX else EXPECTED_DENOM_SUBMITTED
+
+{
+  dd <- dplyr::full_join(
+    EXPECTED_DENOM_SUBMITTED %>% dplyr::rename(sub_sig = n_sig_coef, sub_non = n_nonsig_coef),
+    EXPECTED_DENOM_REFFIX    %>% dplyr::rename(rfx_sig = n_sig_coef, rfx_non = n_nonsig_coef),
+    by = c("alpha", "dataset", "phase")
+  )
+  stopifnot(
+    nrow(dd) == 45L, !anyNA(dd),
+    all(dd$sub_sig == dd$rfx_sig),
+    all(dd$rfx_non - dd$sub_non == ifelse(dd$dataset %in% c("pbc", "colon"), 1L, 0L))
+  )
+}
+
+denom_cmp <- EXPECTED_DENOM %>%
+  rename(exp_sig = n_sig_coef, exp_nonsig = n_nonsig_coef) %>%
+  left_join(classify, by = c("alpha", "dataset", "phase"))
+
+stopifnot(
+  nrow(EXPECTED_DENOM) == length(ALPHAS) * length(DATASET_ORDER) * length(INPUT_PHASES),
+  nrow(denom_cmp) == nrow(EXPECTED_DENOM),
+  !anyNA(denom_cmp$n_sig_coef), !anyNA(denom_cmp$n_nonsig_coef),
+  all(denom_cmp$exp_sig == denom_cmp$n_sig_coef),
+  all(denom_cmp$exp_nonsig == denom_cmp$n_nonsig_coef)
+)
+cat("分母サイズがリテラル定数と一致 ✅（", nrow(denom_cmp), "組）\n")
+
+EXPECTED_ROWS <- EXPECTED_DENOM %>%
+  group_by(alpha) %>%
+  summarise(
+    lsr_rows = sum(n_sig_coef)    * length(EPSILON_GRID),
+    fpr_rows = sum(n_nonsig_coef) * length(EPSILON_GRID),
+    .groups = "drop"
+  )
+
+EXPECTED_ROWS %>%
+  kable(caption = "α 別の期待行数（係数レベル）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r compute-metrics}
+compute_for_alpha <- function(a) {
+  sig  <- baseline_used %>% filter(p_cox <  a) %>% select(dataset, variable)
+  nsig <- baseline_used %>% filter(p_cox >= a) %>% select(dataset, variable)
+  lex  <- exclusions %>% filter(alpha == a, kind == "LSR_EXCLUDE") %>%
+    select(dataset, variable) %>% mutate(phase = "Phase 3")
+  fex  <- exclusions %>% filter(alpha == a, kind == "FPR_EXCLUDE") %>%
+    select(dataset, variable) %>% mutate(phase = "Phase 3")
+
+  conv <- sim_raw %>% filter(converged)
+
+  lsr <- conv %>%
+    inner_join(sig, by = c("dataset", "variable")) %>%
+    anti_join(lex, by = c("dataset", "variable", "phase")) %>%
+    group_by(dataset, phase, epsilon, variable) %>%
+    summarise(n_sims = n(), n_na = sum(is.na(p_value)),
+              n_lost = sum(p_value >= a), lsr = n_lost / n_sims, .groups = "drop") %>%
+    mutate(alpha = a)
+
+  fpr <- conv %>%
+    inner_join(nsig, by = c("dataset", "variable")) %>%
+    anti_join(fex, by = c("dataset", "variable", "phase")) %>%
+    group_by(dataset, phase, epsilon, variable) %>%
+    summarise(n_sims = n(), n_na = sum(is.na(p_value)),
+              n_false_pos = sum(p_value < a), fpr = n_false_pos / n_sims, .groups = "drop") %>%
+    mutate(alpha = a)
+
+  list(lsr = lsr, fpr = fpr)
+}
+
+metrics <- map(ALPHAS, compute_for_alpha)
+lsr_var <- map_dfr(metrics, "lsr")
+fpr_var <- map_dfr(metrics, "fpr")
+
+cat("係数レベル LSR 行数:", nrow(lsr_var), " / FPR 行数:", nrow(fpr_var), "\n")
+```
+
+```{r verify-rows}
+lsr_rows_actual <- lsr_var %>% count(alpha, name = "lsr_rows")
+fpr_rows_actual <- fpr_var %>% count(alpha, name = "fpr_rows")
+
+rows_cmp <- EXPECTED_ROWS %>%
+  rename(exp_lsr = lsr_rows, exp_fpr = fpr_rows) %>%
+  left_join(lsr_rows_actual, by = "alpha") %>%
+  left_join(fpr_rows_actual, by = "alpha")
+
+rows_cmp %>%
+  kable(caption = "期待行数 vs 実際の行数") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(
+  nrow(rows_cmp) == length(ALPHAS),
+  !anyNA(rows_cmp$lsr_rows), !anyNA(rows_cmp$fpr_rows),
+  identical(as.integer(rows_cmp$lsr_rows), as.integer(rows_cmp$exp_lsr)),
+  identical(as.integer(rows_cmp$fpr_rows), as.integer(rows_cmp$exp_fpr))
+)
+
+n_sims_all <- c(lsr_var$n_sims, fpr_var$n_sims)
+cat("n_sims の範囲:", min(n_sims_all), "-", max(n_sims_all),
+    "（1000 未満のセル:", sum(n_sims_all < 1000L), "/", length(n_sims_all), "）\n")
+
+stopifnot(
+  !anyNA(lsr_var$lsr), !anyNA(fpr_var$fpr),
+  sum(lsr_var$n_na) == 0L, sum(fpr_var$n_na) == 0L,
+  min(n_sims_all) >= 990L, max(n_sims_all) == 1000L,
+  all(lsr_var$lsr >= 0 & lsr_var$lsr <= 1),
+  all(fpr_var$fpr >= 0 & fpr_var$fpr <= 1)
+)
+cat("期待行数・NA なし・n_sims ≥ 990・値域 [0,1] をすべて通過 ✅\n")
+```
+
+```{r exact-rounding-helper}
+gcd2 <- function(x, y) { while (y != 0) { t <- y; y <- x %% y; x <- t }; x }
+
+round_exact_mean <- function(a, b, digits = 4L) {
+  stopifnot(length(a) == length(b), length(a) >= 1L,
+            all(b > 0), all(a >= 0), all(a <= b))
+  L <- Reduce(function(x, y) x / gcd2(x, y) * y, unique(b))
+  num <- sum(a * (L / b))
+  den <- L * length(a)
+  sc  <- 10^digits
+  if (2 * num * sc + den >= 2^53) {
+    stop(sprintf(paste("round_exact_mean: 共通分母が倍精度の整数表現を超えた（分母の種類 %d、lcm %.0f）。",
+                       "gmp 等の有理数演算に切り替えること。"),
+                 length(unique(b)), L), call. = FALSE)
+  }
+  floor((2 * num * sc + den) / (2 * den)) / sc
+}
+
+stopifnot(
+  round_exact_mean(c(1L, 0L, 0L, 0L), rep(1000L, 4), 4L) == 0.0003,
+  round_exact_mean(c(9905L), c(10000L), 3L) == 0.991,
+  round_exact_mean(c(1L, 1L), c(999L, 1000L), 4L) == 0.001,
+  round_exact_mean(c(0L, 0L), c(1000L, 999L), 4L) == 0,
+  round_exact_mean(c(1000L, 999L), c(1000L, 999L), 4L) == 1
+)
+cat("順序非依存の丸め関数を検証 ✅（表示桁は DISPLAY_DIGITS =", 4L, "）\n")
+cat("係数レベルの分母 n_sims の種類:",
+    paste(sort(unique(c(fpr_var$n_sims, lsr_var$n_sims))), collapse = ", "), "\n")
+```
+
+```{r aggregate}
+grid_all <- expand_grid(alpha = ALPHAS, dataset = DATASET_ORDER,
+                        phase = INPUT_PHASES, epsilon = EPSILON_GRID)
+
+DISPLAY_DIGITS <- 4L
+
+lsr_avg <- lsr_var %>%
+  group_by(alpha, dataset, phase, epsilon) %>%
+  summarise(mean_lsr = mean(lsr), max_lsr = max(lsr), n_lsr_coef = n(),
+            mean_lsr_r4 = round_exact_mean(n_lost, n_sims, DISPLAY_DIGITS),
+            .groups = "drop")
+
+fpr_avg <- fpr_var %>%
+  group_by(alpha, dataset, phase, epsilon) %>%
+  summarise(mean_fpr = mean(fpr), max_fpr = max(fpr), n_fpr_coef = n(),
+            mean_fpr_r4 = round_exact_mean(n_false_pos, n_sims, DISPLAY_DIGITS),
+            .groups = "drop")
+
+alpha_summary <- grid_all %>%
+  left_join(lsr_avg, by = c("alpha", "dataset", "phase", "epsilon")) %>%
+  left_join(fpr_avg, by = c("alpha", "dataset", "phase", "epsilon")) %>%
+  mutate(
+    n_lsr_coef = replace_na(n_lsr_coef, 0L),
+    n_fpr_coef = replace_na(n_fpr_coef, 0L),
+    dataset = factor(dataset, levels = DATASET_ORDER)
+  ) %>%
+  arrange(alpha, dataset, phase, epsilon)
+
+stopifnot(
+  nrow(alpha_summary) == length(ALPHAS) * length(DATASET_ORDER) *
+                          length(INPUT_PHASES) * length(EPSILON_GRID),
+  !anyNA(alpha_summary$mean_lsr),
+  !anyNA(alpha_summary$mean_fpr),
+  !anyNA(alpha_summary$mean_lsr_r4), !anyNA(alpha_summary$mean_fpr_r4),
+  max(abs(alpha_summary$mean_lsr - alpha_summary$mean_lsr_r4)) <= 0.5 * 10^-DISPLAY_DIGITS + 1e-12,
+  max(abs(alpha_summary$mean_fpr - alpha_summary$mean_fpr_r4)) <= 0.5 * 10^-DISPLAY_DIGITS + 1e-12,
+  max(abs(alpha_summary$mean_lsr_r4 * 10^DISPLAY_DIGITS -
+          round(alpha_summary$mean_lsr_r4 * 10^DISPLAY_DIGITS))) < 1e-6,
+  max(abs(alpha_summary$mean_fpr_r4 * 10^DISPLAY_DIGITS -
+          round(alpha_summary$mean_fpr_r4 * 10^DISPLAY_DIGITS))) < 1e-6
+)
+cat("集計格子", nrow(alpha_summary), "行がすべて充足（NA なし）✅\n")
+
+tie_count <- function(v, digits) sum(abs(v * 10^digits - (floor(v * 10^digits) + 0.5)) < 1e-7)
+cat(sprintf("丸めの同値点: 3 桁で %d セル、4 桁で %d セル（1350 セル中）。",
+            tie_count(c(alpha_summary$mean_fpr, alpha_summary$mean_lsr), 3),
+            tie_count(c(alpha_summary$mean_fpr, alpha_summary$mean_lsr), 4)))
+cat("桁を増やしても同値点は消えないため、丸め手続き自体を確定させている ✅\n")
+
+alpha_summary %>%
+  filter(phase == "Phase 1", epsilon %in% c(1, 10, 30, 100)) %>%
+  select(alpha, dataset, epsilon, mean_fpr, mean_lsr) %>%
+  kable(caption = "Phase 1 の平均 FPR / LSR（代表的 ε）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r crosscheck-alpha05}
+kpi_existing <- read.csv(file.path(eval_dir, KPI_FILE), stringsAsFactors = FALSE) %>%
+  filter(phase %in% INPUT_PHASES) %>%
+  select(dataset, phase, epsilon, old_mean_lsr = mean_lsr, old_mean_fpr = mean_fpr)
+
+mine05 <- alpha_summary %>%
+  filter(alpha == ALPHA_REF) %>%
+  mutate(dataset = as.character(dataset)) %>%
+  select(dataset, phase, epsilon, mean_lsr, mean_fpr)
+
+cmp_kpi <- kpi_existing %>%
+  inner_join(mine05, by = c("dataset", "phase", "epsilon")) %>%
+  mutate(d_lsr = abs(old_mean_lsr - mean_lsr), d_fpr = abs(old_mean_fpr - mean_fpr))
+
+EXPECTED_KPI_ROWS <- length(DATASET_ORDER) * length(INPUT_PHASES) * length(EPSILON_GRID)
+
+stopifnot(
+  nrow(kpi_existing) == EXPECTED_KPI_ROWS,
+  nrow(cmp_kpi) == EXPECTED_KPI_ROWS,
+  !anyNA(cmp_kpi$d_lsr), !anyNA(cmp_kpi$d_fpr),
+  max(cmp_kpi$d_lsr) < 1e-12,
+  max(cmp_kpi$d_fpr) < 1e-12
+)
+cat(KPI_FILE, "との突合:", nrow(cmp_kpi), "行、最大絶対差 LSR =",
+    format(max(cmp_kpi$d_lsr)), " FPR =", format(max(cmp_kpi$d_fpr)), " ✅\n")
+```
+
+```{r crosscheck-detail}
+lsr_existing <- read.csv(file.path(eval_dir, LSR_FILE), stringsAsFactors = FALSE) %>%
+  filter(phase %in% INPUT_PHASES) %>%
+  select(dataset, phase, epsilon, variable, old_lsr = lsr)
+fpr_existing <- read.csv(file.path(eval_dir, FPR_FILE), stringsAsFactors = FALSE) %>%
+  filter(phase %in% INPUT_PHASES) %>%
+  select(dataset, phase, epsilon, variable, old_fpr = fpr)
+
+mine_lsr05 <- lsr_var %>% filter(alpha == ALPHA_REF) %>%
+  select(dataset, phase, epsilon, variable, lsr)
+mine_fpr05 <- fpr_var %>% filter(alpha == ALPHA_REF) %>%
+  select(dataset, phase, epsilon, variable, fpr)
+
+cmp_lsr <- inner_join(lsr_existing, mine_lsr05,
+                      by = c("dataset", "phase", "epsilon", "variable")) %>%
+  mutate(d = abs(old_lsr - lsr))
+cmp_fpr <- inner_join(fpr_existing, mine_fpr05,
+                      by = c("dataset", "phase", "epsilon", "variable")) %>%
+  mutate(d = abs(old_fpr - fpr))
+
+EXP_LSR05 <- EXPECTED_ROWS$lsr_rows[EXPECTED_ROWS$alpha == ALPHA_REF]
+EXP_FPR05 <- EXPECTED_ROWS$fpr_rows[EXPECTED_ROWS$alpha == ALPHA_REF]
+
+stopifnot(
+  nrow(lsr_existing) == EXP_LSR05, nrow(cmp_lsr) == EXP_LSR05,
+  nrow(fpr_existing) == EXP_FPR05, nrow(cmp_fpr) == EXP_FPR05,
+  !anyNA(cmp_lsr$d), !anyNA(cmp_fpr$d),
+  max(cmp_lsr$d) == 0, max(cmp_fpr$d) == 0
+)
+cat("係数レベルの突合: LSR", nrow(cmp_lsr), "行 / FPR", nrow(cmp_fpr),
+    "行がすべて完全一致 ✅\n")
+```
+
+```{r monotonicity}
+mono <- alpha_summary %>%
+  filter(is.finite(epsilon)) %>%
+  arrange(alpha, dataset, phase, epsilon) %>%
+  group_by(alpha, dataset, phase) %>%
+  mutate(increase = mean_lsr - lag(mean_lsr)) %>%
+  ungroup()
+
+mono_summary <- mono %>%
+  filter(!is.na(increase)) %>%
+  group_by(alpha) %>%
+  summarise(
+    n_increase   = sum(increase > 0),
+    max_increase = max(increase),
+    min_lsr_at_increase = ifelse(any(increase > 0), min(mean_lsr[increase > 0]), NA_real_),
+    .groups = "drop"
+  )
+
+mono_summary %>%
+  kable(caption = "ε 昇順で平均 LSR が増加した箇所（α 別）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+crossings <- map_dfr(ALPHAS, function(a) {
+  map_dfr(c(0.50, 0.10), function(th) {
+    base_a <- alpha_summary %>% filter(alpha == a, is.finite(epsilon))
+    first_ok <- base_a %>%
+      group_by(dataset, phase) %>%
+      summarise(first_ok = suppressWarnings(min(epsilon[mean_lsr <= th])), .groups = "drop") %>%
+      filter(is.finite(first_ok))
+    base_a %>%
+      inner_join(first_ok, by = c("dataset", "phase")) %>%
+      filter(epsilon > first_ok, mean_lsr > th) %>%
+      mutate(threshold = th, alpha = a) %>%
+      select(alpha, threshold, dataset, phase, first_ok, epsilon, mean_lsr)
+  })
+})
+
+coverage <- map_dfr(ALPHAS, function(a) {
+  map_dfr(c(0.50, 0.10), function(th) {
+    base_a <- alpha_summary %>% filter(alpha == a, is.finite(epsilon))
+    fo <- base_a %>%
+      group_by(dataset, phase) %>%
+      summarise(first_ok = suppressWarnings(min(epsilon[mean_lsr <= th])), .groups = "drop")
+    tibble(alpha = a, threshold = th,
+           検査対象の群 = sum(is.finite(fo$first_ok)), 全群 = nrow(fo),
+           往復 = sum(crossings$alpha == a & crossings$threshold == th))
+  })
+})
+coverage %>%
+  kable(caption = "閾値ごとの検査対象の群数と往復件数（0 件が「検査していない」ではないことの証跡）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(all(coverage$全群 == length(DATASET_ORDER) * length(INPUT_PHASES)),
+          all(coverage$検査対象の群[coverage$threshold == 0.50] ==
+                length(DATASET_ORDER) * length(INPUT_PHASES)))
+
+cat("閾値を下回った後に再び上回る組:", nrow(crossings), "件",
+    "（閾値 0.50 は 45/45 群、閾値 0.10 は",
+    sum(coverage$検査対象の群[coverage$threshold == 0.10]), "/ 45 群を検査）\n")
+if (nrow(crossings) > 0) {
+  crossings %>%
+    kable(caption = "閾値をまたぐ往復（ε* の「最小 ε」規約が壊れる組）", digits = 4) %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% print()
+}
+
+stopifnot(
+  nrow(mono_summary) == length(ALPHAS),
+  nrow(crossings) == 0L
+)
+cat("3 水準すべてで閾値をまたぐ往復は 0 件 → 「最小 ε」規約は α に依らず妥当 ✅\n")
+```
+
+```{r eps-star}
+min_eps_label <- function(epsilon, value, threshold) {
+  ok <- is.finite(epsilon) & !is.na(value) & value <= threshold
+  if (!any(ok)) return("> 1000")
+  as.character(min(epsilon[ok]))
+}
+
+eps_star <- alpha_summary %>%
+  group_by(alpha, dataset, phase) %>%
+  summarise(
+    eps_lsr50 = min_eps_label(epsilon, mean_lsr, 0.50),
+    eps_lsr10 = min_eps_label(epsilon, mean_lsr, 0.10),
+    .groups = "drop"
+  )
+
+eps_star %>%
+  pivot_wider(names_from = alpha, values_from = c(eps_lsr50, eps_lsr10)) %>%
+  arrange(dataset, phase) %>%
+  kable(caption = "α 別の ε*（LSR ≤ 0.50 / LSR ≤ 0.10 を満たす最小の有限 ε）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+tab4 <- read.csv(file.path(project_dir, "main/06_report/output", TAB4_FILE),
+                 stringsAsFactors = FALSE, check.names = FALSE)
+
+cmp_eps <- tab4 %>%
+  filter(phase %in% INPUT_PHASES) %>%
+  select(dataset, phase, tab4_lsr50 = eps_lsr50, tab4_lsr10 = eps_lsr10) %>%
+  left_join(eps_star %>% filter(alpha == ALPHA_REF) %>%
+              select(dataset, phase, eps_lsr50, eps_lsr10),
+            by = c("dataset", "phase"))
+
+stopifnot(
+  nrow(cmp_eps) == length(DATASET_ORDER) * length(INPUT_PHASES),
+  !anyNA(cmp_eps$eps_lsr50), !anyNA(cmp_eps$eps_lsr10),
+  all(cmp_eps$tab4_lsr50 == cmp_eps$eps_lsr50),
+  all(cmp_eps$tab4_lsr10 == cmp_eps$eps_lsr10)
+)
+cat("α=0.05 の ε* は既存", TAB4_FILE, "と", nrow(cmp_eps), "行すべてで一致 ✅\n")
+```
+
+```{r inf-is-tautological}
+inf_rows <- alpha_summary %>% filter(is.infinite(epsilon))
+stopifnot(nrow(inf_rows) == length(ALPHAS) * length(DATASET_ORDER) * length(INPUT_PHASES),
+          all(inf_rows$mean_fpr == 0), all(inf_rows$mean_lsr == 0))
+cat("ε=∞ の平均 FPR / LSR は", nrow(inf_rows), "条件すべてで厳密に 0（定義上の恒等式）✅\n")
+```
+
+```{r peak-se}
+fpr_se <- map_dfr(ALPHAS, function(a) {
+  fex  <- exclusions %>% filter(alpha == a, kind == "FPR_EXCLUDE") %>%
+    select(dataset, variable) %>% mutate(phase = "Phase 3")
+  nsig <- baseline_used %>% filter(p_cox >= a) %>% select(dataset, variable)
+  sim_raw %>% filter(converged) %>%
+    inner_join(nsig, by = c("dataset", "variable")) %>%
+    anti_join(fex, by = c("dataset", "variable", "phase")) %>%
+    group_by(dataset, phase, epsilon, iteration) %>%
+    summarise(s = mean(p_value < a), .groups = "drop") %>%
+    group_by(dataset, phase, epsilon) %>%
+    summarise(se_fpr = sd(s) / sqrt(n()), .groups = "drop") %>%
+    mutate(alpha = a)
+})
+stopifnot(nrow(fpr_se) == length(ALPHAS) * length(DATASET_ORDER) *
+                          length(INPUT_PHASES) * length(EPSILON_GRID),
+          !anyNA(fpr_se$se_fpr))
+cat("ピーク高さの標準誤差を", nrow(fpr_se), "セルで算出 ✅\n")
+```
+
+```{r peaks}
+eps_finite <- EPSILON_GRID[is.finite(EPSILON_GRID)]
+
+peaks <- alpha_summary %>%
+  filter(is.finite(epsilon)) %>%
+  group_by(alpha, dataset, phase) %>%
+  summarise(
+    peak_fpr   = max(mean_fpr),
+    peak_eps   = min(epsilon[mean_fpr == max(mean_fpr)]),
+    n_tied     = sum(mean_fpr == max(mean_fpr)),
+    fpr_lo_end = mean_fpr[epsilon == min(eps_finite)],
+    fpr_hi_end = mean_fpr[epsilon == max(eps_finite)],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    crit_i   = peak_eps > min(eps_finite) & peak_eps < max(eps_finite) &
+               fpr_lo_end < peak_fpr & fpr_hi_end < peak_fpr,
+    crit_ii  = peak_fpr >= PEAK_ALPHA_MULT * alpha,
+    crit_iii = peak_eps >= PEAK_EPS_RANGE[1] & peak_eps <= PEAK_EPS_RANGE[2],
+    peak_over_alpha = peak_fpr / alpha,
+    all_crit = crit_i & crit_ii & crit_iii
+  ) %>%
+  left_join(fpr_se %>% rename(se_peak = se_fpr),
+            by = c("alpha", "dataset", "phase", "peak_eps" = "epsilon")) %>%
+  left_join(fpr_se %>% filter(epsilon == min(eps_finite)) %>%
+              select(alpha, dataset, phase, se_lo = se_fpr),
+            by = c("alpha", "dataset", "phase")) %>%
+  mutate(
+    z_lo = (peak_fpr - fpr_lo_end) / sqrt(se_peak^2 + se_lo^2),
+    z_2a = (peak_fpr - PEAK_ALPHA_MULT * alpha) / se_peak,
+    z_a  = (peak_fpr - alpha) / se_peak
+  )
+
+stopifnot(!anyNA(peaks$se_peak), !anyNA(peaks$se_lo))
+
+peaks %>%
+  filter(phase == "Phase 1") %>%
+  select(alpha, dataset, peak_eps, peak_fpr, peak_over_alpha,
+         fpr_lo_end, fpr_hi_end, crit_i, crit_ii, crit_iii, all_crit) %>%
+  kable(caption = "Phase 1: FPR ピークと頑健性 3 条件の判定", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+peaks %>%
+  filter(phase != "Phase 1") %>%
+  select(alpha, dataset, phase, peak_eps, peak_fpr, peak_over_alpha,
+         crit_i, crit_ii, crit_iii, all_crit) %>%
+  kable(caption = "Phase 2 / Phase 3: FPR ピークと頑健性 3 条件の判定", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r robustness-verdict}
+verdict <- peaks %>%
+  group_by(dataset, phase) %>%
+  summarise(
+    n_alpha_ok = sum(all_crit),
+    robust     = all(all_crit),
+    peak_eps_set = paste(sort(unique(peak_eps)), collapse = " / "),
+    peak_fpr_range = sprintf("%.3f--%.3f", min(peak_fpr), max(peak_fpr)),
+    .groups = "drop"
+  ) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(dataset, phase)
+
+verdict %>%
+  kable(caption = "「α に依らず頑健」の判定（3 水準すべてで 3 条件を満たすか）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat("Phase 1 で 3 条件を全 α 充足:", sum(verdict$robust[verdict$phase == "Phase 1"]),
+    "/", length(DATASET_ORDER), "データセット\n")
+cat("入力摂動 15 条件のうち充足:", sum(verdict$robust), "/ 15\n")
+
+peaks %>%
+  group_by(phase) %>%
+  summarise(across(c(crit_i, crit_ii, crit_iii, all_crit), ~ sum(.x)),
+            n = n(), .groups = "drop") %>%
+  kable(caption = "条件別の充足数（各 phase について α 3 水準 × 5 データセット = 15 組）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r multiplier-sensitivity}
+map_dfr(c(1, 1.5, 2, 2.5, 3, 4, 5), function(k) {
+  tibble(倍率 = k,
+         `(ii) 充足` = sum(peaks$peak_fpr >= k * peaks$alpha),
+         `3 条件すべて` = sum(peaks$crit_i & peaks$crit_iii &
+                               peaks$peak_fpr >= k * peaks$alpha))
+}) %>%
+  kable(caption = "倍率を変えたときの充足数（45 条件中）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+peaks %>%
+  group_by(alpha) %>%
+  summarise(中央値 = median(peak_over_alpha), 最小 = min(peak_over_alpha),
+            最大 = max(peak_over_alpha), .groups = "drop") %>%
+  kable(caption = "ピーク倍率の分布（α 別）", digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r peak-mcse}
+z_bonf <- qnorm(1 - 0.05 / length(eps_finite))
+
+tibble(
+  観点 = c("(i) ピークが低 ε 端より 2 標準誤差以上高い",
+           sprintf("(ii) %g α の線から 2 標準誤差以内（合否が誤差に埋もれる）", PEAK_ALPHA_MULT),
+           sprintf("ピーク > α が 14 点の多重性を補正しても有意（z > %.2f）", z_bonf)),
+  条件数 = c(sprintf("%d / %d", sum(peaks$z_lo >= 2), nrow(peaks)),
+             sprintf("%d / %d", sum(abs(peaks$z_2a) < 2), nrow(peaks)),
+             sprintf("%d / %d", sum(peaks$z_a > z_bonf), nrow(peaks)))
+) %>%
+  kable(caption = "モンテカルロ誤差を入れた再評価") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+peaks %>%
+  filter(z_lo < 2 | abs(z_2a) < 2) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(z_lo, z_2a) %>%
+  select(alpha, dataset, phase, peak_eps, peak_fpr, peak_over_alpha,
+         se_peak, z_lo, z_2a, crit_i, crit_ii) %>%
+  kable(caption = "判定が誤差に埋もれる条件の内訳", digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r peak-preservation}
+peak_shift <- peaks %>%
+  filter(phase == "Phase 1") %>%
+  select(dataset, alpha, peak_eps, peak_fpr) %>%
+  pivot_wider(names_from = alpha, values_from = c(peak_eps, peak_fpr)) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(dataset)
+
+peak_shift %>%
+  kable(caption = "Phase 1: α 3 水準でのピーク位置 ε と高さ", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+same_eps <- peaks %>%
+  filter(phase == "Phase 1") %>%
+  group_by(dataset) %>%
+  summarise(n_distinct_peak_eps = n_distinct(peak_eps), .groups = "drop")
+cat("ピーク位置が 3 水準で完全に同一のデータセット:",
+    sum(same_eps$n_distinct_peak_eps == 1), "/", nrow(same_eps), "\n")
+```
+
+```{r fixed-denominator}
+nsig_fixed <- baseline_used %>% filter(p_cox >= ALPHA_REF) %>% select(dataset, variable)
+fex_fixed  <- exclusions %>% filter(alpha == ALPHA_REF, kind == "FPR_EXCLUDE") %>%
+  select(dataset, variable) %>% mutate(phase = "Phase 3")
+
+fpr_fixed_var <- map_dfr(ALPHAS, function(a) {
+  sim_raw %>% filter(converged) %>%
+    inner_join(nsig_fixed, by = c("dataset", "variable")) %>%
+    anti_join(fex_fixed, by = c("dataset", "variable", "phase")) %>%
+    group_by(dataset, phase, epsilon, variable) %>%
+    summarise(n_sims = n(), n_false_pos = sum(p_value < a),
+              fpr = n_false_pos / n_sims, .groups = "drop") %>%
+    mutate(alpha = a)
+})
+
+n_denom_fixed <- classify %>% filter(alpha == ALPHA_REF) %>% pull(n_nonsig_coef) %>% sum()
+expected_rows_fixed <- n_denom_fixed * length(EPSILON_GRID) * length(ALPHAS)
+stopifnot(
+  nrow(fpr_fixed_var) == expected_rows_fixed,
+  !anyNA(fpr_fixed_var$fpr),
+  all(fpr_fixed_var$fpr >= 0 & fpr_fixed_var$fpr <= 1),
+  fpr_fixed_var %>% distinct(alpha, dataset, phase, variable) %>% count(alpha) %>%
+    pull(n) %>% n_distinct() == 1L
+)
+cat("固定分母版の係数レベル FPR:", nrow(fpr_fixed_var), "行（期待", expected_rows_fixed, "行）✅\n")
+
+fpr_fixed_avg <- fpr_fixed_var %>%
+  group_by(alpha, dataset, phase, epsilon) %>%
+  summarise(mean_fpr = mean(fpr), n_fpr_coef = n(), .groups = "drop")
+
+peaks_fixed <- fpr_fixed_avg %>%
+  filter(is.finite(epsilon)) %>%
+  group_by(alpha, dataset, phase) %>%
+  summarise(peak_fpr = max(mean_fpr),
+            peak_eps = min(epsilon[mean_fpr == max(mean_fpr)]),
+            n_denom  = first(n_fpr_coef), .groups = "drop") %>%
+  mutate(peak_over_alpha = peak_fpr / alpha,
+         dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(alpha, dataset, phase)
+
+stopifnot(nrow(peaks_fixed) == length(ALPHAS) * length(DATASET_ORDER) * length(INPUT_PHASES),
+          !anyNA(peaks_fixed$peak_over_alpha))
+
+cmp_ref <- peaks %>% filter(alpha == ALPHA_REF) %>%
+  select(dataset, phase, peak_fpr_var = peak_fpr, peak_eps_var = peak_eps) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  inner_join(peaks_fixed %>% filter(alpha == ALPHA_REF) %>%
+               select(dataset, phase, peak_fpr, peak_eps), by = c("dataset", "phase"))
+stopifnot(
+  nrow(cmp_ref) == length(DATASET_ORDER) * length(INPUT_PHASES),
+  !anyNA(cmp_ref$peak_fpr),
+  max(abs(cmp_ref$peak_fpr_var - cmp_ref$peak_fpr)) == 0,
+  identical(cmp_ref$peak_eps_var, cmp_ref$peak_eps)
+)
+cat("α=0.05 では可変分母版と固定分母版が完全一致（", nrow(cmp_ref), "条件、最大絶対差 0）✅\n")
+```
+
+```{r fixed-denominator-medians}
+med_cmp <- bind_rows(
+  peaks %>% mutate(分母 = "α ごとに引き直す（実装どおり）") %>%
+    select(分母, alpha, phase, peak_over_alpha),
+  peaks_fixed %>% mutate(分母 = "α=0.05 の集合に固定") %>%
+    select(分母, alpha, phase, peak_over_alpha)
+)
+
+bind_rows(
+  med_cmp %>% group_by(分母, alpha) %>%
+    summarise(条件数 = n(), 中央値 = median(peak_over_alpha), .groups = "drop") %>%
+    mutate(範囲 = "全 45 条件"),
+  med_cmp %>% filter(phase == "Phase 1") %>% group_by(分母, alpha) %>%
+    summarise(条件数 = n(), 中央値 = median(peak_over_alpha), .groups = "drop") %>%
+    mutate(範囲 = "Phase 1 のみ")
+) %>%
+  select(範囲, 分母, alpha, 条件数, 中央値) %>%
+  pivot_wider(names_from = alpha, values_from = 中央値,
+              names_prefix = "α=") %>%
+  kable(caption = paste("ピーク FPR / α の中央値。分母を固定すると 45 条件では単調な傾向が消え、",
+                        "Phase 1 では向きは残るが傾きが縮む。"),
+        digits = 2) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+peaks_fixed %>%
+  filter(phase == "Phase 1") %>%
+  select(dataset, alpha, peak_eps, peak_fpr, peak_over_alpha) %>%
+  pivot_wider(names_from = alpha, values_from = c(peak_eps, peak_fpr, peak_over_alpha)) %>%
+  kable(caption = "固定分母版・Phase 1: ピーク位置と高さ", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r denominator-swap-evidence}
+swap_cells <- alpha_summary %>%
+  select(alpha, dataset, phase, epsilon, mean_fpr) %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>%
+  select(-alpha) %>%
+  pivot_wider(names_from = alpha_key, values_from = mean_fpr) %>%
+  mutate(drop_01_05 = `0.05` < `0.01`, drop_05_10 = `0.10` < `0.05`)
+
+stopifnot(nrow(swap_cells) == length(DATASET_ORDER) * length(INPUT_PHASES) * length(EPSILON_GRID),
+          !anyNA(swap_cells$`0.01`), !anyNA(swap_cells$`0.05`), !anyNA(swap_cells$`0.10`))
+
+n_drop_01_05 <- sum(swap_cells$drop_01_05)
+n_drop_05_10 <- sum(swap_cells$drop_05_10)
+cat(sprintf("α を緩めたのに平均 FPR が下がるセル: 0.01→0.05 で %d、0.05→0.10 で %d、計 %d（%d 行中）\n",
+            n_drop_01_05, n_drop_05_10, n_drop_01_05 + n_drop_05_10, nrow(swap_cells)))
+
+swap_fixed <- fpr_fixed_avg %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>%
+  select(alpha_key, dataset, phase, epsilon, mean_fpr) %>%
+  pivot_wider(names_from = alpha_key, values_from = mean_fpr)
+stopifnot(nrow(swap_fixed) == nrow(swap_cells), !anyNA(swap_fixed$`0.10`))
+n_drop_fixed <- sum(swap_fixed$`0.05` < swap_fixed$`0.01`) + sum(swap_fixed$`0.10` < swap_fixed$`0.05`)
+stopifnot(n_drop_fixed == 0L)
+cat("固定分母版で同じ現象が起きるセル:", n_drop_fixed, "件（分母を固定すれば単調）✅\n")
+
+nonmono_peak <- peaks %>%
+  select(alpha, dataset, phase, peak_fpr) %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>% select(-alpha) %>%
+  pivot_wider(names_from = alpha_key, values_from = peak_fpr) %>%
+  filter(`0.05` < `0.01` | `0.10` < `0.05`)
+cat("ピーク FPR 自体が α について単調でない条件:", nrow(nonmono_peak), "/ 15\n")
+nonmono_peak %>%
+  kable(caption = "ピーク FPR が α について単調でない条件（可変分母版）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r denominator-swap-mechanism}
+swap_example <- fpr_var %>%
+  filter(dataset == "colon", phase == "Phase 1", epsilon == 30) %>%
+  select(alpha, variable, fpr) %>%
+  mutate(alpha_key = sprintf("%.2f", alpha)) %>% select(-alpha) %>%
+  pivot_wider(names_from = alpha_key, values_from = fpr) %>%
+  left_join(baseline_used %>% filter(dataset == "colon") %>% select(variable, p_cox),
+            by = "variable") %>%
+  arrange(p_cox)
+
+swap_example %>%
+  kable(caption = paste("colon Phase 1・ε=30 の係数レベル FPR。p_cox が 0.05 と 0.10 の間にある係数",
+                        "（differ・obstruct）は α=0.10 では「ベースライン有意」側へ移り、",
+                        "FPR の分母から抜ける。空欄がその係数である。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r fpr-curves, fig.width=12, fig.height=9}
+plot_df <- alpha_summary %>%
+  filter(is.finite(epsilon)) %>%
+  mutate(alpha_lab = factor(sprintf("%.2f", alpha),
+                            levels = sprintf("%.2f", ALPHAS)))
+
+ggplot(plot_df, aes(x = epsilon, y = mean_fpr, color = alpha_lab)) +
+  geom_hline(aes(yintercept = alpha, color = alpha_lab), linetype = "dashed", alpha = 0.5) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.3) +
+  facet_grid(phase ~ dataset) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000), labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = expression(epsilon), y = "Mean FPR", color = expression(alpha)) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r lsr-curves, fig.width=12, fig.height=9}
+ggplot(plot_df, aes(x = epsilon, y = mean_lsr, color = alpha_lab)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.3) +
+  facet_grid(phase ~ dataset) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000), labels = c("0.1", "1", "10", "100", "1k")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = expression(epsilon), y = "Mean LSR", color = expression(alpha)) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r write-outputs}
+out_files <- list(
+  alpha_sensitivity_summary      = alpha_summary,
+  alpha_sensitivity_lsr_detail   = lsr_var %>% select(alpha, dataset, phase, epsilon, variable,
+                                                      n_sims, n_lost, lsr),
+  alpha_sensitivity_fpr_detail   = fpr_var %>% select(alpha, dataset, phase, epsilon, variable,
+                                                      n_sims, n_false_pos, fpr),
+  alpha_sensitivity_denominators = classify,
+  alpha_sensitivity_exclusions   = exclusions,
+  alpha_sensitivity_peaks        = peaks,
+  alpha_sensitivity_eps_star     = eps_star,
+  alpha_sensitivity_peaks_fixed_denom = peaks_fixed %>% mutate(dataset = as.character(dataset))
+)
+
+out_csv  <- paste0(names(out_files), ARM_SUFFIX, ".csv")
+existing <- list.files(eval_dir)
+stopifnot(all(startsWith(names(out_files), "alpha_sensitivity_")))
+foreign <- setdiff(existing, out_csv)
+stopifnot(length(intersect(out_csv, foreign)) == 0)
+if (ARM == "reffix") {
+  stopifnot(all(endsWith(out_csv, "_reffix.csv")),
+            length(intersect(out_csv, paste0(names(out_files), ".csv"))) == 0)
+}
+cat("出力名の検査: 名前空間 OK / 既存ファイルとの衝突 0 件 ✅\n")
+
+iwalk(setNames(out_files, out_csv), function(df, fn) {
+  path <- file.path(eval_dir, fn)
+  write.csv(df, path, row.names = FALSE)
+  cat(sprintf("%-42s %5d 行\n", basename(path), nrow(df)))
+})
+```
+
+```{r conclusion}
+n_p1_robust <- sum(verdict$robust[verdict$phase == "Phase 1"])
+
+summary_tbl <- tibble(
+  項目 = c(
+    paste0("α=0.05 の再計算値と ", KPI_FILE, " の一致"),
+    paste0("α=0.05 の係数レベル値と ", LSR_FILE, " / ", FPR_FILE, " の一致"),
+    "期待行数の検証（α 別リテラル定数）",
+    "分母が 0 になる組",
+    "平均 LSR が閾値をまたいで往復する組",
+    "Phase 1 で逆 U 字 3 条件を全 α 充足したデータセット",
+    "入力摂動 15 条件のうち 3 条件を全 α 充足",
+    "ピーク倍率の中央値（可変分母 / 固定分母、45 条件）",
+    "α を緩めたのに平均 FPR が下がるセル（可変 / 固定）"
+  ),
+  結果 = c(
+    sprintf("%d 行すべて一致（最大絶対差 %s）", nrow(cmp_kpi), format(max(cmp_kpi$d_lsr))),
+    sprintf("LSR %d 行 / FPR %d 行すべて完全一致", nrow(cmp_lsr), nrow(cmp_fpr)),
+    sprintf("LSR %s / FPR %s（α=0.01/0.05/0.10）",
+            paste(EXPECTED_ROWS$lsr_rows, collapse = "/"),
+            paste(EXPECTED_ROWS$fpr_rows, collapse = "/")),
+    sprintf("%d 件", nrow(empty_denom)),
+    sprintf("%d 件", nrow(crossings)),
+    sprintf("%d / %d", n_p1_robust, length(DATASET_ORDER)),
+    sprintf("%d / 15", sum(verdict$robust)),
+    sprintf("%s / %s",
+            paste(sprintf("%.2f", tapply(peaks$peak_over_alpha, peaks$alpha, median)),
+                  collapse = " / "),
+            paste(sprintf("%.2f", tapply(peaks_fixed$peak_over_alpha, peaks_fixed$alpha, median)),
+                  collapse = " / ")),
+    sprintf("%d 件 / %d 件", n_drop_01_05 + n_drop_05_10, n_drop_fixed)
+  )
+)
+
+summary_tbl %>%
+  kable(caption = "実験 A の検証結果") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```
+

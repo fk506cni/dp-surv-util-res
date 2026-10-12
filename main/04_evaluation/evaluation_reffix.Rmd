@@ -1,0 +1,245 @@
+---
+title: "参照レベル修正アームの評価"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(width = 140)
+```
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(arrow)
+library(knitr)
+library(kableExtra)
+library(purrr)
+library(survival)
+library(splines)
+
+PROJECT_DIR <- "/home/rstudio/project"
+SIM_DIR     <- file.path(PROJECT_DIR, "data/03_simulation")
+PREP_DIR    <- file.path(PROJECT_DIR, "data/01_prepared")
+EVAL_DIR    <- file.path(PROJECT_DIR, "data/04_evaluation")
+
+ALPHA <- 0.05
+DATASET_ORDER <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/survival_stacking.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_discrete_time.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R"))
+source(file.path(PROJECT_DIR, "main/03_simulation/R/data_split.R"))
+source(file.path(PROJECT_DIR, "main/03_simulation/R/simulation_engine.R"))
+source(file.path(PROJECT_DIR, "main/06_report/R/revise_helpers.R"))
+```
+
+```{r kpi-fn}
+compute_kpis <- function(all_results, baseline, excl_lsr, excl_fpr) {
+  bl <- baseline %>% mutate(is_significant = p_value < ALPHA, hr_baseline = HR)
+
+  cfr <- all_results %>%
+    group_by(dataset, epsilon, phase, approach) %>%
+    summarise(n_total = n_distinct(iteration),
+              n_failed = n_distinct(iteration[!converged]),
+              cfr = n_failed / n_total, .groups = "drop")
+
+  c_per_iter <- all_results %>%
+    filter(converged) %>%
+    distinct(dataset, epsilon, phase, approach, iteration, .keep_all = TRUE)
+  c_summary <- c_per_iter %>%
+    group_by(dataset, epsilon, phase, approach) %>%
+    summarise(mean_c = mean(c_index, na.rm = TRUE), sd_c = sd(c_index, na.rm = TRUE),
+              .groups = "drop") %>%
+    left_join(bl %>% select(dataset, c_index) %>% distinct() %>% rename(c_baseline = c_index),
+              by = "dataset") %>%
+    mutate(delta_c = c_baseline - mean_c)
+
+  sig_vars    <- bl %>% filter(is_significant)  %>% select(dataset, variable)
+  nonsig_vars <- bl %>% filter(!is_significant) %>% select(dataset, variable)
+
+  lsr_avg <- all_results %>%
+    filter(converged) %>%
+    inner_join(sig_vars, by = c("dataset", "variable")) %>%
+    anti_join(excl_lsr %>% mutate(phase = "Phase 3"), by = c("dataset", "variable", "phase")) %>%
+    group_by(dataset, epsilon, phase, approach, variable) %>%
+    summarise(n_sims = n(), lsr = sum(p_value >= ALPHA) / n(), .groups = "drop") %>%
+    group_by(dataset, epsilon, phase, approach) %>%
+    summarise(mean_lsr = mean(lsr), max_lsr = max(lsr), .groups = "drop")
+
+  fpr_avg <- all_results %>%
+    filter(converged) %>%
+    inner_join(nonsig_vars, by = c("dataset", "variable")) %>%
+    anti_join(excl_fpr %>% mutate(phase = "Phase 3"), by = c("dataset", "variable", "phase")) %>%
+    group_by(dataset, epsilon, phase, approach, variable) %>%
+    summarise(n_sims = n(), fpr = sum(p_value < ALPHA) / n(), .groups = "drop") %>%
+    group_by(dataset, epsilon, phase, approach) %>%
+    summarise(mean_fpr = mean(fpr), max_fpr = max(fpr), .groups = "drop")
+
+  hr_avg <- all_results %>%
+    filter(converged) %>%
+    inner_join(bl %>% select(dataset, variable, hr_baseline), by = c("dataset", "variable")) %>%
+    group_by(dataset, epsilon, phase, approach, variable) %>%
+    summarise(hr_rel_bias = mean((hr - hr_baseline) / hr_baseline, na.rm = TRUE),
+              hr_rmse = sqrt(mean((hr - hr_baseline)^2, na.rm = TRUE)), .groups = "drop") %>%
+    group_by(dataset, epsilon, phase, approach) %>%
+    summarise(mean_hr_rel_bias = mean(abs(hr_rel_bias)), mean_hr_rmse = mean(hr_rmse),
+              .groups = "drop")
+
+  cov_avg <- all_results %>%
+    filter(converged) %>%
+    inner_join(bl %>% select(dataset, variable, hr_baseline), by = c("dataset", "variable")) %>%
+    mutate(covered = hr_baseline >= exp(beta - 1.96 * se) & hr_baseline <= exp(beta + 1.96 * se)) %>%
+    group_by(dataset, epsilon, phase, approach, variable) %>%
+    summarise(coverage = mean(covered, na.rm = TRUE), .groups = "drop") %>%
+    group_by(dataset, epsilon, phase, approach) %>%
+    summarise(mean_coverage = mean(coverage), min_coverage = min(coverage), .groups = "drop")
+
+  c_summary %>%
+    select(dataset, epsilon, phase, approach, mean_c, sd_c, delta_c) %>%
+    left_join(cfr %>% select(dataset, epsilon, phase, approach, cfr),
+              by = c("dataset", "epsilon", "phase", "approach")) %>%
+    left_join(lsr_avg, by = c("dataset", "epsilon", "phase", "approach")) %>%
+    left_join(fpr_avg, by = c("dataset", "epsilon", "phase", "approach")) %>%
+    left_join(hr_avg,  by = c("dataset", "epsilon", "phase", "approach")) %>%
+    left_join(cov_avg, by = c("dataset", "epsilon", "phase", "approach")) %>%
+    mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+    arrange(dataset, approach, phase, epsilon)
+}
+
+KPI_COLS <- c("mean_c", "sd_c", "delta_c", "cfr", "mean_lsr", "max_lsr",
+              "mean_fpr", "max_fpr", "mean_hr_rel_bias", "mean_hr_rmse",
+              "mean_coverage", "min_coverage")
+```
+
+```{r load-fn}
+load_arm <- function(paths, labels) {
+  parts <- map2(paths, labels, function(p, lab) {
+    if (!file.exists(p)) return(NULL)
+    read_parquet(p) %>%
+      select(any_of(c("variable", "beta", "se", "hr", "p_value", "c_index",
+                      "converged", "epsilon", "iteration", "dataset"))) %>%
+      mutate(phase = lab, approach = if (grepl("^Output", lab)) "Output" else "Input")
+  })
+  bind_rows(parts[!vapply(parts, is.null, logical(1))])
+}
+```
+
+```{r load-new}
+RF_DIR <- file.path(SIM_DIR, "reffix")
+new_paths <- file.path(RF_DIR, c("all_phase1_reffix.parquet", "all_phase2_reffix.parquet",
+                                 "all_phase3_reffix.parquet",
+                                 "all_output_std_reffix.parquet",
+                                 "all_output_dfbeta_reffix.parquet"))
+new_labels <- c("Phase 1", "Phase 2", "Phase 3", "Output (Std)", "Output (dfbeta)")
+new_res <- load_arm(new_paths, new_labels)
+baseline_new <- read_csv(file.path(PREP_DIR, "baseline_cox_reffix.csv"), show_col_types = FALSE)
+cat(sprintf("修正アーム: %d 行 / phase %s\n", nrow(new_res),
+            paste(sort(unique(new_res$phase)), collapse = ", ")))
+
+cat("注: ヒューリスティック感度版 'Output' は論文に現れないため再実行していない\n")
+```
+
+```{r recompute-exclusions}
+prepared <- setNames(lapply(DATASET_ORDER, function(d)
+  set_reference_levels(as.data.frame(read_csv(
+    file.path(PREP_DIR, paste0(d, "_prepared.csv")), show_col_types = FALSE)), d)), DATASET_ORDER)
+
+glm_inf <- map_dfr(DATASET_ORDER, function(d) {
+  data <- prepared[[d]]
+  iv <- create_time_intervals(data$time[data$status == 1], K_VALUES[[d]])
+  st <- stack_survival_data(data, iv); st$interval_id <- as.numeric(st$interval_id)
+  cn <- setdiff(names(data), c("time", "status"))
+  fit <- glm(as.formula(paste("y_ik ~ splines::ns(interval_id, df = 3) +",
+                              paste(cn, collapse = " + "))),
+             data = st, family = binomial(link = "logit"))
+  extract_covariate_coefs(fit) %>% mutate(dataset = d)
+})
+
+disc_new <- baseline_new %>%
+  select(dataset, variable, p_cox = p_value) %>%
+  inner_join(glm_inf %>% select(dataset, variable, p_glm = p_value),
+             by = c("dataset", "variable")) %>%
+  mutate(sig_cox = p_cox < ALPHA, sig_glm = p_glm < ALPHA, discordant = sig_cox != sig_glm)
+
+EXCL_LSR_NEW <- disc_new %>% filter(discordant, sig_cox) %>% select(dataset, variable) %>% as.data.frame()
+EXCL_FPR_NEW <- disc_new %>% filter(discordant, !sig_cox) %>% select(dataset, variable) %>% as.data.frame()
+
+kable(disc_new %>% filter(discordant) %>% select(dataset, variable, p_cox, p_glm),
+      digits = 5, caption = "修正アームでの Cox vs 離散時間 GLM 乖離係数（α=0.05）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat(sprintf("照合係数 %d 個 / 乖離 %d 個\n", nrow(disc_new), sum(disc_new$discordant)))
+cat(sprintf("LSR 除外: %s\nFPR 除外: %s\n",
+            paste(paste(EXCL_LSR_NEW$dataset, EXCL_LSR_NEW$variable), collapse = ", "),
+            paste(paste(EXCL_FPR_NEW$dataset, EXCL_FPR_NEW$variable), collapse = ", ")))
+
+p3_inf_art <- read_parquet(file.path(RF_DIR, "all_phase3_reffix.parquet")) %>%
+  filter(is.infinite(epsilon)) %>%
+  distinct(dataset, variable, .keep_all = TRUE) %>%
+  select(dataset, variable, beta_art = beta, p_art = p_value)
+art_chk <- glm_inf %>% select(dataset, variable, beta, p_value) %>%
+  inner_join(p3_inf_art, by = c("dataset", "variable")) %>%
+  mutate(rel_beta = abs(beta - beta_art) / pmax(1e-8, abs(beta_art)),
+         sig_here = p_value < ALPHA, sig_art = p_art < ALPHA)
+kable(tibble(`突合係数` = nrow(art_chk),
+             `β の最大相対差` = sprintf("%.2e", max(art_chk$rel_beta)),
+             `有意性判定の不一致` = sum(art_chk$sig_here != art_chk$sig_art)),
+      caption = "本書の GLM と修正アーム成果物（ε=∞ 行）の突合") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(nrow(art_chk) == nrow(disc_new),
+          max(art_chk$rel_beta) < 1e-4,
+          all(art_chk$sig_here == art_chk$sig_art))
+cat(sprintf(paste0("本書の GLM は修正アーム成果物の ε=∞ 行と %d 係数で有意性判定が一致",
+                   "（β の最大相対差 %.2e、クリッピングの丸めぶん）✅\n"),
+            nrow(art_chk), max(art_chk$rel_beta)))
+
+excl_csv <- bind_rows(
+  EXCL_LSR_NEW %>% mutate(kind = "lsr"),
+  EXCL_FPR_NEW %>% mutate(kind = "fpr")
+) %>% select(kind, dataset, variable) %>% arrange(kind, dataset, variable)
+write_csv(excl_csv, file.path(EVAL_DIR, "phase3_exclusions_reffix.csv"))
+cat(sprintf("除外集合を書き出した: phase3_exclusions_reffix.csv（%d 行）\n", nrow(excl_csv)))
+```
+
+```{r kpi-new}
+kpi_new <- compute_kpis(new_res, baseline_new, EXCL_LSR_NEW, EXCL_FPR_NEW)
+write_csv(kpi_new, file.path(EVAL_DIR, "kpi_reffix.csv"))
+cat(sprintf("修正アーム KPI: %d 行 → kpi_reffix.csv\n", nrow(kpi_new)))
+```
+
+```{r traintest}
+RFT_DIR <- file.path(SIM_DIR, "reffix_traintest")
+has_tt <- dir.exists(RFT_DIR) && length(list.files(RFT_DIR, pattern = "parquet$")) > 0
+cat(sprintf("train/test 修正アーム: %s\n", ifelse(has_tt, "あり", "未実行（スキップ）")))
+```
+
+```{r traintest-kpi, eval=has_tt}
+tt_new <- load_arm(file.path(RFT_DIR,
+                             c("all_phase1_reffix_traintest.parquet",
+                               "all_phase2_reffix_traintest.parquet",
+                               "all_phase3_reffix_traintest.parquet",
+                               "all_output_std_reffix_traintest.parquet",
+                               "all_output_dfbeta_reffix_traintest.parquet")),
+                   c("Phase 1", "Phase 2", "Phase 3", "Output (Std)", "Output (dfbeta)"))
+
+kpi_tt_new <- compute_kpis(tt_new, baseline_new, EXCL_LSR_NEW, EXCL_FPR_NEW)
+write_csv(kpi_tt_new, file.path(EVAL_DIR, "kpi_reffix_traintest.csv"))
+cat(sprintf("train/test 修正アーム KPI: %d 行 → kpi_reffix_traintest.csv\n", nrow(kpi_tt_new)))
+```
+
+```{r session-info}
+sessionInfo()
+```
+

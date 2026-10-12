@@ -1,0 +1,557 @@
+---
+title: "実験 C: クリッピング境界 3 方式の比較 — 設計とスモークテスト"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.width = 10, fig.height = 6, fig.path = "figures/"
+)
+
+B_SMOKE        <- 10L
+B_PRODUCTION   <- 1000L
+RUN_PRODUCTION <- TRUE
+
+PROJ <- "/home/rstudio/project"
+```
+
+```{r load-packages}
+library(survival)
+library(tidyverse)
+library(arrow)
+library(furrr)
+library(progressr)
+library(knitr)
+cat("[expC] Packages loaded.\n")
+```
+
+```{r source-functions}
+source(file.path(PROJ, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJ, "main/02_dp_mechanisms/R/dp_bounds_comparison.R"))
+source(file.path(PROJ, "main/03_simulation/R/dp_fast.R"))
+source(file.path(PROJ, "main/03_simulation/R/simulation_engine.R"))
+source(file.path(PROJ, "main/03_simulation/R/data_split.R"))
+cat("[expC] Functions sourced. epsilon grid =", length(EPSILON_VALUES), "values\n")
+```
+
+```{r load-data}
+DATASETS <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+data_list <- setNames(lapply(DATASETS, function(ds)
+  read_csv(file.path(PROJ, sprintf("data/01_prepared/%s_prepared.csv", ds)),
+           show_col_types = FALSE)), DATASETS)
+for (ds in DATASETS) cat(sprintf("%-10s N = %5d\n", ds, nrow(data_list[[ds]])))
+```
+
+```{r tabS9-draft}
+kable(FIXED_BOUNDS_SOURCES[, c("dataset", "variable", "tier", "lower", "upper",
+                               "unit_data", "source_value", "unit_source", "conversion", "obs_ref")],
+      row.names = FALSE,
+      caption = "tabS9 ドラフト（数値部）。適用規則・出典・URL・アクセス日は下表")
+
+kable(FIXED_BOUNDS_SOURCES[, c("dataset", "variable", "rule", "source_citation",
+                               "source_url", "access_date")],
+      row.names = FALSE,
+      caption = "tabS9 ドラフト（根拠部）")
+```
+
+```{r bounds-check}
+bounds_check <- map_dfr(DATASETS, function(ds) {
+  d  <- data_list[[ds]]
+  ty <- COVARIATE_TYPES[[ds]]
+  cols <- names(ty)[map_lgl(ty, ~ identical(.x, "continuous"))]
+  map_dfr(cols, function(cl) {
+    x  <- d[[cl]]
+    ob <- as.numeric(CLIPPING_BOUNDS[[ds]][[cl]])
+    fx <- as.numeric(CLIPPING_BOUNDS_FIXED[[ds]][[cl]])
+    wd <- as.numeric(CLIPPING_BOUNDS_WIDE[[ds]][[cl]])
+    tibble(
+      dataset = ds, variable = cl,
+      obs = sprintf("[%g, %g]", ob[1], ob[2]),
+      fixed = sprintf("[%g, %g]", fx[1], fx[2]),
+      widened = sprintf("[%g, %g]", wd[1], wd[2]),
+      fixed_ratio   = (fx[2] - fx[1]) / (ob[2] - ob[1]),
+      fixed_clip_pct = mean(x < fx[1] | x > fx[2]) * 100,
+      widened_ratio = (wd[2] - wd[1]) / (ob[2] - ob[1]),
+      widened_clip_pct = mean(x < wd[1] | x > wd[2]) * 100
+    )
+  })
+})
+
+bounds_check <- bounds_check %>%
+  mutate(unit_flag = if_else(fixed_ratio < 1 | fixed_ratio > 50, "要確認", ""))
+
+kable(bounds_check, digits = 4,
+      caption = "境界幅 ÷ 観測幅とクリップ発生率（fixed / widened）")
+
+cat(sprintf("\n[検査 1] 1〜50 倍の外側にある変数: %d / %d\n",
+            sum(bounds_check$unit_flag == "要確認"), nrow(bounds_check)))
+cat(sprintf("[検査 1] fixed でクリップが生じる変数: %d / %d\n",
+            sum(bounds_check$fixed_clip_pct > 0), nrow(bounds_check)))
+print(bounds_check %>% filter(unit_flag == "要確認" | fixed_clip_pct > 0) %>%
+        select(dataset, variable, obs, fixed, fixed_ratio, fixed_clip_pct))
+```
+
+```{r structure-check}
+assert_bounds_structure(CLIPPING_BOUNDS_FIXED, label = "CLIPPING_BOUNDS_FIXED")
+assert_bounds_structure(CLIPPING_BOUNDS_WIDE,  label = "CLIPPING_BOUNDS_WIDE")
+cat("[検査 2] 構造検査 OK（データセット 5 / 共変量集合・カテゴリ集合すべて一致）\n")
+```
+
+```{r seed-design}
+seed_tbl <- expand_grid(arm = c("fixed", "widened"), dataset = DATASETS) %>%
+  mutate(
+    base_seed  = BOUNDS_DATASET_BASE_SEED[dataset] + BOUNDS_ARM_SEED_OFFSET[arm],
+    smoke_from = base_seed + 1L,
+    smoke_to   = base_seed + length(EPSILON_VALUES) * B_SMOKE,
+    prod_from  = base_seed + 1L,
+    prod_to    = base_seed + length(EPSILON_VALUES) * B_PRODUCTION
+  )
+kable(seed_tbl, caption = "アーム × データセット別のシード消費域")
+
+cat(sprintf("\nfixed   本番消費域: [%d, %d]\n", min(seed_tbl$prod_from[seed_tbl$arm=="fixed"]),
+            max(seed_tbl$prod_to[seed_tbl$arm=="fixed"])))
+cat(sprintf("widened 本番消費域: [%d, %d]\n", min(seed_tbl$prod_from[seed_tbl$arm=="widened"]),
+            max(seed_tbl$prod_to[seed_tbl$arm=="widened"])))
+```
+
+```{r callr-helper}
+run_bounds_sim_isolated <- function(data, dataset_name, arm, eps_values, B, seed) {
+  callr::r(
+    function(data, dataset_name, arm, eps_values, B, seed) {
+      library(survival); library(dplyr); library(furrr); library(progressr)
+
+      source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+      source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_bounds_comparison.R")
+      source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+      source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+      source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+
+      n_workers <- min(10, parallel::detectCores() - 1)
+      Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+                 VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+      plan(multisession, workers = n_workers)
+
+      bounds_all <- get(BOUNDS_ARM_BOUNDS[[arm]])
+      bounds <- bounds_all[[dataset_name]]
+      types  <- COVARIATE_TYPES[[dataset_name]]
+      perturb_fn <- function(data, epsilon) {
+        perturb_covariates_phase1_fast(data, bounds, epsilon, types,
+                                       preserve_factor_levels = TRUE)
+      }
+
+      result <- run_simulation_batch(
+        data = data, perturb_fn = perturb_fn,
+        epsilon_values = eps_values, B = B,
+        base_seed = seed, cox_formula = COX_FORMULAS[[dataset_name]],
+        dataset_name = dataset_name
+      )
+      plan(sequential)
+      result$arm <- arm
+      result
+    },
+    args = list(data = data, dataset_name = dataset_name, arm = arm,
+                eps_values = eps_values, B = B, seed = seed)
+  )
+}
+
+run_arm <- function(arm, B) {
+  map_dfr(DATASETS, function(ds) {
+    seed <- unname(BOUNDS_DATASET_BASE_SEED[ds] + BOUNDS_ARM_SEED_OFFSET[arm])
+    t0 <- Sys.time()
+    res <- run_bounds_sim_isolated(data_list[[ds]], ds, arm, EPSILON_VALUES, B, seed)
+    cat(sprintf("[%s/%s] B=%d done in %.1f s (base_seed=%d)\n", arm, ds, B,
+                as.numeric(difftime(Sys.time(), t0, units = "secs")), seed))
+    res
+  })
+}
+```
+
+```{r check-functions}
+REF_PARQUET <- file.path(PROJ, "data/03_simulation/reffix/all_phase1_reffix.parquet")
+
+check_convergence <- function(res, label, B_expected = NULL) {
+  by_eps <- res %>%
+    group_by(arm, dataset, epsilon) %>%
+    summarise(n_sims = n_distinct(iteration),
+              n_conv = sum(converged[!duplicated(iteration)]), .groups = "drop") %>%
+    mutate(cfr_pct = 100 * (1 - n_conv / n_sims))
+
+  conv <- by_eps %>%
+    group_by(arm, dataset) %>%
+    summarise(n_sims = sum(n_sims), n_conv = sum(n_conv),
+              max_cfr_pct_by_eps = max(cfr_pct), .groups = "drop") %>%
+    mutate(cfr_pct = 100 * (1 - n_conv / n_sims))
+  print(kable(conv, digits = 4,
+              caption = sprintf("%s: アーム × データセット別の収束失敗率（停止条件は ε 単位で判定する。%s）",
+                                label, "max_cfr_pct_by_eps = そのデータセット内で最大の ε 単位 CFR")))
+
+  bad <- by_eps %>% filter(n_conv < n_sims)
+  if (nrow(bad) == 0) {
+    cat(sprintf("[%s 確認 1] 収束失敗ゼロ（全 2 アーム × 5 データセット × %d ε）\n",
+                label, length(EPSILON_VALUES)))
+  } else {
+    cat(sprintf("[%s 確認 1] ⚠️ 収束失敗あり。内訳:\n", label))
+    print(as.data.frame(bad))
+  }
+  fail_rows <- res %>% filter(!converged)
+  hard_fail <- fail_rows %>% filter(variable == "FAILED")
+
+  conv_ref <- res %>%
+    filter(converged, variable != "FAILED", is.finite(beta)) %>%
+    group_by(arm, dataset, epsilon, variable) %>%
+    summarise(ref_abs_beta = max(abs(beta)), .groups = "drop")
+
+  benign_iter <- fail_rows %>%
+    group_by(arm, dataset, epsilon, iteration) %>%
+    summarise(
+      shape_ok = all(variable != "FAILED") & all(is.finite(beta)) & all(is.finite(se)) &
+                 all(grepl("Loglik converged before variable", error_msg, fixed = TRUE)),
+      warn_idx = suppressWarnings(as.integer(
+        sub(".*variable\\s+([0-9]+).*", "\\1", error_msg[1]))),
+      n_coef   = n(),
+      .groups = "drop") %>%
+    left_join(fail_rows %>%
+                group_by(arm, dataset, epsilon, iteration) %>%
+                mutate(.pos = row_number()) %>%
+                ungroup() %>%
+                select(arm, dataset, epsilon, iteration, .pos, variable, beta),
+              by = c("arm", "dataset", "epsilon", "iteration")) %>%
+    filter(!is.na(warn_idx) & .pos == warn_idx) %>%
+    rename(warn_var = variable, warn_beta = beta) %>%
+    right_join(fail_rows %>% distinct(arm, dataset, epsilon, iteration),
+               by = c("arm", "dataset", "epsilon", "iteration")) %>%
+    left_join(conv_ref, by = c("arm", "dataset", "epsilon", "warn_var" = "variable")) %>%
+    mutate(benign = coalesce(shape_ok, FALSE) &
+                    !is.na(warn_beta) & !is.na(ref_abs_beta) &
+                    abs(warn_beta) <= ref_abs_beta) %>%
+    select(arm, dataset, epsilon, iteration, benign, warn_var, warn_beta, ref_abs_beta)
+  by_eps <- by_eps %>%
+    left_join(benign_iter %>% group_by(arm, dataset, epsilon) %>%
+                summarise(n_benign = sum(benign), .groups = "drop"),
+              by = c("arm", "dataset", "epsilon")) %>%
+    mutate(n_benign = coalesce(n_benign, 0L),
+           n_fail = n_sims - n_conv,
+           n_nonbenign = n_fail - n_benign,
+           cfr_nonbenign_pct = 100 * n_nonbenign / n_sims)
+
+  if (any(by_eps$n_fail > 0)) {
+    print(kable(by_eps %>% filter(n_fail > 0) %>%
+                  select(arm, dataset, epsilon, n_sims, n_fail, n_benign, n_nonbenign,
+                         cfr_pct, cfr_nonbenign_pct),
+                digits = 4,
+                caption = sprintf("%s: 収束失敗の内訳（良性 = coxph の警告のみ・係数は有限）", label)))
+  }
+
+  overall_cfr <- 100 * sum(by_eps$n_fail) / sum(by_eps$n_sims)
+  cat(sprintf("[%s] 全体 CFR = %.4f%%（真の失敗 %d 件 / 良性の警告 %d 件 / 全 %d 反復）\n",
+              label, overall_cfr, nrow(hard_fail), sum(by_eps$n_benign), sum(by_eps$n_sims)))
+
+  if (nrow(benign_iter %>% filter(!benign)) > 0) {
+    print(kable(benign_iter %>% filter(!benign) %>%
+                  select(arm, dataset, epsilon, iteration, warn_var, warn_beta, ref_abs_beta),
+                digits = 8,
+                caption = sprintf("%s: 良性と判定されなかった失敗（warn_var = 警告が名指しした変数）",
+                                  label)))
+  }
+
+  viol <- c(
+    if (nrow(hard_fail) > 0)
+      sprintf("  (a) error 分岐の真の失敗が %d 行ある", nrow(hard_fail)),
+    {
+      b <- by_eps %>% filter(cfr_nonbenign_pct > 1.0)
+      if (nrow(b) > 0) sprintf("  (b) %s / %s / eps=%g: 良性でない失敗 %d/%d (CFR %.2f%%)",
+                               b$arm, b$dataset, b$epsilon, b$n_nonbenign, b$n_sims,
+                               b$cfr_nonbenign_pct)
+    },
+    {
+      b <- by_eps %>% filter(cfr_pct > 5.0)
+      if (nrow(b) > 0) sprintf("  (c) %s / %s / eps=%g: 良性を含めても CFR %.2f%% が 5%% を超える",
+                               b$arm, b$dataset, b$epsilon, b$cfr_pct)
+    },
+    if (overall_cfr > 0.1) sprintf("  (d) 全体 CFR %.4f%% が 0.1%% を超える", overall_cfr),
+    {
+      if (!is.null(B_expected)) {
+        b <- by_eps %>% filter(n_sims != B_expected)
+        if (nrow(b) > 0) sprintf("  (e) %s / %s / eps=%g: 反復数 %d（期待 %d）",
+                                 b$arm, b$dataset, b$epsilon, b$n_sims, B_expected)
+      }
+    }
+  )
+  if (length(viol) > 0) {
+    stop(sprintf("[%s] 収束の停止条件に触れた:\n%s", label, paste(viol, collapse = "\n")))
+  }
+  invisible(conv)
+}
+
+check_schema <- function(res, label) {
+  ref_cols <- arrow::open_dataset(REF_PARQUET)$schema$names
+  new_cols <- names(res)
+  cat(sprintf("[%s] 既存 phase1 の列: %s\n", label, paste(ref_cols, collapse = ", ")))
+  cat(sprintf("[%s] 新アームの列    : %s\n", label, paste(new_cols, collapse = ", ")))
+  stopifnot(identical(setdiff(new_cols, ref_cols), "arm"))
+  stopifnot(length(setdiff(ref_cols, new_cols)) == 0)
+  cat(sprintf("[%s 確認 2] スキーマ一致 OK（既存の全列 + arm 列のみ追加）\n", label))
+  invisible(TRUE)
+}
+
+clip_diff_datasets <- function(arm) {
+  bounds_all <- get(BOUNDS_ARM_BOUNDS[[arm]])
+  out <- character(0)
+  for (ds in DATASETS) {
+    d <- data_list[[ds]]
+    ty <- COVARIATE_TYPES[[ds]]
+    differs <- FALSE
+    for (v in names(ty)) {
+      if (ty[[v]] != "continuous") next
+      bd <- CLIPPING_BOUNDS[[ds]][[v]]
+      ba <- bounds_all[[ds]][[v]]
+      if (!identical(pmin(pmax(d[[v]], bd[1]), bd[2]),
+                     pmin(pmax(d[[v]], ba[1]), ba[2]))) { differs <- TRUE; break }
+    }
+    if (differs) out <- c(out, ds)
+  }
+  out
+}
+
+check_inf_identity <- function(res, label, out_csv) {
+  dd_inf <- read_parquet(REF_PARQUET) %>%
+    filter(is.infinite(epsilon), converged, variable != "FAILED") %>%
+    distinct(dataset, iteration, .keep_all = TRUE) %>%
+    group_by(dataset) %>% summarise(`data-driven` = mean(c_index), .groups = "drop")
+
+  arm_inf <- res %>%
+    filter(is.infinite(epsilon), converged, variable != "FAILED") %>%
+    distinct(arm, dataset, iteration, .keep_all = TRUE) %>%
+    group_by(arm, dataset) %>%
+    summarise(c = mean(c_index), sd = sd(c_index), .groups = "drop")
+  stopifnot(all(arm_inf$sd == 0))
+
+  inf_tbl <- dd_inf %>%
+    left_join(arm_inf %>% select(-sd) %>% pivot_wider(names_from = arm, values_from = c),
+              by = "dataset") %>%
+    mutate(identical_fixed   = fixed   == `data-driven`,
+           identical_widened = widened == `data-driven`)
+  print(kable(inf_tbl, digits = 10,
+              caption = sprintf("%s: ε=∞ での C-index（アーム間の一致検査）", label)))
+  write_csv(inf_tbl, out_csv)
+
+  may_fixed   <- clip_diff_datasets("fixed")
+  may_widened <- clip_diff_datasets("widened")
+  got_fixed   <- inf_tbl$dataset[!inf_tbl$identical_fixed]
+  got_widened <- inf_tbl$dataset[!inf_tbl$identical_widened]
+  cat(sprintf("[%s] クリップ結果が data-driven と違うデータセット: fixed = {%s} / widened = {%s}\n",
+              label, paste(may_fixed, collapse = ", "), paste(may_widened, collapse = ", ")))
+  cat(sprintf("[%s] 実際に C-index が動いたデータセット:         fixed = {%s} / widened = {%s}\n",
+              label, paste(got_fixed, collapse = ", "), paste(got_widened, collapse = ", ")))
+  unexplained <- c(setdiff(got_fixed, may_fixed), setdiff(got_widened, may_widened))
+  if (length(unexplained) > 0) {
+    stop(sprintf("[%s] クリップで説明できない差がある: %s", label,
+                 paste(unique(unexplained), collapse = ", ")))
+  }
+  cat(sprintf("[%s 確認 3b] ε=∞ の差はすべてクリップの違いで説明できる\n", label))
+  invisible(inf_tbl)
+}
+
+check_inf_refit <- function(res, label) {
+  out <- map_dfr(names(BOUNDS_ARM_BOUNDS), function(arm) {
+    bounds_all <- get(BOUNDS_ARM_BOUNDS[[arm]])
+    map_dfr(DATASETS, function(ds) {
+      d  <- set_reference_levels(as.data.frame(data_list[[ds]]), ds)
+      pd <- perturb_covariates_phase1_fast(d, bounds_all[[ds]], Inf, COVARIATE_TYPES[[ds]],
+                                           preserve_factor_levels = TRUE)
+      fit <- coxph(COX_FORMULAS[[ds]], data = pd)
+      ref <- tibble(variable = names(coef(fit)), beta_ref = unname(coef(fit)),
+                    se_ref = unname(sqrt(diag(vcov(fit)))))
+      got <- res %>%
+        filter(arm == !!arm, dataset == ds, is.infinite(epsilon), iteration == min(iteration)) %>%
+        select(variable, beta, se)
+      j <- inner_join(ref, got, by = "variable")
+      tibble(arm = arm, dataset = ds,
+             n_ref = nrow(ref), n_got = nrow(got), n_joined = nrow(j),
+             max_abs_diff_beta = if (nrow(j)) max(abs(j$beta - j$beta_ref)) else NA_real_,
+             max_abs_diff_se   = if (nrow(j)) max(abs(j$se   - j$se_ref))   else NA_real_)
+    })
+  })
+  print(kable(out, digits = 16,
+              caption = sprintf("%s: ε=∞ の成果物を各アームの箱から再計算して突合", label)))
+  stopifnot(all(out$n_ref == out$n_joined), all(out$n_got == out$n_joined))
+  bad <- out %>% filter(max_abs_diff_beta != 0 | max_abs_diff_se != 0)
+  if (nrow(bad) > 0) {
+    stop(sprintf("[%s] ε=∞ の成果物が宣言した箱から再現できない:\n%s", label,
+                 paste(sprintf("  %s / %s: |Δβ| = %g / |Δse| = %g",
+                               bad$arm, bad$dataset,
+                               bad$max_abs_diff_beta, bad$max_abs_diff_se), collapse = "\n")))
+  }
+  cat(sprintf("[%s 確認 3c] ε=∞ の成果物は各アームの箱からビット単位で再現できる\n", label))
+  invisible(out)
+}
+
+check_arm_results <- function(res, label, out_csv, B_expected = NULL) {
+  check_convergence(res, label, B_expected = B_expected)
+  check_schema(res, label)
+  check_inf_identity(res, label, out_csv)
+  check_inf_refit(res, label)
+  cat(sprintf("\n=== [%s] 4 検査すべて合格 ===\n", label))
+  invisible(TRUE)
+}
+```
+
+```{r smoke-run, results='hide'}
+t_smoke0 <- Sys.time()
+smoke_fixed   <- run_arm("fixed",   B_SMOKE)
+t_smoke1 <- Sys.time()
+smoke_widened <- run_arm("widened", B_SMOKE)
+t_smoke2 <- Sys.time()
+
+smoke_results <- bind_rows(smoke_fixed, smoke_widened)
+smoke_secs_fixed   <- as.numeric(difftime(t_smoke1, t_smoke0, units = "secs"))
+smoke_secs_widened <- as.numeric(difftime(t_smoke2, t_smoke1, units = "secs"))
+```
+
+```{r smoke-time}
+cat(sprintf("fixed   (5 datasets x %d eps x B=%d): %.1f 秒\n",
+            length(EPSILON_VALUES), B_SMOKE, smoke_secs_fixed))
+cat(sprintf("widened (5 datasets x %d eps x B=%d): %.1f 秒\n",
+            length(EPSILON_VALUES), B_SMOKE, smoke_secs_widened))
+cat(sprintf("\nB=%d 換算の見積もり（線形外挿）: fixed %.1f 分 / widened %.1f 分 / 合計 %.1f 分\n",
+            B_PRODUCTION,
+            smoke_secs_fixed   * B_PRODUCTION / B_SMOKE / 60,
+            smoke_secs_widened * B_PRODUCTION / B_SMOKE / 60,
+            (smoke_secs_fixed + smoke_secs_widened) * B_PRODUCTION / B_SMOKE / 60))
+```
+
+```{r calibration, results='hide'}
+t_cal0 <- Sys.time()
+cal_fixed <- run_arm("fixed", 100L)
+cal_secs  <- as.numeric(difftime(Sys.time(), t_cal0, units = "secs"))
+```
+
+```{r calibration-report}
+b_slope <- (cal_secs - smoke_secs_fixed) / (100 - B_SMOKE)
+a_fixed <- smoke_secs_fixed - b_slope * B_SMOKE
+est_1000_arm <- a_fixed + b_slope * B_PRODUCTION
+
+cat(sprintf("実測: B=%d %.1f 秒 / B=100 %.1f 秒\n", B_SMOKE, smoke_secs_fixed, cal_secs))
+cat(sprintf("当てはめ: 固定費 a = %.1f 秒 / 限界コスト b = %.3f 秒/反復\n", a_fixed, b_slope))
+cat(sprintf("B=%d 外挿: 1 アーム %.1f 分 / 2 アーム合計 %.1f 分\n",
+            B_PRODUCTION, est_1000_arm / 60, 2 * est_1000_arm / 60))
+cat(sprintf("（素朴な線形外挿 %.1f 分 との差 = 固定費の二重計上分）\n",
+            2 * smoke_secs_fixed * B_PRODUCTION / B_SMOKE / 60))
+```
+
+```{r smoke-convergence-schema}
+check_convergence(smoke_results, sprintf("B=%d スモーク", B_SMOKE), B_expected = B_SMOKE)
+check_schema(smoke_results, sprintf("B=%d スモーク", B_SMOKE))
+```
+
+```{r smoke-cindex}
+cidx <- smoke_results %>%
+  filter(converged, variable != "FAILED") %>%
+  distinct(arm, dataset, epsilon, iteration, .keep_all = TRUE) %>%
+  group_by(arm, dataset, epsilon) %>%
+  summarise(mean_c = mean(c_index, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = arm, values_from = mean_c)
+kable(cidx, digits = 4,
+      caption = sprintf("B=%d スモーク: ε 別平均 C-index（参考値。B が小さいため推定精度は低い）", B_SMOKE))
+```
+
+```{r inf-identity}
+inf_tbl <- check_inf_identity(
+  smoke_results,
+  label   = sprintf("B=%d スモーク", B_SMOKE),
+  out_csv = file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/inf_identity.csv")
+)
+check_inf_refit(smoke_results, sprintf("B=%d スモーク", B_SMOKE))
+```
+
+```{r smoke-save}
+for (a in c("fixed", "widened")) {
+  outdir <- file.path(PROJ, "data/03_simulation", BOUNDS_ARM_OUTPUT_DIR[[a]])
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  dat <- smoke_results %>% filter(arm == a)
+  for (ds in DATASETS) {
+    sub <- dat %>% filter(dataset == ds)
+    write_csv(sub, file.path(outdir, sprintf("%s_phase1_%s_smoke.csv", ds, a)))
+    write_parquet(sub, file.path(outdir, sprintf("%s_phase1_%s_smoke.parquet", ds, a)))
+  }
+  write_csv(dat, file.path(outdir, sprintf("all_phase1_%s_smoke.csv", a)))
+  write_parquet(dat, file.path(outdir, sprintf("all_phase1_%s_smoke.parquet", a)))
+  cat("saved:", outdir, "\n")
+}
+
+write_csv(bounds_check, file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/bounds_check.csv"))
+write_csv(FIXED_BOUNDS_SOURCES,
+          file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/tabS9_fixed_bounds_draft.csv"))
+```
+
+```{r nondestructive}
+protected_dir <- normalizePath(file.path(PROJ, "data/03_simulation", c("phase1_covariates", "reffix")),
+                               mustWork = FALSE)
+write_dirs <- vapply(BOUNDS_ARM_OUTPUT_DIR, function(d) {
+  p <- file.path(PROJ, "data/03_simulation", d)
+  dir.create(p, recursive = TRUE, showWarnings = FALSE)
+  normalizePath(p, mustWork = TRUE)
+}, character(1L))
+
+cat("保護対象ディレクトリ:", protected_dir, "\n")
+cat("本 Rmd の書き込み先  :", paste(write_dirs, collapse = " / "), "\n")
+stopifnot(!any(write_dirs %in% protected_dir))
+stopifnot(!any(outer(write_dirs, paste0(protected_dir, .Platform$file.sep), startsWith)))
+
+existing <- list.files(protected_dir, full.names = TRUE)
+info <- file.info(existing)
+chk <- tibble(file = basename(existing), size = info$size,
+              md5 = unname(tools::md5sum(existing)))
+kable(chk, caption = "既存 data-driven 出力（本 Rmd は書き込まない。md5 は台帳との照合用）")
+cat("[確認 4] 書き込み先は保護対象ディレクトリと交わらない\n")
+cat("")
+```
+
+```{r production-run, eval=RUN_PRODUCTION}
+t_p0 <- Sys.time()
+prod_fixed   <- run_arm("fixed",   B_PRODUCTION)
+prod_widened <- run_arm("widened", B_PRODUCTION)
+prod_results <- bind_rows(prod_fixed, prod_widened)
+cat(sprintf("production done in %.1f min\n",
+            as.numeric(difftime(Sys.time(), t_p0, units = "mins"))))
+
+saveRDS(prod_results,
+        file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/.prod_raw.rds"))
+cat("[退避] data/03_simulation/phase1_bounds_fixed/.prod_raw.rds に生の結果を書き出した\n")
+
+check_arm_results(
+  prod_results,
+  label   = sprintf("B=%d 本番", B_PRODUCTION),
+  out_csv = file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/inf_identity_production.csv"),
+  B_expected = B_PRODUCTION
+)
+
+unlink(file.path(PROJ, "data/03_simulation/phase1_bounds_fixed/.prod_raw.rds"))
+cat("[退避] 3 検査に合格したため .prod_raw.rds を削除した\n")
+
+for (a in c("fixed", "widened")) {
+  outdir <- file.path(PROJ, "data/03_simulation", BOUNDS_ARM_OUTPUT_DIR[[a]])
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  dat <- prod_results %>% filter(arm == a)
+  for (ds in DATASETS) {
+    sub <- dat %>% filter(dataset == ds)
+    write_csv(sub, file.path(outdir, sprintf("%s_phase1_%s.csv", ds, a)))
+    write_parquet(sub, file.path(outdir, sprintf("%s_phase1_%s.parquet", ds, a)))
+  }
+  write_csv(dat, file.path(outdir, sprintf("all_phase1_%s.csv", a)))
+  write_parquet(dat, file.path(outdir, sprintf("all_phase1_%s.parquet", a)))
+}
+```
+
+```{r session-info}
+sessionInfo()
+```
+

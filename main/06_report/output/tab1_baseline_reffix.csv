@@ -1,0 +1,6 @@
+"Dataset","N","Events","q","Event rate","C-index","Test C-index","Sig. coef."
+"lung",168,121,7,0.72,0.651154097747874,0.613998534036399,"3/7 (sex, ph.ecog, ph.karno)"
+"pbc",312,125,17,0.401,0.856942833139977,0.830899207292095,"8/17 (age, edema, bili, albumin, copper, ast, protime, stage)"
+"colon",929,468,11,0.504,0.671072015278157,0.658829536480965,"5/12 (nodes, extent, surg, node4, rxLev+5FU)"
+"rotterdam",2982,1518,9,0.509,0.678977441770819,0.674905928732623,"6/10 (age, meno, size>50, size20-50, grade, nodes)"
+"flchain",6524,1962,7,0.301,0.790268797394308,0.790541668459682,"4/7 (age, sexM, sample.yr, lambda)"

@@ -1,0 +1,497 @@
+---
+title: "参照レベル修正アーム（in-sample）"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(width = 130)
+```
+
+```{r libs}
+library(survival)
+library(dplyr)
+library(readr)
+library(arrow)
+library(knitr)
+library(callr)
+
+PROJECT_DIR <- "/home/rstudio/project"
+REFFIX_SMOKE <- identical(Sys.getenv("REFFIX_SMOKE"), "1")
+OUT_DIR     <- file.path(PROJECT_DIR, if (REFFIX_SMOKE) "data/variants/reffix_smoke" else "data/03_simulation/reffix")
+PREP_DIR    <- file.path(PROJECT_DIR, "data/01_prepared")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+source(file.path(PROJECT_DIR, "main/03_simulation/R/dp_fast.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_survival_time.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_event_indicator.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase2.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/survival_stacking.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R"))
+source(file.path(PROJECT_DIR, "main/03_simulation/R/data_split.R"))
+source(file.path(PROJECT_DIR, "main/03_simulation/R/simulation_engine.R"))
+
+BASE_SEED <- 42L
+DATASET_SEED_OFFSET <- c(lung = 0L, pbc = 100000L, colon = 200000L,
+                         rotterdam = 300000L, flchain = 400000L)
+OUTPUT_SEED_OFFSET <- 0L
+DATASETS <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+
+B_TEST <- 10L
+B_PROD <- 1000L
+B <- if (REFFIX_SMOKE) B_TEST else B_PROD
+cat(sprintf("B = %d（REFFIX_SMOKE=1 でスモーク実行）\n", B))
+
+PREV_DIR <- file.path(tempdir(), "reffix_prev")
+dir.create(PREV_DIR, showWarnings = FALSE, recursive = TRUE)
+prev_files <- list.files(OUT_DIR, pattern = "\\.parquet$", full.names = TRUE)
+if (length(prev_files) > 0) file.copy(prev_files, PREV_DIR, overwrite = TRUE)
+cat(sprintf("前回実行の退避: %d 件\n", length(prev_files)))
+
+raw <- setNames(lapply(DATASETS, function(d)
+  as.data.frame(read_csv(file.path(PREP_DIR, paste0(d, "_prepared.csv")),
+                         show_col_types = FALSE))), DATASETS)
+
+dat <- setNames(lapply(DATASETS, function(d) set_reference_levels(raw[[d]], d)), DATASETS)
+
+ref_tbl <- bind_rows(lapply(DATASETS, function(d) {
+  rl <- REFERENCE_LEVELS[[d]]
+  if (length(rl) == 0) return(tibble(dataset = d, 変数 = "—", 参照 = "—", 水準順 = "—"))
+  tibble(dataset = d, 変数 = names(rl), 参照 = unlist(rl),
+         水準順 = sapply(names(rl), function(v) paste(levels(dat[[d]][[v]]), collapse = ", ")))
+}))
+kable(ref_tbl, caption = "本アームで適用した参照レベル（REFERENCE_LEVELS）")
+```
+
+```{r default-invariance}
+inv <- bind_rows(lapply(DATASETS, function(d) {
+  x1 <- dat[[d]]
+  fac_cols <- names(x1)[vapply(x1, is.factor, logical(1))]
+  set.seed(11); a  <- perturb_covariates_phase1_fast(x1, CLIPPING_BOUNDS[[d]], 1.0, COVARIATE_TYPES[[d]])
+  set.seed(11); tt <- perturb_covariates_phase1_fast(x1, CLIPPING_BOUNDS[[d]], 1.0, COVARIATE_TYPES[[d]],
+                                                     preserve_factor_levels = TRUE)
+  set.seed(11); ff <- perturb_covariates_phase1_fast(x1, CLIPPING_BOUNDS[[d]], 1.0, COVARIATE_TYPES[[d]],
+                                                     preserve_factor_levels = FALSE)
+  tibble(dataset = d,
+         `factor 共変量` = if (length(fac_cols)) paste(fac_cols, collapse = ", ") else "—",
+         `既定 = TRUE 明示` = identical(a, tt),
+         `FALSE 明示は投稿版の挙動` = if (length(fac_cols) == 0) NA
+           else all(vapply(fac_cols, function(k) is.character(ff[[k]]), logical(1))),
+         `摂動値は既定でも FALSE でも同一` = all(vapply(names(a), function(k)
+           identical(as.character(a[[k]]), as.character(ff[[k]])), logical(1))))
+}))
+kable(inv, caption = "既定の切り替えで何が変わり、何が変わらないか（Phase 1 経路）")
+stopifnot(all(inv$`既定 = TRUE 明示`),
+          all(inv$`摂動値は既定でも FALSE でも同一`),
+          any(inv$`factor 共変量` != "—"),
+          all(na.omit(inv$`FALSE 明示は投稿版の挙動`)))
+cat("既定は TRUE 明示と一致し、FALSE 明示で投稿版の挙動が再現でき、摂動値は不変 ✅\n")
+```
+
+```{r default-invariance-p23}
+inv23 <- bind_rows(lapply(DATASETS, function(d) {
+  x1 <- dat[[d]]
+  set.seed(21); a2 <- perturb_all_phase2(x1, CLIPPING_BOUNDS[[d]], T_MAX[[d]], 1.0,
+                                         COVARIATE_TYPES[[d]])
+  set.seed(21); b2 <- perturb_all_phase2(x1, CLIPPING_BOUNDS[[d]], T_MAX[[d]], 1.0,
+                                         COVARIATE_TYPES[[d]], preserve_factor_levels = TRUE)
+  set.seed(21); a3 <- perturb_discrete_phase3(x1, CLIPPING_BOUNDS[[d]], 1.0,
+                                              K_VALUES[[d]], COVARIATE_TYPES[[d]])
+  set.seed(21); b3 <- perturb_discrete_phase3(x1, CLIPPING_BOUNDS[[d]], 1.0,
+                                              K_VALUES[[d]], COVARIATE_TYPES[[d]],
+                                              preserve_factor_levels = TRUE)
+  tibble(dataset = d,
+         `perturb_all_phase2()` = identical(a2, b2),
+         `perturb_discrete_phase3()` = identical(a3, b3))
+}))
+kable(inv23, caption = "既定 = TRUE 明示（Phase 2 / Phase 3 統合関数）")
+stopifnot(all(inv23$`perturb_all_phase2()`), all(inv23$`perturb_discrete_phase3()`))
+cat("Phase 2 / Phase 3 の統合関数でも既定は TRUE 明示と一致 ✅\n")
+```
+
+```{r scope-check}
+scope <- bind_rows(lapply(DATASETS, function(d) {
+  set.seed(11); a <- perturb_covariates_phase1_fast(raw[[d]], CLIPPING_BOUNDS[[d]], 1.0, COVARIATE_TYPES[[d]],
+                                                    preserve_factor_levels = FALSE)
+  set.seed(11); b <- perturb_covariates_phase1_fast(dat[[d]], CLIPPING_BOUNDS[[d]], 1.0, COVARIATE_TYPES[[d]],
+                                                    preserve_factor_levels = TRUE)
+  fa <- coxph(COX_FORMULAS[[d]], data = a); fb <- coxph(COX_FORMULAS[[d]], data = b)
+  cm <- intersect(names(coef(fa)), names(coef(fb)))
+  non_fac <- cm[!grepl("^rx|^size|^sex", cm)]
+  tibble(dataset = d,
+         係数名が変わる = !identical(names(coef(fa)), names(coef(fb))),
+         `非因子係数の最大差` = max(abs(coef(fa)[non_fac] - coef(fb)[non_fac])),
+         `C-index の差` = abs(concordance(fa)$concordance - concordance(fb)$concordance))
+}))
+kable(scope, digits = 20, caption = "修正で何が変わるか（1 サンプル、ε=1）")
+stopifnot(scope$係数名が変わる == (scope$dataset == "colon"),
+          max(scope$`非因子係数の最大差`) < 1e-12,
+          all(scope$`C-index の差` == 0))
+cat("係数名が変わるのは colon のみ / 非因子係数と C-index は不変 ✅\n")
+```
+
+```{r baseline-reffix}
+baseline_reffix <- bind_rows(lapply(DATASETS, function(d) {
+  fit <- coxph(COX_FORMULAS[[d]], data = dat[[d]])
+  s <- summary(fit)$coefficients
+  ci <- concordance(fit)
+  tibble(dataset = d, variable = rownames(s),
+         beta = s[, "coef"], HR = s[, "exp(coef)"], se = s[, "se(coef)"],
+         z = s[, "z"], p_value = s[, "Pr(>|z|)"],
+         c_index = as.numeric(ci$concordance),
+         c_index_se = sqrt(as.numeric(ci$var)))
+}))
+write_csv(baseline_reffix, file.path(PREP_DIR, "baseline_cox_reffix.csv"))
+
+canon <- read_csv(file.path(PREP_DIR, "baseline_cox_results.csv"), show_col_types = FALSE)
+cmp <- baseline_reffix %>%
+  full_join(canon %>% select(dataset, variable, beta_c = beta, p_c = p_value),
+            by = c("dataset", "variable")) %>%
+  mutate(状態 = case_when(is.na(beta) ~ "canonical のみ",
+                          is.na(beta_c) ~ "reffix のみ",
+                          abs(beta - beta_c) > 1e-10 ~ "値が違う",
+                          TRUE ~ "一致"))
+kable(cmp %>% count(dataset, 状態), caption = "参照レベル適用版ベースラインと canonical の突合")
+kable(cmp %>% filter(状態 != "一致") %>% select(dataset, variable, beta, beta_c, p_value, p_c, 状態),
+      digits = 6, caption = "一致しない係数")
+
+diff_keys <- cmp %>% filter(状態 != "一致") %>% transmute(k = paste(dataset, variable)) %>% pull(k)
+stopifnot(setequal(diff_keys, c("pbc sexf", "pbc sexm")))
+cat("colon rx は canonical と同じ Obs 基準に揃った。残る差は pbc sex の符号反転のみ ✅\n")
+```
+
+```{r phase1-runner}
+run_p1 <- function(data, dataset_name, B, seed) {
+  callr::r(function(data, dataset_name, B, seed) {
+    library(survival); library(dplyr); library(furrr); library(progressr)
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    bounds <- CLIPPING_BOUNDS[[dataset_name]]; types <- COVARIATE_TYPES[[dataset_name]]
+    perturb_fn <- function(data, epsilon) {
+      perturb_covariates_phase1_fast(data, bounds, epsilon, types,
+                                     preserve_factor_levels = TRUE)
+    }
+    res <- run_simulation_batch(data = data, perturb_fn = perturb_fn,
+                                epsilon_values = EPSILON_VALUES, B = B, base_seed = seed,
+                                cox_formula = COX_FORMULAS[[dataset_name]],
+                                dataset_name = dataset_name)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed))
+}
+```
+
+```{r phase1-run, results='hide'}
+t0 <- Sys.time()
+phase1 <- bind_rows(lapply(DATASETS, function(d)
+  run_p1(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]]) %>% mutate(dataset = d)))
+p1_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r phase1-save}
+cat(sprintf("Phase 1: %d 行 / %.1f 分\n", nrow(phase1), as.numeric(p1_time)))
+write_csv(phase1, file.path(OUT_DIR, "all_phase1_reffix.csv"))
+write_parquet(phase1, file.path(OUT_DIR, "all_phase1_reffix.parquet"))
+```
+
+```{r phase2-runner}
+run_p2 <- function(data, dataset_name, B, seed) {
+  callr::r(function(data, dataset_name, B, seed) {
+    library(survival); library(dplyr); library(furrr); library(progressr)
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_survival_time.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_event_indicator.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase2.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    bounds <- CLIPPING_BOUNDS[[dataset_name]]; types <- COVARIATE_TYPES[[dataset_name]]
+    tmax <- T_MAX[[dataset_name]]
+    perturb_fn <- function(data, epsilon) {
+      perturb_all_phase2(data, bounds, tmax, epsilon, types,
+                         preserve_factor_levels = TRUE)$data
+    }
+    res <- run_simulation_batch(data = data, perturb_fn = perturb_fn,
+                                epsilon_values = EPSILON_VALUES, B = B, base_seed = seed,
+                                cox_formula = COX_FORMULAS[[dataset_name]],
+                                dataset_name = dataset_name)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed))
+}
+```
+
+```{r phase2-run, results='hide'}
+t0 <- Sys.time()
+phase2 <- bind_rows(lapply(DATASETS, function(d)
+  run_p2(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]]) %>% mutate(dataset = d)))
+p2_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r phase2-save}
+cat(sprintf("Phase 2: %d 行 / %.1f 分\n", nrow(phase2), as.numeric(p2_time)))
+write_csv(phase2, file.path(OUT_DIR, "all_phase2_reffix.csv"))
+write_parquet(phase2, file.path(OUT_DIR, "all_phase2_reffix.parquet"))
+```
+
+```{r phase3-runner}
+run_p3 <- function(data, dataset_name, B, seed) {
+  callr::r(function(data, dataset_name, B, seed) {
+    library(survival); library(dplyr); library(furrr); library(progressr); library(splines)
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/survival_stacking.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_discrete_time.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_phase3.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    res <- run_simulation_batch_phase3(
+      data = data, epsilon_values = EPSILON_VALUES, B = B, base_seed = seed,
+      K = K_VALUES[[dataset_name]], clipping_bounds = CLIPPING_BOUNDS[[dataset_name]],
+      covariate_types = COVARIATE_TYPES[[dataset_name]],
+      cox_formula = COX_FORMULAS[[dataset_name]], dataset_name = dataset_name,
+      preserve_factor_levels = TRUE)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed))
+}
+```
+
+```{r phase3-run, results='hide'}
+t0 <- Sys.time()
+phase3 <- bind_rows(lapply(DATASETS, function(d)
+  run_p3(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]]) %>% mutate(dataset = d)))
+p3_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r phase3-save}
+cat(sprintf("Phase 3: %d 行 / %.1f 分\n", nrow(phase3), as.numeric(p3_time)))
+write_csv(phase3, file.path(OUT_DIR, "all_phase3_reffix.csv"))
+write_parquet(phase3, file.path(OUT_DIR, "all_phase3_reffix.parquet"))
+```
+
+```{r output-runner}
+run_out <- function(data, dataset_name, B, seed, use_dfbeta, standardize) {
+  callr::r(function(data, dataset_name, B, seed, use_dfbeta, standardize) {
+    library(survival); library(dplyr); library(furrr); library(progressr)
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_output_perturbation.R")
+    source("/home/rstudio/project/main/04_evaluation/R/dp_aware_pvalue.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_output.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    res <- run_output_simulation_batch(
+      data = data, cox_formula = COX_FORMULAS[[dataset_name]],
+      epsilon_values = EPSILON_VALUES, B = B, base_seed = seed,
+      clipping_bounds = CLIPPING_BOUNDS[[dataset_name]],
+      covariate_types = COVARIATE_TYPES[[dataset_name]],
+      dataset_name = dataset_name, standardize = standardize, use_dfbeta = use_dfbeta)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed,
+                 use_dfbeta = use_dfbeta, standardize = standardize))
+}
+```
+
+```{r output-run, results='hide'}
+t0 <- Sys.time()
+out_dfbeta <- bind_rows(lapply(DATASETS, function(d)
+  run_out(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]] + OUTPUT_SEED_OFFSET,
+          use_dfbeta = TRUE, standardize = FALSE) %>% mutate(dataset = d)))
+out_std <- bind_rows(lapply(DATASETS, function(d)
+  run_out(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]] + OUTPUT_SEED_OFFSET,
+          use_dfbeta = FALSE, standardize = TRUE) %>% mutate(dataset = d)))
+out_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r output-save}
+cat(sprintf("出力摂動: dfbeta %d 行 / std %d 行 / %.1f 分\n",
+            nrow(out_dfbeta), nrow(out_std), as.numeric(out_time)))
+write_csv(out_dfbeta, file.path(OUT_DIR, "all_output_dfbeta_reffix.csv"))
+write_parquet(out_dfbeta, file.path(OUT_DIR, "all_output_dfbeta_reffix.parquet"))
+write_csv(out_std, file.path(OUT_DIR, "all_output_std_reffix.csv"))
+write_parquet(out_std, file.path(OUT_DIR, "all_output_std_reffix.parquet"))
+```
+
+```{r compare-existing}
+COMPARE_OK <- (B == B_PROD)
+if (!COMPARE_OK) {
+  cat(sprintf("B = %d はスモークのため既存アームとの照合をスキップする（シード式が B を含むため）\n", B))
+}
+```
+
+```{r compare-setup}
+old_paths <- c(
+  phase1 = "phase1_covariates/all_phase1_results.parquet",
+  phase2 = "phase2_full_input/all_phase2_results.parquet",
+  phase3 = "phase3_discrete/all_phase3_results.parquet",
+  output_dfbeta = "output_perturbation/output_perturbation_dfbeta_all.parquet",
+  output_std    = "output_perturbation/output_perturbation_std_all.parquet"
+)
+new_tbl <- list(phase1 = phase1, phase2 = phase2, phase3 = phase3,
+                output_dfbeta = out_dfbeta, output_std = out_std)
+
+key_cols <- c("dataset", "variable", "epsilon", "iteration")
+num_cols <- c("beta", "se", "p_value", "c_index")
+
+rel_diff <- function(a, b) {
+  d <- abs(a - b) / pmax(1, abs(a), abs(b), na.rm = TRUE)
+  d[is.na(a) & is.na(b)] <- 0
+  d[xor(is.na(a), is.na(b))] <- Inf
+  d
+}
+
+present_original <- file.exists(file.path(PROJECT_DIR, "data/03_simulation", old_paths))
+if (any(present_original) && !all(present_original))
+  stop("The submission-version arm is only partly present: ", paste(old_paths[!present_original], collapse = ", "))
+HAS_ORIGINAL_ARM <- all(present_original)
+if (COMPARE_OK && !HAS_ORIGINAL_ARM)
+  cat("The submission-version arm is not present; the comparison with it is skipped.\n")
+```
+
+```{r compare-existing-run, eval=COMPARE_OK && HAS_ORIGINAL_ARM}
+cmp_rows <- bind_rows(lapply(names(old_paths), function(arm) {
+  f <- file.path(PROJECT_DIR, "data/03_simulation", old_paths[[arm]])
+  if (!file.exists(f)) return(tibble(arm = arm, dataset = NA_character_,
+                                     状態 = "既存ファイルなし", n = NA_integer_,
+                                     最大相対差 = NA_real_))
+  old <- as.data.frame(read_parquet(f))
+  new <- as.data.frame(new_tbl[[arm]])
+  if (!all(key_cols %in% names(old)) || !all(key_cols %in% names(new)))
+    return(tibble(arm = arm, dataset = NA_character_, 状態 = "キー列なし", n = NA_integer_,
+                  最大相対差 = NA_real_))
+  cols <- intersect(intersect(names(old), names(new)), c(key_cols, num_cols))
+  j <- inner_join(old[, cols], new[, cols], by = key_cols, suffix = c("_o", "_n"))
+  nc <- intersect(num_cols, cols)
+  j$maxdiff <- do.call(pmax, c(lapply(nc, function(v)
+    rel_diff(j[[paste0(v, "_o")]], j[[paste0(v, "_n")]])), list(na.rm = TRUE)))
+  j %>% group_by(dataset) %>%
+    summarise(n = n(), 最大相対差 = max(maxdiff, na.rm = TRUE), .groups = "drop") %>%
+    mutate(arm = arm, .before = 1) %>%
+    mutate(状態 = case_when(最大相対差 == 0 ~ "完全一致",
+                            最大相対差 < 1e-10 ~ sprintf("数値誤差内（%.1e）", 最大相対差),
+                            TRUE ~ sprintf("差あり（%.3g）", 最大相対差))) %>%
+    select(arm, dataset, 状態, n, 最大相対差)
+}))
+kable(cmp_rows, caption = "既存アームとの行単位照合（キーが一致する行のみ）")
+
+unmatched <- bind_rows(lapply(names(old_paths), function(arm) {
+  f <- file.path(PROJECT_DIR, "data/03_simulation", old_paths[[arm]])
+  if (!file.exists(f)) return(NULL)
+  old <- as.data.frame(read_parquet(f)); new <- as.data.frame(new_tbl[[arm]])
+  k <- key_cols
+  bind_rows(
+    anti_join(old[, k], new[, k], by = k) %>%
+      distinct(dataset, variable) %>% mutate(arm = arm, side = "既存アームのみ"),
+    anti_join(new[, k], old[, k], by = k) %>%
+      distinct(dataset, variable) %>% mutate(arm = arm, side = "本アームのみ"))
+}))
+kable(unmatched %>% arrange(arm, dataset, variable),
+      caption = "突合できなかった (dataset, variable)（想定は colon の rx 係数のみ）")
+stopifnot(nrow(unmatched) > 0,
+          all(unmatched$dataset == "colon"),
+          all(grepl("^rx", unmatched$variable)))
+cat(sprintf("突合できなかったのは colon の rx 係数 %s だけ ✅\n",
+            paste(sort(unique(unmatched$variable)), collapse = ", ")))
+
+n_coef <- vapply(DATASETS, function(d)
+  length(coef(coxph(COX_FORMULAS[[d]], data = dat[[d]]))), integer(1L))
+expect_n <- cmp_rows %>% filter(!is.na(dataset)) %>%
+  mutate(期待件数 = ifelse(dataset == "colon",
+                           (n_coef[["colon"]] - 1L) * length(EPSILON_VALUES) * B,
+                           n_coef[as.character(dataset)] * length(EPSILON_VALUES) * B),
+         一致 = (n == 期待件数))
+kable(expect_n %>% select(arm, dataset, n, 期待件数, 一致),
+      caption = "突合件数と期待件数（colon は対応しない rx 係数 1 本ぶんを差し引く）")
+stopifnot(all(expect_n$一致))
+cat("突合件数はすべて期待どおり（真空成立ではない）✅\n")
+
+noncolon <- cmp_rows %>% filter(!is.na(dataset), dataset != "colon")
+stopifnot(nrow(noncolon) > 0, all(noncolon$最大相対差 < 1e-10))
+cat(sprintf("colon 以外の %d 条件がすべて一致（ビット一致 %d 件 / 数値誤差内 %d 件、最大相対差 %.1e）✅\n",
+            nrow(noncolon), sum(noncolon$最大相対差 == 0), sum(noncolon$最大相対差 > 0),
+            max(noncolon$最大相対差)))
+colon_rows <- cmp_rows %>% filter(dataset == "colon")
+cat(sprintf("colon は %d 条件中 %d 条件で差がある（rx 係数の対比が変わるため）\n",
+            nrow(colon_rows), sum(colon_rows$最大相対差 > 1e-10)))
+
+colon_names <- bind_rows(lapply(names(new_tbl), function(arm) {
+  v <- new_tbl[[arm]] %>% filter(dataset == "colon", grepl("^rx", variable)) %>%
+    distinct(variable) %>% arrange(variable) %>% pull(variable)
+  tibble(arm = arm, rx係数 = paste(v, collapse = ", "))
+}))
+kable(colon_names, caption = "本アームの colon rx 係数名（すべて Obs 基準）")
+stopifnot(all(colon_names$rx係数 == "rxLev, rxLev+5FU"))
+cat("colon の rx 係数は全アームで対照群 Obs 基準に揃った ✅\n")
+```
+
+```{r self-repro, eval=COMPARE_OK}
+self_paths <- c(phase1 = "all_phase1_reffix.parquet",
+                phase2 = "all_phase2_reffix.parquet",
+                phase3 = "all_phase3_reffix.parquet",
+                output_dfbeta = "all_output_dfbeta_reffix.parquet",
+                output_std    = "all_output_std_reffix.parquet")
+self_rows <- bind_rows(lapply(names(self_paths), function(arm) {
+  f <- file.path(PREV_DIR, self_paths[[arm]])
+  if (!file.exists(f)) return(tibble(arm = arm, 状態 = "前回実行なし（初回）",
+                                     n = NA_integer_, 最大相対差 = NA_real_))
+  prev <- as.data.frame(read_parquet(f)); cur <- as.data.frame(new_tbl[[arm]])
+  cols <- intersect(intersect(names(prev), names(cur)), c(key_cols, num_cols))
+  j <- inner_join(prev[, cols], cur[, cols], by = key_cols, suffix = c("_p", "_c"))
+  nc <- intersect(num_cols, cols)
+  md <- do.call(pmax, c(lapply(nc, function(v)
+    rel_diff(j[[paste0(v, "_p")]], j[[paste0(v, "_c")]])), list(na.rm = TRUE)))
+  tibble(arm = arm,
+         状態 = if (max(md) == 0) "ビット一致" else sprintf("差あり（%.1e）", max(md)),
+         n = nrow(j), 最大相対差 = max(md))
+}))
+kable(self_rows, caption = "前回の本アーム実行との突合（自己再現性）")
+if (all(!is.na(self_rows$最大相対差))) {
+  cat(sprintf("自己再現性: %d アーム中 %d アームがビット一致\n",
+              nrow(self_rows), sum(self_rows$最大相対差 == 0)))
+}
+```
+
+```{r summary}
+tibble(
+  アーム = c("Phase 1", "Phase 2", "Phase 3", "出力摂動 (dfbeta)", "出力摂動 (std)"),
+  行数 = c(nrow(phase1), nrow(phase2), nrow(phase3), nrow(out_dfbeta), nrow(out_std)),
+  収束率 = sprintf("%.4f", c(mean(phase1$converged), mean(phase2$converged), mean(phase3$converged),
+                             mean(out_dfbeta$converged), mean(out_std$converged)))
+) %>% kable(caption = sprintf("本アームの実行結果（B = %d）", B))
+
+cat(sprintf("\n合計所要: %.1f 分\n",
+            as.numeric(p1_time) + as.numeric(p2_time) + as.numeric(p3_time) + as.numeric(out_time)))
+cat(sprintf("出力先: %s\n", OUT_DIR))
+```
+
+```{r session-info}
+sessionInfo()
+```
+

@@ -1,0 +1,876 @@
+---
+title: "Phase 3 乖離 3 変数の診断"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dpi = 150)
+options(width = 130)
+```
+
+```{r libs}
+library(survival)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(splines)
+library(arrow)
+library(knitr)
+library(kableExtra)
+
+set.seed(42)
+
+project_dir <- "/home/rstudio/project"
+prep_dir    <- file.path(project_dir, "data/01_prepared")
+sim_dir     <- file.path(project_dir, "data/03_simulation")
+eval_dir    <- file.path(project_dir, "data/04_evaluation")
+
+source(file.path(project_dir, "main/03_simulation/R/dp_fast.R"))
+source(file.path(project_dir, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(project_dir, "main/02_dp_mechanisms/R/survival_stacking.R"))
+source(file.path(project_dir, "main/02_dp_mechanisms/R/dp_discrete_time.R"))
+source(file.path(project_dir, "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R"))
+source(file.path(project_dir, "main/03_simulation/R/simulation_engine.R"))
+
+DATASETS  <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+ALPHA     <- 0.05
+SPLINE_DF <- 3L
+
+TARGETS <- tibble::tribble(
+  ~dataset,   ~variable,
+  "flchain",  "kappa",
+  "lung",     "ph.karno",
+  "flchain",  "sample.yr"
+)
+
+prepared <- setNames(lapply(DATASETS, function(d)
+  read.csv(file.path(prep_dir, paste0(d, "_prepared.csv")))), DATASETS)
+
+for (d in DATASETS) {
+  stopifnot(all(c("time", "status") %in% names(prepared[[d]])),
+            !anyNA(prepared[[d]]))
+}
+cat(sprintf("読み込み: %d データセット / 欠損 0 件 ✅\n", length(prepared)))
+```
+
+```{r cox-baseline}
+cox_fit_ds <- function(d) {
+  fit <- coxph(COX_FORMULAS[[d]], data = prepared[[d]])
+  s <- summary(fit)$coefficients
+  tibble(dataset = d, variable = rownames(s),
+         beta = s[, "coef"], se = s[, "se(coef)"],
+         z = s[, "z"], p_value = s[, "Pr(>|z|)"])
+}
+cox_base <- map_dfr(DATASETS, cox_fit_ds)
+
+canon <- read.csv(file.path(prep_dir, "baseline_cox_results.csv")) %>%
+  select(dataset, variable, beta_canon = beta, se_canon = se, p_canon = p_value)
+
+cmp_canon <- cox_base %>%
+  inner_join(canon, by = c("dataset", "variable")) %>%
+  mutate(d_beta = abs(beta - beta_canon), d_se = abs(se - se_canon), d_p = abs(p_value - p_canon))
+
+canon_summary <- cmp_canon %>%
+  group_by(dataset) %>%
+  summarise(n_matched = n(), max_d_beta = max(d_beta), max_d_p = max(d_p), .groups = "drop") %>%
+  mutate(n_canon = as.integer(table(canon$dataset)[dataset]),
+         n_recomputed = as.integer(table(cox_base$dataset)[dataset]))
+
+kable(canon_summary, digits = 12,
+      caption = "呼び直した Cox とカノニカルな baseline_cox_results.csv の差") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r cox-baseline-check}
+tol <- 1e-10
+off <- cmp_canon %>% filter(d_beta > tol)
+stopifnot(nrow(off) == 1, off$dataset == "colon", off$variable == "rxLev+5FU")
+cat(sprintf("突合: 一致しない係数は %d 件（%s %s のみ、差 %.2e）。§2.4 で説明する ✅\n",
+            nrow(off), off$dataset, off$variable, off$d_beta))
+```
+
+```{r glm-fit-fn}
+fit_discrete <- function(d, K, link = "logit", baseline = "ns") {
+  data <- prepared[[d]]
+  ev <- data$time[data$status == 1]
+  intervals <- suppressWarnings(create_time_intervals(ev, K))
+  stacked <- stack_survival_data(data, intervals)
+  stacked$interval_id <- as.numeric(stacked$interval_id)
+  cov_names <- setdiff(names(data), c("time", "status"))
+  base_term <- if (baseline == "factor") "factor(interval_id)"
+               else sprintf("splines::ns(interval_id, df = %d)", SPLINE_DF)
+  fml <- as.formula(paste("y_ik ~", paste(c(base_term, cov_names), collapse = " + ")))
+
+  warns <- character(0)
+  fit <- withCallingHandlers(
+    glm(fml, data = stacked, family = binomial(link = link)),
+    warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") })
+
+  extract_covariate_coefs(fit) %>%
+    as_tibble() %>%
+    mutate(dataset = d, K_target = as.integer(K), K_actual = nrow(intervals),
+           link = link, baseline = baseline, n_rows = nrow(stacked),
+           glm_converged = fit$converged, n_warn = length(warns)) %>%
+    select(dataset, variable, beta, se, z, p_value, everything())
+}
+```
+
+```{r glm-vs-parquet}
+HAS_ORIGINAL_ARM <- file.exists(file.path(sim_dir, "phase3_discrete/all_phase3_results.parquet"))
+if (!HAS_ORIGINAL_ARM)
+  cat("The submission-version arm is not present; the checks against it are skipped.\n")
+if (HAS_ORIGINAL_ARM) {
+p3_inf <- read_parquet(file.path(sim_dir, "phase3_discrete/all_phase3_results.parquet"),
+                       col_select = c("dataset", "variable", "beta", "se", "p_value",
+                                      "epsilon", "iteration")) %>%
+  filter(is.infinite(epsilon))
+
+det_check <- p3_inf %>%
+  group_by(dataset, variable) %>%
+  summarise(n_iter = n(), sd_beta = sd(beta), sd_se = sd(se), sd_p = sd(p_value), .groups = "drop")
+stopifnot(nrow(det_check) == 53, all(det_check$n_iter == 1000),
+          all(det_check$sd_beta == 0), all(det_check$sd_se == 0), all(det_check$sd_p == 0))
+cat(sprintf("決定性: ε=∞ の %d 係数 × %d 反復すべてで β・SE・p の標準偏差が厳密に 0 ✅\n",
+            nrow(det_check), max(det_check$n_iter)))
+}
+
+fit_pipeline_inf <- function(d) {
+  p3 <- perturb_discrete_phase3(prepared[[d]], CLIPPING_BOUNDS[[d]], Inf,
+                                K_VALUES[[d]], COVARIATE_TYPES[[d]])
+  cov_names <- setdiff(names(prepared[[d]]), c("time", "status"))
+  extract_covariate_coefs(fit_discrete_cox(p3$stacked_data, cov_names, spline_df = SPLINE_DF)) %>%
+    as_tibble() %>% mutate(dataset = d)
+}
+
+pipe_base <- map_dfr(DATASETS, fit_pipeline_inf)
+
+if (HAS_ORIGINAL_ARM) {
+repro <- pipe_base %>%
+  select(dataset, variable, beta, se, p_value) %>%
+  inner_join(p3_inf %>% distinct(dataset, variable, .keep_all = TRUE) %>%
+               select(dataset, variable, beta_pq = beta, se_pq = se, p_pq = p_value),
+             by = c("dataset", "variable")) %>%
+  mutate(d_beta = abs(beta - beta_pq), d_se = abs(se - se_pq), d_p = abs(p_value - p_pq))
+
+stopifnot(nrow(repro) == 53,
+          max(repro$d_beta) < 1e-12, max(repro$d_se) < 1e-12, max(repro$d_p) < 1e-12)
+cat(sprintf("再現: シミュレーション経路の直接適合が parquet の ε=∞ 行 %d 係数すべてと一致（最大差 β %.2e / SE %.2e / p %.2e）✅\n",
+            nrow(repro), max(repro$d_beta), max(repro$d_se), max(repro$d_p)))
+}
+```
+
+```{r clipping-offset}
+glm_base <- map_dfr(DATASETS, ~ fit_discrete(.x, K_VALUES[[.x]], "logit", "ns"))
+
+clip_offset <- glm_base %>%
+  select(dataset, variable, beta, se, p_value) %>%
+  inner_join(pipe_base %>% select(dataset, variable, beta_pipe = beta,
+                                  se_pipe = se, p_pipe = p_value),
+             by = c("dataset", "variable")) %>%
+  mutate(d_beta_rel = abs(beta - beta_pipe) / pmax(abs(beta_pipe), .Machine$double.eps),
+         d_p = abs(p_value - p_pipe),
+         flip = (p_value < ALPHA) != (p_pipe < ALPHA))
+
+kable(clip_offset %>% group_by(dataset) %>%
+        summarise(n = n(), max_rel_dbeta = max(d_beta_rel), max_dp = max(d_p),
+                  n_decision_flip = sum(flip), .groups = "drop"),
+      digits = 12, caption = "クリッピングなし（ラダー）とパイプライン経路の差") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(max(clip_offset$d_beta_rel) < 1e-5, !any(clip_offset$flip))
+cat(sprintf("差は β の相対で最大 %.2e、p で最大 %.2e、有意性が変わる係数は %d 件 ✅\n",
+            max(clip_offset$d_beta_rel), max(clip_offset$d_p), sum(clip_offset$flip)))
+
+zero_ds <- clip_offset %>% group_by(dataset) %>%
+  summarise(all_exact = max(d_beta_rel) == 0, .groups = "drop")
+kable(zero_ds, caption = "クリッピングの影響を受けるデータセット") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(identical(sort(zero_ds$dataset[!zero_ds$all_exact]), "pbc"))
+n_clipped <- sum(prepared$pbc$age < CLIPPING_BOUNDS$pbc$age[1] |
+                 prepared$pbc$age > CLIPPING_BOUNDS$pbc$age[2])
+cat(sprintf("影響を受けるのは pbc のみ。境界の外に出る観測は %d 件、最大ずれ %.4f 歳 ✅\n",
+            n_clipped,
+            max(abs(pmin(pmax(prepared$pbc$age, CLIPPING_BOUNDS$pbc$age[1]),
+                         CLIPPING_BOUNDS$pbc$age[2]) - prepared$pbc$age))))
+```
+
+```{r reference-levels}
+canon_only <- setdiff(paste(canon$dataset, canon$variable), paste(cox_base$dataset, cox_base$variable))
+recomp_only <- setdiff(paste(cox_base$dataset, cox_base$variable), paste(canon$dataset, canon$variable))
+
+ref_tbl <- tibble(
+  データセット = c("pbc", "colon", "colon"),
+  係数 = c("sex", "rx（2 値対比）", "rx（Lev+5FU の対比）"),
+  `canonical 側` = c("sexf（参照 m）", "rxLev（参照 Obs）", "rxLev+5FU（Lev+5FU vs Obs）"),
+  `インサンプル側` = c("sexm（参照 f）", "rxObs（参照 Lev）", "rxLev+5FU（Lev+5FU vs Lev）"),
+  影響 = c("符号反転のみ。|z| と p は同一",
+           "名前が違うため既存規約では両方とも落ちる",
+           "**同名だが対比が違う**。p は 2.23e-05 vs 3.32e-05 でともに有意")
+)
+kable(ref_tbl, caption = "参照レベルの食い違い（canonical 対 インサンプル成果物）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat(sprintf("canonical にのみある係数: %s\nインサンプル側にのみある係数: %s\n",
+            paste(canon_only, collapse = ", "), paste(recomp_only, collapse = ", ")))
+```
+
+```{r reference-levels-paths, eval=HAS_ORIGINAL_ARM}
+rx_names_of <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  read_parquet(path, col_select = c("dataset", "variable", "epsilon")) %>%
+    filter(dataset == "colon", grepl("^rx", variable)) %>%
+    mutate(eps_grp = ifelse(is.infinite(epsilon), "Inf", "finite")) %>%
+    distinct(eps_grp, variable) %>%
+    group_by(eps_grp) %>%
+    summarise(vars = paste(sort(variable), collapse = ", "), .groups = "drop")
+}
+paths <- c(
+  `インサンプル Phase 1` = "phase1_covariates/all_phase1_results.parquet",
+  `インサンプル Phase 2` = "phase2_full_input/all_phase2_results.parquet",
+  `インサンプル Phase 3` = "phase3_discrete/all_phase3_results.parquet",
+  `train/test Phase 1`   = "traintest/all_phase1_traintest.parquet",
+  `train/test Phase 2`   = "traintest/all_phase2_traintest.parquet",
+  `train/test Phase 3`   = "traintest/all_phase3_traintest.parquet",
+  `train/test 出力摂動`  = "traintest/all_output_dfbeta_traintest.parquet",
+  `インサンプル 出力摂動 (dfbeta)` = "output_perturbation/output_perturbation_dfbeta_all.parquet",
+  `インサンプル 出力摂動 (std)`    = "output_perturbation/output_perturbation_std_all.parquet"
+)
+ref_paths <- map_dfr(names(paths), function(nm) {
+  r <- rx_names_of(file.path(sim_dir, paths[[nm]]))
+  if (is.null(r)) return(NULL)
+  pick <- function(g) { v <- r$vars[r$eps_grp == g]; if (length(v) == 1L) v else NA_character_ }
+  tibble(経路 = nm, `ε=∞ の係数名` = pick("Inf"), `有限 ε の係数名` = pick("finite"))
+})
+kable(ref_paths, caption = "colon `rx` の係数名（= 参照レベル）を成果物から直接読んだもの") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+tt_phase <- ref_paths %>% filter(grepl("^train/test Phase", 経路))
+tt_out   <- ref_paths %>% filter(grepl("^train/test 出力摂動", 経路))
+ins      <- ref_paths %>% filter(grepl("^インサンプル Phase", 経路))
+ins_out  <- ref_paths %>% filter(grepl("^インサンプル 出力摂動", 経路))
+stopifnot(
+  nrow(ref_paths) == 9,
+  nrow(tt_phase) == 3, nrow(tt_out) == 1, nrow(ins) == 3, nrow(ins_out) == 2,
+  all(tt_phase$`ε=∞ の係数名` == "rxLev, rxLev+5FU"),
+  all(tt_phase$`有限 ε の係数名` == "rxLev+5FU, rxObs"),
+  tt_out$`ε=∞ の係数名` == tt_out$`有限 ε の係数名`,
+  tt_out$`ε=∞ の係数名` == "rxLev, rxLev+5FU",
+  all(ins$`ε=∞ の係数名` == ins$`有限 ε の係数名`),
+  all(ins$`ε=∞ の係数名` == "rxLev+5FU, rxObs"),
+  all(ins_out$`ε=∞ の係数名` == ins_out$`有限 ε の係数名`),
+  all(ins_out$`ε=∞ の係数名` == "rxLev+5FU, rxObs")
+)
+cat(sprintf(paste0("経路別の参照レベル（%d 経路）: train/test Phase 1-3 のみ ε で係数名が変わる。",
+                   "インサンプルは Phase 1-3・出力摂動とも全 ε で rxObs 基準 ✅\n"), nrow(ref_paths)))
+```
+
+```{r reference-levels-mechanism}
+source(file.path(project_dir, "main/03_simulation/R/data_split.R"))
+
+sp <- stratified_train_test_split(prepared$colon, test_ratio = 0.3, seed = SPLIT_BASE_SEED + 1L)
+tr <- set_reference_levels(sp$train, "colon")
+stopifnot(is.factor(tr$rx), levels(tr$rx)[1] == "Obs")
+
+mech <- map_dfr(c(Inf, 10), function(e) {
+  set.seed(42)
+  pd <- perturb_covariates_phase1_fast(tr, CLIPPING_BOUNDS$colon, e, COVARIATE_TYPES$colon,
+                                       preserve_factor_levels = FALSE)
+  fit <- coxph(COX_FORMULAS$colon, data = pd)
+  tibble(epsilon = ifelse(is.infinite(e), "Inf", as.character(e)),
+         クラス = class(pd$rx)[1],
+         水準順 = paste(if (is.factor(pd$rx)) levels(pd$rx) else sort(unique(as.character(pd$rx))),
+                        collapse = ","),
+         係数名 = paste(grep("^rx", names(coef(fit)), value = TRUE), collapse = ", "))
+})
+kable(mech, caption = "`dp_rr_categorical_vec()` が factor 水準を落とす（colon `rx`）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(mech$クラス[mech$epsilon == "Inf"] == "factor",
+          mech$クラス[mech$epsilon == "10"] == "character",
+          mech$係数名[mech$epsilon == "Inf"] == "rxLev, rxLev+5FU",
+          mech$係数名[mech$epsilon == "10"] == "rxLev+5FU, rxObs")
+cat("原因: ε=∞ は factor のまま、有限 ε は character に落ちて参照が Lev に戻る ✅\n")
+
+mech_fixed <- map_dfr(c(Inf, 10), function(e) {
+  set.seed(42)
+  pd <- perturb_covariates_phase1_fast(tr, CLIPPING_BOUNDS$colon, e, COVARIATE_TYPES$colon)
+  fit <- coxph(COX_FORMULAS$colon, data = pd)
+  tibble(epsilon = ifelse(is.infinite(e), "Inf", as.character(e)),
+         クラス = class(pd$rx)[1],
+         水準順 = paste(levels(pd$rx), collapse = ","),
+         係数名 = paste(grep("^rx", names(coef(fit)), value = TRUE), collapse = ", "))
+})
+kable(mech_fixed, caption = "現行の既定（`preserve_factor_levels = TRUE`）では ε によらず参照が `Obs`") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(all(mech_fixed$クラス == "factor"),
+          all(mech_fixed$係数名 == "rxLev, rxLev+5FU"),
+          identical(mech$水準順[mech$epsilon == "Inf"], mech_fixed$水準順[mech_fixed$epsilon == "Inf"]))
+cat("現行の既定では有限 ε でも factor のまま返り、参照は `Obs` に留まる ✅\n")
+
+mk_ref <- function(ref) {
+  d <- prepared$colon
+  d$rx <- factor(as.character(d$rx), levels = c(ref, setdiff(c("Obs", "Lev", "Lev+5FU"), ref)))
+  coxph(COX_FORMULAS$colon, data = d)
+}
+f_obs <- mk_ref("Obs"); f_lev <- mk_ref("Lev")
+non_rx <- grep("^rx", names(coef(f_obs)), value = TRUE, invert = TRUE)
+invariance <- tibble(
+  量 = c("rx 以外の 10 係数の最大差", "対数尤度の差", "concordance の差"),
+  差 = c(max(abs(coef(f_obs)[non_rx] - coef(f_lev)[non_rx])),
+         abs(f_obs$loglik[2] - f_lev$loglik[2]),
+         abs(concordance(f_obs)$concordance - concordance(f_lev)$concordance))
+)
+kable(invariance, digits = 20, caption = "参照レベルを変えたときの当てはめ量の差") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(length(non_rx) == 10, invariance$差[1] < 1e-12,
+          invariance$差[2] < 1e-9, invariance$差[3] == 0)
+cat(sprintf("再パラメータ化の不変性: 他係数 %.2e / 対数尤度 %.2e / concordance %.0f ✅\n",
+            invariance$差[1], invariance$差[2], invariance$差[3]))
+
+rx_contrasts <- bind_rows(
+  as.data.frame(summary(f_obs)$coefficients)[grep("^rx", names(coef(f_obs))), ] %>%
+    tibble::rownames_to_column("係数") %>% mutate(参照 = "Obs"),
+  as.data.frame(summary(f_lev)$coefficients)[grep("^rx", names(coef(f_lev))), ] %>%
+    tibble::rownames_to_column("係数") %>% mutate(参照 = "Lev")
+) %>% select(参照, 係数, beta = coef, se = `se(coef)`, p = `Pr(>|z|)`)
+kable(rx_contrasts, digits = 6, caption = "2 つの対比（Levamisole 単剤はほぼ無効なので差は小さい）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r discordance-table}
+discord <- cox_base %>%
+  rename(beta_cox = beta, se_cox = se, z_cox = z, p_cox = p_value) %>%
+  inner_join(glm_base %>% select(dataset, variable, beta_glm = beta, se_glm = se,
+                                 z_glm = z, p_glm = p_value, K_actual),
+             by = c("dataset", "variable")) %>%
+  mutate(sig_cox = p_cox < ALPHA,
+         sig_glm = p_glm < ALPHA,
+         discordant = sig_cox != sig_glm,
+         direction = case_when(sig_cox & !sig_glm ~ "Cox 有意 → GLM 非有意（LSR 側）",
+                               !sig_cox & sig_glm ~ "Cox 非有意 → GLM 有意（FPR 側）",
+                               TRUE ~ "一致"),
+         dlog_z = log(abs(z_glm)) - log(abs(z_cox)),
+         z_ratio = abs(z_glm) / abs(z_cox)) %>%
+  mutate(dataset = factor(dataset, levels = DATASETS)) %>%
+  arrange(dataset, variable)
+
+summ <- discord %>%
+  group_by(dataset) %>%
+  summarise(n_coef = n(), n_discordant = sum(discordant),
+            median_z_ratio = median(z_ratio),
+            min_z_ratio = min(z_ratio), max_z_ratio = max(z_ratio), .groups = "drop")
+kable(summ, digits = 3, caption = "α=0.05 での乖離係数数と |z| 比の分布") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+kable(discord %>% filter(discordant) %>%
+        select(dataset, variable, beta_cox, se_cox, p_cox, beta_glm, se_glm, p_glm,
+               z_ratio, direction),
+      digits = 5, caption = "乖離した係数（α=0.05）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r exclusion-check}
+PHASE3_LSR_EXCLUDE <- data.frame(dataset = c("lung", "flchain"),
+                                 variable = c("ph.karno", "sample.yr"))
+PHASE3_FPR_EXCLUDE <- data.frame(dataset = "flchain", variable = "kappa")
+expected <- rbind(PHASE3_LSR_EXCLUDE, PHASE3_FPR_EXCLUDE) %>%
+  arrange(dataset, variable) %>% mutate(key = paste(dataset, variable))
+
+found <- discord %>% filter(discordant) %>%
+  transmute(key = paste(dataset, variable)) %>% arrange(key)
+
+stopifnot(setequal(found$key, expected$key), nrow(found) == 3)
+cat(sprintf("除外規約との突合: 独立に再判定した乖離集合 {%s} が evaluation.Rmd のハードコード値と完全一致 ✅\n",
+            paste(sort(found$key), collapse = ", ")))
+
+stopifnot(setequal(found$key, paste(TARGETS$dataset, TARGETS$variable)))
+cat("実験 H の診断対象 3 変数とも一致 ✅\n")
+
+dropped <- tibble(
+  dataset  = c("pbc", "colon"),
+  var_cox  = c("sexf", "rxLev"),
+  var_glm  = c("sexm", "rxObs")) %>%
+  mutate(p_cox = map2_dbl(dataset, var_cox, ~ canon$p_canon[canon$dataset == .x & canon$variable == .y]),
+         p_glm = map2_dbl(dataset, var_glm, ~ glm_base$p_value[glm_base$dataset == .x & glm_base$variable == .y]),
+         sig_cox = p_cox < ALPHA, sig_glm = p_glm < ALPHA, discordant = sig_cox != sig_glm)
+kable(dropped, digits = 5,
+      caption = "既存規約で落とされる 2 係数（参照レベル不一致）— どちらの側でも非有意") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(!any(dropped$discordant))
+cat("落とされる 2 係数はいずれも両側で非有意であり、乖離集合は 51 係数扱いでも 53 係数扱いでも 3 件で変わらない ✅\n")
+```
+
+```{r ladder}
+cox_coarsened <- function(d, K, ties = "efron") {
+  data <- prepared[[d]]
+  ev <- data$time[data$status == 1]
+  intervals <- suppressWarnings(create_time_intervals(ev, K))
+  k_star <- if (nrow(intervals) > 1)
+    findInterval(data$time, intervals$upper[-nrow(intervals)], left.open = TRUE) + 1L
+  else rep(1L, nrow(data))
+  d2 <- data; d2$time <- k_star
+  warns <- character(0)
+  fit <- withCallingHandlers(
+    coxph(COX_FORMULAS[[d]], data = d2, ties = ties),
+    warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") })
+  s <- summary(fit)$coefficients
+  tibble(dataset = d, variable = rownames(s), beta = s[, "coef"], se = s[, "se(coef)"],
+         z = s[, "z"], p_value = s[, "Pr(>|z|)"],
+         K_target = as.integer(K), K_actual = nrow(intervals),
+         glm_converged = TRUE, n_warn = length(warns))
+}
+
+LADDER_STEPS <- tibble::tribble(
+  ~step, ~model_id,                        ~label,
+  1L,    "A_cox",                          "A. Cox（実時間）",
+  2L,    "Ap_cox_coarsened",               "A'. Cox（時間を k* に粗視化）",
+  3L,    "B_cloglog_factor",               "B. 離散時間 cloglog + factor(k)",
+  4L,    "C_logit_factor",                 "C. 離散時間 logit + factor(k)",
+  5L,    "D_logit_ns",                     "D. 離散時間 logit + ns(k, df=3) = Phase 3"
+)
+
+ladder_ds <- c("lung", "flchain")
+
+ladder <- map_dfr(ladder_ds, function(d) {
+  K <- K_VALUES[[d]]
+  bind_rows(
+    cox_base %>% filter(dataset == d) %>% mutate(model_id = "A_cox", K_actual = NA_integer_),
+    cox_coarsened(d, K) %>% mutate(model_id = "Ap_cox_coarsened") %>% select(-K_target),
+    fit_discrete(d, K, "cloglog", "factor") %>% mutate(model_id = "B_cloglog_factor") %>%
+      select(dataset, variable, beta, se, z, p_value, K_actual, model_id),
+    fit_discrete(d, K, "logit", "factor") %>% mutate(model_id = "C_logit_factor") %>%
+      select(dataset, variable, beta, se, z, p_value, K_actual, model_id),
+    fit_discrete(d, K, "logit", "ns") %>% mutate(model_id = "D_logit_ns") %>%
+      select(dataset, variable, beta, se, z, p_value, K_actual, model_id)
+  ) %>% mutate(K_base = as.integer(K))
+}) %>%
+  left_join(LADDER_STEPS, by = "model_id") %>%
+  mutate(sig = p_value < ALPHA) %>%
+  arrange(dataset, variable, step)
+
+ladder_D <- ladder %>% filter(model_id == "D_logit_ns") %>% select(dataset, variable, beta, se, p_value)
+if (HAS_ORIGINAL_ARM) {
+chk_D <- ladder_D %>% inner_join(repro %>% select(dataset, variable, beta_pq, se_pq, p_pq),
+                                 by = c("dataset", "variable"))
+stopifnot(nrow(chk_D) == 14, max(abs(chk_D$beta - chk_D$beta_pq)) == 0,
+          max(abs(chk_D$se - chk_D$se_pq)) == 0, max(abs(chk_D$p_value - chk_D$p_pq)) == 0)
+cat(sprintf("ラダー段 D の検査: lung・flchain の %d 係数すべてが Phase 3 の ε=∞ 行と厳密に一致 ✅\n", nrow(chk_D)))
+}
+```
+
+```{r ladder-targets}
+ladder_tgt <- ladder %>% semi_join(TARGETS, by = c("dataset", "variable"))
+
+ladder_tgt %>%
+  select(dataset, variable, label, K_actual, beta, se, z, p_value, sig) %>%
+  kable(digits = 5, caption = "ラダー分解（ε=∞、K = K_VALUES）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+
+```{r ladder-decomp}
+STEP_MEANING <- c(
+  "D→C" = "ベースラインハザードの平滑化（ns df=3 → 飽和）",
+  "C→B" = "リンク関数（logit → cloglog）= 分類 (c)",
+  "B→A'" = "推定量（グループ化二項尤度 → Cox 部分尤度）※整合性確認",
+  "A'→A" = "時間の離散化 = 分類 (b)"
+)
+
+decomp <- ladder %>%
+  select(dataset, variable, model_id, z) %>%
+  pivot_wider(names_from = model_id, values_from = z) %>%
+  mutate(
+    `D→C`  = log(abs(C_logit_factor))   - log(abs(D_logit_ns)),
+    `C→B`  = log(abs(B_cloglog_factor)) - log(abs(C_logit_factor)),
+    `B→A'` = log(abs(Ap_cox_coarsened)) - log(abs(B_cloglog_factor)),
+    `A'→A` = log(abs(A_cox))            - log(abs(Ap_cox_coarsened)),
+    total  = log(abs(A_cox))            - log(abs(D_logit_ns)),
+    sum_steps = `D→C` + `C→B` + `B→A'` + `A'→A`
+  )
+
+stopifnot(max(abs(decomp$total - decomp$sum_steps)) < 1e-12)
+cat(sprintf("加法性の検査: 4 段の和と全体差の最大乖離 %.2e（厳密に一致）✅\n",
+            max(abs(decomp$total - decomp$sum_steps))))
+
+decomp_tgt <- decomp %>% semi_join(TARGETS, by = c("dataset", "variable"))
+
+decomp_tgt %>%
+  transmute(dataset, variable,
+            `z (Phase 3)` = D_logit_ns, `z (Cox)` = A_cox,
+            `D→C` , `C→B`, `B→A'`, `A'→A`, `合計` = total,
+            `支配的な段` = c("D→C", "C→B", "B→A'", "A'→A")[
+              apply(abs(cbind(`D→C`, `C→B`, `B→A'`, `A'→A`)), 1, which.max)]) %>%
+  kable(digits = 4, caption = "log|z| の段別分解（正の値 = その段を戻すと |z| が増える）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+decomp_pct <- decomp_tgt %>%
+  transmute(dataset, variable,
+            across(c(`D→C`, `C→B`, `B→A'`, `A'→A`), ~ 100 * (exp(.x) - 1),
+                   .names = "{.col} (%)"),
+            `合計 (%)` = 100 * (exp(total) - 1))
+kable(decomp_pct, digits = 1, caption = "各段が |z| を何 % 動かすか") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r ladder-BA-agreement}
+ba <- decomp %>%
+  transmute(dataset, variable,
+            z_B = B_cloglog_factor, z_Ap = Ap_cox_coarsened,
+            pct = 100 * (exp(`B→A'`) - 1))
+kable(ba %>% arrange(desc(abs(pct))), digits = 3,
+      caption = "段 B → A′ の残差（lung・flchain の全 14 係数）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat(sprintf("残差の絶対値: 中央値 %.2f%% / 最大 %.2f%%（最大は %s %s）\n",
+            median(abs(ba$pct)), max(abs(ba$pct)),
+            ba$dataset[which.max(abs(ba$pct))], ba$variable[which.max(abs(ba$pct))]))
+
+ties_sens <- map_dfr(ladder_ds, function(d)
+  cox_coarsened(d, K_VALUES[[d]], ties = "breslow") %>% mutate(ties = "breslow")) %>%
+  select(dataset, variable, z_breslow = z) %>%
+  inner_join(ba, by = c("dataset", "variable")) %>%
+  mutate(pct_breslow = 100 * (abs(z_breslow) / abs(z_B) - 1))
+kable(ties_sens %>% semi_join(TARGETS, by = c("dataset", "variable")), digits = 3,
+      caption = "A′ のタイ処理を Breslow にした場合（既定は Efron）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r hazard-magnitude}
+hazard_profile <- map_dfr(DATASETS, function(d) {
+  data <- prepared[[d]]
+  ev <- data$time[data$status == 1]
+  intervals <- suppressWarnings(create_time_intervals(ev, K_VALUES[[d]]))
+  st <- stack_survival_data(data, intervals)
+  st$interval_id <- as.numeric(st$interval_id)
+  cov_names <- setdiff(names(data), c("time", "status"))
+  fit <- glm(as.formula(paste("y_ik ~ factor(interval_id) +", paste(cov_names, collapse = " + "))),
+             data = st, family = binomial(link = "cloglog"))
+  h <- fitted(fit)
+  emp <- st %>% group_by(interval_id) %>% summarise(h = sum(y_ik) / n(), .groups = "drop")
+  tibble(dataset = d, K = nrow(intervals), n = nrow(data), events = sum(data$status),
+         h_emp_med = median(emp$h), h_emp_max = max(emp$h),
+         h_fit_med = median(h), h_fit_p90 = quantile(h, 0.9), h_fit_max = max(h),
+         frac_h_gt_10pct = mean(h > 0.1))
+})
+kable(hazard_profile, digits = 4,
+      caption = "K = K_VALUES における区間ハザードの大きさ（cloglog + 飽和ベースライン）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r hazard-leverage}
+lev <- map_dfr(seq_len(nrow(TARGETS)), function(i) {
+  d <- TARGETS$dataset[i]; v <- TARGETS$variable[i]
+  data <- prepared[[d]]
+  ev <- data$time[data$status == 1]
+  intervals <- suppressWarnings(create_time_intervals(ev, K_VALUES[[d]]))
+  st <- stack_survival_data(data, intervals)
+  st$interval_id <- as.numeric(st$interval_id)
+  cov_names <- setdiff(names(data), c("time", "status"))
+  fit <- glm(as.formula(paste("y_ik ~ factor(interval_id) +", paste(cov_names, collapse = " + "))),
+             data = st, family = binomial(link = "cloglog"))
+  st$h <- fitted(fit)
+  q9 <- quantile(data[[v]], 0.9)
+  top <- st[[v]] >= q9
+  stopifnot(any(top), any(!top))
+  tibble(dataset = d, variable = v, q90 = as.numeric(q9),
+         n_rows_top10 = sum(top),
+         h_mean_top10 = mean(st$h[top]), h_max_top10 = max(st$h[top]),
+         h_mean_rest = mean(st$h[!top]))
+})
+kable(lev, digits = 4, caption = "共変量上位 10% の行におけるフィットハザード") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r sample-yr-structure}
+fl <- prepared$flchain
+yr_tbl <- fl %>% group_by(sample.yr) %>%
+  summarise(n = n(), event_rate = mean(status), median_time = median(time),
+            median_time_censored = median(time[status == 0]), max_time = max(time), .groups = "drop")
+kable(yr_tbl, digits = 3, caption = "flchain: 採血年ごとの追跡構造") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+sampleyr_ctx <- yr_tbl %>%
+  mutate(cor_all      = cor(fl$sample.yr, fl$time, method = "spearman"),
+         cor_censored = with(fl[fl$status == 0, ], cor(sample.yr, time, method = "spearman")),
+         cor_event    = with(fl[fl$status == 1, ], cor(sample.yr, time, method = "spearman")))
+cat(sprintf("Spearman 相関 sample.yr vs time: 全体 %.3f / 打ち切り例 %.3f / イベント例 %.3f\n",
+            sampleyr_ctx$cor_all[1], sampleyr_ctx$cor_censored[1], sampleyr_ctx$cor_event[1]))
+```
+
+```{r ksweep, cache=FALSE}
+d_unique <- sapply(DATASETS, function(d)
+  length(unique(prepared[[d]]$time[prepared[[d]]$status == 1])))
+
+K_MAX_CAP <- 100L
+
+k_grid_for <- function(d) {
+  base <- K_VALUES[[d]]
+  g <- c(4L, 6L, base - 2L, base, base + 2L, 20L, 30L, 50L, 75L, 100L)
+  g <- g[g >= 2L]
+  sort(unique(pmin(g, min(K_MAX_CAP, d_unique[[d]]))))
+}
+
+SPECS <- tibble::tribble(
+  ~model_id,            ~link,     ~baseline,
+  "D_logit_ns",         "logit",   "ns",
+  "B_cloglog_factor",   "cloglog", "factor",
+  "C_logit_factor",     "logit",   "factor"
+)
+
+t0 <- Sys.time()
+ksweep <- map_dfr(DATASETS, function(d) {
+  map_dfr(k_grid_for(d), function(K) {
+    map_dfr(seq_len(nrow(SPECS)), function(i)
+      fit_discrete(d, K, SPECS$link[i], SPECS$baseline[i]) %>%
+        mutate(model_id = SPECS$model_id[i]))
+  })
+}) %>%
+  mutate(K_base = as.integer(unlist(K_VALUES[dataset])), sig = p_value < ALPHA)
+cat(sprintf("K 掃引: %d 行 / %.1f 分\n", nrow(ksweep),
+            as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+
+ksweep_cox <- map_dfr(DATASETS, function(d)
+  map_dfr(k_grid_for(d), function(K) cox_coarsened(d, K))) %>%
+  mutate(model_id = "Ap_cox_coarsened", K_base = as.integer(unlist(K_VALUES[dataset])),
+         sig = p_value < ALPHA, link = NA_character_, baseline = NA_character_)
+
+ksweep_all <- bind_rows(
+  ksweep %>% select(dataset, variable, K_target, K_actual, model_id, link, baseline,
+                    beta, se, z, p_value, sig, n_rows, glm_converged, n_warn, K_base),
+  ksweep_cox %>% select(dataset, variable, K_target, K_actual, model_id, link, baseline,
+                        beta, se, z, p_value, sig, glm_converged, n_warn, K_base)
+) %>%
+  mutate(usable = glm_converged & n_warn == 0)
+```
+
+```{r ksweep-convergence}
+conv_tbl <- ksweep_all %>%
+  distinct(dataset, model_id, K_actual, glm_converged, n_warn, usable) %>%
+  filter(!usable) %>%
+  arrange(dataset, model_id, K_actual)
+if (nrow(conv_tbl) == 0) {
+  cat("掃引した全条件で適合が収束した\n")
+} else {
+  kable(conv_tbl, caption = "収束しなかった／警告が出た適合（以降の判定から除外する）") %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE)
+}
+n_cond <- nrow(distinct(ksweep_all, dataset, model_id, K_actual))
+cat(sprintf("除外: %d 条件 / 全 %d 条件（%.1f%%）\n", nrow(conv_tbl), n_cond,
+            100 * nrow(conv_tbl) / n_cond))
+
+core <- ksweep_all %>%
+  filter(model_id == "D_logit_ns",
+         K_target == K_base - 2L | K_target == K_base | K_target == K_base + 2L)
+stopifnot(nrow(core) > 0, all(core$usable))
+cat(sprintf("Phase 3 の仕様（D）は K ∈ {base−2, base, base+2} の全 %d 条件で健全 ✅\n",
+            nrow(distinct(core, dataset, K_actual))))
+
+if (nrow(conv_tbl) > 0) {
+  kable(conv_tbl %>% count(model_id, coarse = K_actual <= 6, name = "n_conditions"),
+        caption = "除外条件の内訳（coarse = K ≤ 6）") %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE)
+}
+```
+
+```{r ksweep-targets}
+ks_tgt <- ksweep_all %>% filter(usable) %>% semi_join(TARGETS, by = c("dataset", "variable"))
+
+ks_tgt %>%
+  filter(model_id %in% c("D_logit_ns", "B_cloglog_factor", "Ap_cox_coarsened")) %>%
+  select(dataset, variable, model_id, K_actual, p_value) %>%
+  pivot_wider(names_from = model_id, values_from = p_value) %>%
+  left_join(cox_base %>% select(dataset, variable, p_cox = p_value), by = c("dataset", "variable")) %>%
+  arrange(dataset, variable, K_actual) %>%
+  kable(digits = 5, caption = "K を変えたときの p 値（ε=∞）。p_cox は実時間 Cox の参照値") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+
+```{r ksweep-resolution}
+resolution <- ks_tgt %>%
+  filter(model_id == "D_logit_ns") %>%
+  left_join(cox_base %>% transmute(dataset, variable, sig_cox = p_value < ALPHA),
+            by = c("dataset", "variable")) %>%
+  mutate(discordant = sig != sig_cox) %>%
+  group_by(dataset, variable) %>%
+  summarise(K_tested = paste(K_actual, collapse = ", "),
+            n_K = n(),
+            n_resolved = sum(!discordant),
+            K_resolved = if (any(!discordant)) paste(K_actual[!discordant], collapse = ", ") else "なし",
+            p_at_Kmax = p_value[which.max(K_actual)],
+            K_max = max(K_actual), .groups = "drop")
+kable(resolution, caption = "Phase 3 の仕様（D）のまま K だけ変えた場合に乖離が消える K") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+around_base <- ks_tgt %>%
+  filter(model_id == "D_logit_ns",
+         K_target == K_base - 2L | K_target == K_base | K_target == K_base + 2L) %>%
+  left_join(cox_base %>% transmute(dataset, variable, p_cox = p_value, sig_cox = p_value < ALPHA),
+            by = c("dataset", "variable")) %>%
+  transmute(dataset, variable, K_actual, p_glm = p_value, sig_glm = sig, p_cox, sig_cox,
+            discordant = sig != sig_cox) %>%
+  arrange(dataset, variable, K_actual)
+kable(around_base, digits = 5, caption = "K ∈ {base−2, base, base+2}") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r ksweep-all-datasets}
+disc_by_K <- ksweep_all %>%
+  filter(usable, model_id == "D_logit_ns") %>%
+  left_join(cox_base %>% transmute(dataset, variable, sig_cox = p_value < ALPHA),
+            by = c("dataset", "variable")) %>%
+  mutate(discordant = sig != sig_cox) %>%
+  group_by(dataset, K_actual) %>%
+  summarise(n_coef = n(), n_discordant = sum(discordant),
+            which = paste(variable[discordant], collapse = ", "), .groups = "drop") %>%
+  mutate(dataset = factor(dataset, levels = DATASETS)) %>%
+  arrange(dataset, K_actual)
+kable(disc_by_K, caption = "K ごとの乖離係数数（Phase 3 の仕様 D、α=0.05、全 5 データセット）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+```{r boundary-quantification}
+z_crit <- qnorm(1 - ALPHA / 2)
+
+boundary <- discord %>%
+  mutate(margin_needed = z_crit / abs(z_cox) - 1,
+         observed_change = z_ratio - 1,
+         p_over_alpha = p_cox / ALPHA) %>%
+  select(dataset, variable, p_cox, p_over_alpha, z_cox, margin_needed,
+         z_glm, observed_change, discordant)
+
+kable(boundary %>% semi_join(TARGETS, by = c("dataset", "variable")), digits = 4,
+      caption = "対象 3 変数: 反転に必要な |z| の変化と実際の変化") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+boundary_ctx <- boundary %>%
+  mutate(near_boundary = abs(margin_needed) <= 0.10) %>%
+  group_by(near_boundary) %>%
+  summarise(n = n(), n_discordant = sum(discordant), .groups = "drop")
+kable(boundary_ctx,
+      caption = "|z| を 10% 動かせば判定が変わる係数か否かで分けた乖離件数（53 係数）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat(sprintf("|観測変化| の中央値は %.1f%%、乖離した 3 件は %s。\n",
+            100 * median(abs(boundary$observed_change)),
+            paste(sprintf("%s %s %.1f%%", boundary$dataset[boundary$discordant],
+                          boundary$variable[boundary$discordant],
+                          100 * boundary$observed_change[boundary$discordant]), collapse = " / ")))
+```
+
+```{r diagnosis}
+get_step <- function(d, v, col) decomp_tgt[[col]][decomp_tgt$dataset == d & decomp_tgt$variable == v]
+pc <- function(x) sprintf("%+.1f%%", 100 * (exp(x) - 1))
+
+diagnosis <- tibble(
+  データセット = c("flchain", "lung", "flchain"),
+  変数 = c("kappa", "ph.karno", "sample.yr"),
+  `主因` = c("(c) リンク関数 + (a) 境界近傍",
+             "(c) リンク関数 + (a) 境界近傍",
+             "(b) 時間の離散化"),
+  `D→C` = c(pc(get_step("flchain", "kappa", "D→C")), pc(get_step("lung", "ph.karno", "D→C")),
+            pc(get_step("flchain", "sample.yr", "D→C"))),
+  `C→B (c)` = c(pc(get_step("flchain", "kappa", "C→B")), pc(get_step("lung", "ph.karno", "C→B")),
+                pc(get_step("flchain", "sample.yr", "C→B"))),
+  `A'→A (b)` = c(pc(get_step("flchain", "kappa", "A'→A")), pc(get_step("lung", "ph.karno", "A'→A")),
+                 pc(get_step("flchain", "sample.yr", "A'→A")))
+)
+kable(diagnosis, caption = "診断の要約（段の符号は「その差を戻すと |z| がどう動くか」）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r write-outputs}
+out_files <- list(
+  phase3_discordance_baseline = discord %>% mutate(dataset = as.character(dataset)) %>%
+    select(dataset, variable, K_actual, beta_cox, se_cox, z_cox, p_cox,
+           beta_glm, se_glm, z_glm, p_glm, sig_cox, sig_glm, discordant, direction,
+           z_ratio, dlog_z),
+  phase3_discordance_ladder = ladder %>%
+    select(dataset, variable, step, model_id, label, K_base, K_actual,
+           beta, se, z, p_value, sig),
+  phase3_discordance_decomp = decomp %>%
+    select(dataset, variable, z_D = D_logit_ns, z_C = C_logit_factor, z_B = B_cloglog_factor,
+           z_Ap = Ap_cox_coarsened, z_A = A_cox,
+           d_baseline = `D→C`, d_link = `C→B`, d_estimator = `B→A'`,
+           d_discretization = `A'→A`, d_total = total),
+  phase3_discordance_ksweep = ksweep_all %>%
+    select(dataset, variable, model_id, link, baseline, K_target, K_actual, K_base,
+           beta, se, z, p_value, sig, glm_converged, n_warn, usable),
+  phase3_discordance_hazard = hazard_profile,
+  phase3_discordance_leverage = lev,
+  phase3_discordance_sampleyr = sampleyr_ctx,
+  phase3_discordance_reflevels = if (HAS_ORIGINAL_ARM) ref_paths %>%
+    rename(path = 経路, vars_inf = `ε=∞ の係数名`, vars_finite = `有限 ε の係数名`),
+  phase3_discordance_refinvariance = invariance %>%
+    rename(quantity = 量, difference = 差),
+  phase3_discordance_boundary = boundary %>% mutate(dataset = as.character(dataset))
+)
+
+out_files <- Filter(Negate(is.null), out_files)
+out_csv  <- paste0(names(out_files), ".csv")
+existing <- list.files(eval_dir)
+stopifnot(all(startsWith(names(out_files), "phase3_discordance_")))
+stopifnot(length(intersect(out_csv, setdiff(existing, out_csv))) == 0)
+cat("出力名の検査: 名前空間 OK / 既存ファイルとの衝突 0 件 ✅\n")
+
+iwalk(out_files, function(df, nm) {
+  path <- file.path(eval_dir, paste0(nm, ".csv"))
+  write.csv(df, path, row.names = FALSE)
+  cat(sprintf("%-38s %5d 行\n", basename(path), nrow(df)))
+})
+```
+
+```{r conclusion}
+tibble(
+  項目 = c(
+    "乖離係数数（α=0.05、53 係数中）",
+    "既存の除外規約との一致",
+    "flchain kappa の主因",
+    "lung ph.karno の主因",
+    "flchain sample.yr の主因",
+    "K を変えたときの挙動（対象 3 変数）",
+    "有限 ε の再実行の要否"
+  ),
+  結果 = c(
+    sprintf("%d 件（%s）。|z| 比の中央値は %.3f で、モデル変更の影響は全体としては小さい",
+            sum(discord$discordant),
+            paste(paste(discord$dataset[discord$discordant], discord$variable[discord$discordant]),
+                  collapse = " / "),
+            median(discord$z_ratio)),
+    "独立に再判定した集合が evaluation.Rmd のハードコード値と完全一致（§3.2）",
+    sprintf("リンク関数 %s / 離散化 %s。Cox の p は α の %.2f 倍で、%.1f%% の |z| 変化で判定が反転する",
+            pc(get_step("flchain", "kappa", "C→B")), pc(get_step("flchain", "kappa", "A'→A")),
+            boundary$p_over_alpha[boundary$dataset == "flchain" & boundary$variable == "kappa"],
+            100 * boundary$margin_needed[boundary$dataset == "flchain" & boundary$variable == "kappa"]),
+    sprintf("リンク関数 %s / 離散化 %s。Cox の p は α の %.2f 倍",
+            pc(get_step("lung", "ph.karno", "C→B")), pc(get_step("lung", "ph.karno", "A'→A")),
+            boundary$p_over_alpha[boundary$dataset == "lung" & boundary$variable == "ph.karno"]),
+    sprintf("離散化 %s が支配的。リンクは %s にすぎず、Cox の p は α の %.3f 倍で境界から遠い",
+            pc(get_step("flchain", "sample.yr", "A'→A")), pc(get_step("flchain", "sample.yr", "C→B")),
+            boundary$p_over_alpha[boundary$dataset == "flchain" & boundary$variable == "sample.yr"]),
+    sprintf("%s", paste(sprintf("%s %s: %s", resolution$dataset, resolution$variable,
+                                ifelse(resolution$n_resolved > 0,
+                                       sprintf("K = %s で解消", resolution$K_resolved),
+                                       "試した全 K で乖離が残る")), collapse = " / ")),
+    "不要。ε=∞ は決定的（1,000 反復の SD が厳密に 0、§2.2）"
+  )
+) %>%
+  kable(caption = "実験 H の結果サマリー") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```
+

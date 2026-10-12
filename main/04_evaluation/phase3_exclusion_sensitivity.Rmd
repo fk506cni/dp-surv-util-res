@@ -1,0 +1,317 @@
+---
+title: "実験 H-2: Phase 3 の乖離 3 係数を除外することが結論を作っていないか"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(width = 140)
+```
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(arrow)
+library(purrr)
+library(knitr)
+library(kableExtra)
+
+PROJECT_DIR <- "/home/rstudio/project"
+SIM_DIR     <- file.path(PROJECT_DIR, "data/03_simulation")
+PREP_DIR    <- file.path(PROJECT_DIR, "data/01_prepared")
+EVAL_DIR    <- file.path(PROJECT_DIR, "data/04_evaluation")
+
+ALPHA <- 0.05
+DATASET_ORDER <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+
+PHASE3_LSR_EXCLUDE <- data.frame(dataset = c("lung", "flchain"),
+                                 variable = c("ph.karno", "sample.yr"),
+                                 stringsAsFactors = FALSE)
+PHASE3_FPR_EXCLUDE <- data.frame(dataset = "flchain", variable = "kappa",
+                                 stringsAsFactors = FALSE)
+
+baseline <- read_csv(file.path(PREP_DIR, "baseline_cox_reffix.csv"), show_col_types = FALSE) %>%
+  mutate(is_significant = p_value < ALPHA)
+
+load_phase3 <- function(path) {
+  read_parquet(path) %>%
+    select(any_of(c("dataset", "variable", "p_value", "converged", "epsilon", "iteration"))) %>%
+    as.data.frame()
+}
+p3_ins <- load_phase3(file.path(SIM_DIR, "reffix/all_phase3_reffix.parquet"))
+p3_tt  <- load_phase3(file.path(SIM_DIR, "reffix_traintest/all_phase3_reffix_traintest.parquet"))
+cat(sprintf("Phase 3: in-sample %d 行 / train/test %d 行\n", nrow(p3_ins), nrow(p3_tt)))
+```
+
+```{r denominator}
+den <- bind_rows(lapply(DATASET_ORDER, function(d) {
+  b <- baseline %>% filter(dataset == d)
+  n_sig    <- sum(b$is_significant);  n_nonsig <- sum(!b$is_significant)
+  ex_lsr <- sum(PHASE3_LSR_EXCLUDE$dataset == d)
+  ex_fpr <- sum(PHASE3_FPR_EXCLUDE$dataset == d)
+  tibble(dataset = d,
+         `LSR 分母（除外なし）` = n_sig, `LSR 分母（投稿版）` = n_sig - ex_lsr,
+         `LSR 減少率` = sprintf("%.0f%%", 100 * ex_lsr / n_sig),
+         `FPR 分母（除外なし）` = n_nonsig, `FPR 分母（投稿版）` = n_nonsig - ex_fpr,
+         `FPR 減少率` = sprintf("%.0f%%", 100 * ex_fpr / n_nonsig))
+}))
+kable(den, caption = "除外が分母に与える影響") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r kpi-fn}
+phase3_kpi <- function(res, excl_lsr, excl_fpr) {
+  sig    <- baseline %>% filter(is_significant)  %>% select(dataset, variable)
+  nonsig <- baseline %>% filter(!is_significant) %>% select(dataset, variable)
+  ok <- res %>% filter(converged)
+
+  lsr_var <- ok %>% inner_join(sig, by = c("dataset", "variable")) %>%
+    anti_join(excl_lsr, by = c("dataset", "variable")) %>%
+    group_by(dataset, epsilon, variable) %>%
+    summarise(lsr = sum(p_value >= ALPHA) / n(), .groups = "drop")
+  fpr_var <- ok %>% inner_join(nonsig, by = c("dataset", "variable")) %>%
+    anti_join(excl_fpr, by = c("dataset", "variable")) %>%
+    group_by(dataset, epsilon, variable) %>%
+    summarise(fpr = sum(p_value < ALPHA) / n(), .groups = "drop")
+
+  agg <- lsr_var %>% group_by(dataset, epsilon) %>%
+      summarise(mean_lsr = mean(lsr), max_lsr = max(lsr), .groups = "drop") %>%
+    full_join(fpr_var %>% group_by(dataset, epsilon) %>%
+                summarise(mean_fpr = mean(fpr), max_fpr = max(fpr), .groups = "drop"),
+              by = c("dataset", "epsilon"))
+  list(agg = agg, lsr_var = lsr_var, fpr_var = fpr_var)
+}
+
+NONE <- data.frame(dataset = character(), variable = character(), stringsAsFactors = FALSE)
+
+ins_with <- phase3_kpi(p3_ins, PHASE3_LSR_EXCLUDE, PHASE3_FPR_EXCLUDE)
+ins_none <- phase3_kpi(p3_ins, NONE, NONE)
+tt_with  <- phase3_kpi(p3_tt,  PHASE3_LSR_EXCLUDE, PHASE3_FPR_EXCLUDE)
+tt_none  <- phase3_kpi(p3_tt,  NONE, NONE)
+```
+
+```{r validate}
+check_against <- function(agg, ref_file, label) {
+  ref <- read_csv(file.path(EVAL_DIR, ref_file), show_col_types = FALSE) %>%
+    filter(phase == "Phase 3") %>%
+    select(dataset, epsilon, mean_lsr, max_lsr, mean_fpr, max_fpr)
+  j <- agg %>% inner_join(ref, by = c("dataset", "epsilon"), suffix = c("_new", "_ref"))
+  cols <- c("mean_lsr", "max_lsr", "mean_fpr", "max_fpr")
+  d <- map_dfr(cols, function(v) {
+    a <- j[[paste0(v, "_new")]]; b <- j[[paste0(v, "_ref")]]
+    both_na <- is.na(a) & is.na(b)
+    diff <- ifelse(both_na, 0, abs(a - b))
+    tibble(指標 = v, 照合セル = length(diff), 最大差 = max(diff, na.rm = TRUE))
+  })
+  stopifnot(nrow(j) == nrow(ref), nrow(j) > 0, all(d$最大差 < 1e-12))
+  cat(sprintf("%s: %d 条件 × %d 指標が %s と一致（最大差 %.2e）✅\n",
+              label, nrow(j), length(cols), ref_file, max(d$最大差)))
+  d
+}
+v1 <- check_against(ins_with$agg, "kpi_summary_reffix.csv",   "in-sample")
+v2 <- check_against(tt_with$agg,  "kpi_traintest_reffix.csv", "train/test")
+kable(bind_rows(v1 %>% mutate(アーム = "in-sample", .before = 1),
+                v2 %>% mutate(アーム = "train/test", .before = 1)),
+      digits = 20, caption = "「除外あり」の再集計が投稿版の掲載値と一致すること") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r delta}
+delta_of <- function(w, n, arm) {
+  w$agg %>% rename_with(~ paste0(.x, "_with"), -c(dataset, epsilon)) %>%
+    inner_join(n$agg %>% rename_with(~ paste0(.x, "_none"), -c(dataset, epsilon)),
+               by = c("dataset", "epsilon")) %>%
+    mutate(アーム = arm, .before = 1)
+}
+d_all <- bind_rows(delta_of(ins_with, ins_none, "in-sample"),
+                   delta_of(tt_with,  tt_none,  "train/test"))
+
+long <- map_dfr(c("mean_lsr", "max_lsr", "mean_fpr", "max_fpr"), function(v) {
+  a <- d_all[[paste0(v, "_with")]]; b <- d_all[[paste0(v, "_none")]]
+  tibble(アーム = d_all$アーム, dataset = d_all$dataset, epsilon = d_all$epsilon,
+         指標 = v, 投稿版 = a, 除外なし = b,
+         差 = ifelse(is.na(a) & is.na(b), 0, b - a))
+})
+write_csv(long, file.path(EVAL_DIR, "phase3_exclusion_sensitivity.csv"))
+
+summ <- long %>% group_by(アーム, 指標) %>%
+  summarise(条件数 = n(),
+            `変化した条件` = sum(abs(差) > 1e-12, na.rm = TRUE),
+            `最大 |差|` = max(abs(差), na.rm = TRUE),
+            `中央 |差|` = median(abs(差), na.rm = TRUE), .groups = "drop")
+kable(summ, digits = 4, caption = "除外の有無による Phase 3 の KPI の差（全 5 データセット × 15 ε）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+kable(long %>% arrange(desc(abs(差))) %>% head(12) %>%
+        mutate(epsilon = as.character(epsilon)),
+      digits = 4, caption = "差の大きい上位 12 条件") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r self-ref}
+p3_base <- p3_ins %>% filter(is.infinite(epsilon), converged) %>%
+  distinct(dataset, variable, .keep_all = TRUE) %>%
+  transmute(dataset, variable, is_significant = p_value < ALPHA)
+stopifnot(nrow(p3_base) == 53)
+
+phase3_kpi_selfref <- function(res) {
+  sig    <- p3_base %>% filter(is_significant)  %>% select(dataset, variable)
+  nonsig <- p3_base %>% filter(!is_significant) %>% select(dataset, variable)
+  ok <- res %>% filter(converged)
+  lsr_var <- ok %>% inner_join(sig, by = c("dataset", "variable")) %>%
+    group_by(dataset, epsilon, variable) %>%
+    summarise(lsr = sum(p_value >= ALPHA) / n(), .groups = "drop")
+  fpr_var <- ok %>% inner_join(nonsig, by = c("dataset", "variable")) %>%
+    group_by(dataset, epsilon, variable) %>%
+    summarise(fpr = sum(p_value < ALPHA) / n(), .groups = "drop")
+  agg <- lsr_var %>% group_by(dataset, epsilon) %>%
+      summarise(mean_lsr = mean(lsr), max_lsr = max(lsr), .groups = "drop") %>%
+    full_join(fpr_var %>% group_by(dataset, epsilon) %>%
+                summarise(mean_fpr = mean(fpr), max_fpr = max(fpr), .groups = "drop"),
+              by = c("dataset", "epsilon"))
+  list(agg = agg, lsr_var = lsr_var, fpr_var = fpr_var)
+}
+ins_self <- phase3_kpi_selfref(p3_ins)
+tt_self  <- phase3_kpi_selfref(p3_tt)
+
+den2 <- bind_rows(lapply(DATASET_ORDER, function(d) {
+  b <- baseline %>% filter(dataset == d); g <- p3_base %>% filter(dataset == d)
+  tibble(dataset = d,
+         `LSR 分母: 投稿版` = sum(b$is_significant) - sum(PHASE3_LSR_EXCLUDE$dataset == d),
+         `LSR 分母: 自己参照` = sum(g$is_significant),
+         `FPR 分母: 投稿版` = sum(!b$is_significant) - sum(PHASE3_FPR_EXCLUDE$dataset == d),
+         `FPR 分母: 自己参照` = sum(!g$is_significant),
+         `評価係数の合計: 投稿版` = nrow(b) - sum(PHASE3_LSR_EXCLUDE$dataset == d) -
+                                     sum(PHASE3_FPR_EXCLUDE$dataset == d),
+         `評価係数の合計: 自己参照` = nrow(g))
+}))
+kable(den2, caption = "分母の比較（投稿版の除外 vs 自己参照ベースライン）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+inf_chk <- bind_rows(ins_self$agg %>% mutate(アーム = "in-sample"),
+                     tt_self$agg  %>% mutate(アーム = "train/test")) %>%
+  filter(is.infinite(epsilon))
+kable(inf_chk %>% select(アーム, dataset, mean_lsr, max_lsr, mean_fpr, max_fpr),
+      digits = 4, caption = "自己参照ベースラインでの ε=∞（in-sample は定義上ゼロになる）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(all(ins_self$agg %>% filter(is.infinite(epsilon)) %>%
+                select(mean_lsr, max_lsr, mean_fpr, max_fpr) %>% unlist() == 0))
+cat("自己参照ベースラインでは ε=∞ の LSR・FPR が厳密に 0 になる（指標が壊れない）✅\n")
+```
+
+```{r selfref-vs-paper}
+cmp3 <- bind_rows(
+  ins_with$agg %>% mutate(アーム = "in-sample", 方式 = "投稿版（除外あり）"),
+  ins_self$agg %>% mutate(アーム = "in-sample", 方式 = "自己参照ベースライン"),
+  tt_with$agg  %>% mutate(アーム = "train/test", 方式 = "投稿版（除外あり）"),
+  tt_self$agg  %>% mutate(アーム = "train/test", 方式 = "自己参照ベースライン"))
+d3 <- cmp3 %>%
+  pivot_longer(c(mean_lsr, max_lsr, mean_fpr, max_fpr), names_to = "指標", values_to = "v") %>%
+  pivot_wider(names_from = 方式, values_from = v) %>%
+  mutate(差 = `自己参照ベースライン` - `投稿版（除外あり）`)
+write_csv(d3, file.path(EVAL_DIR, "phase3_selfref_baseline.csv"))
+kable(d3 %>% group_by(アーム, 指標) %>%
+        summarise(条件数 = n(), `変化した条件` = sum(abs(差) > 1e-12, na.rm = TRUE),
+                  `最大 |差|` = max(abs(差), na.rm = TRUE),
+                  `中央 |差|` = median(abs(差), na.rm = TRUE), .groups = "drop"),
+      digits = 4, caption = "自己参照ベースライン vs 投稿版（除外あり）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r thresholds}
+eps_star_fn <- function(k, arm, mode) {
+  lsr50 <- k$agg %>% filter(is.finite(epsilon), mean_lsr <= 0.50) %>%
+    group_by(dataset) %>% summarise(eps_lsr50 = min(epsilon), .groups = "drop")
+  lsr10 <- k$agg %>% filter(is.finite(epsilon), mean_lsr <= 0.10) %>%
+    group_by(dataset) %>% summarise(eps_lsr10 = min(epsilon), .groups = "drop")
+  fpr <- k$fpr_var %>% filter(is.finite(epsilon)) %>%
+    group_by(dataset, epsilon) %>% summarise(mean_fpr = mean(fpr, na.rm = TRUE), .groups = "drop") %>%
+    arrange(dataset, desc(epsilon)) %>% group_by(dataset) %>%
+    mutate(mx = cummax(mean_fpr)) %>% ungroup() %>% filter(mx <= 0.10) %>%
+    group_by(dataset) %>% summarise(eps_fpr10 = min(epsilon), .groups = "drop")
+  tibble(dataset = DATASET_ORDER) %>%
+    left_join(lsr50, by = "dataset") %>% left_join(lsr10, by = "dataset") %>%
+    left_join(fpr, by = "dataset") %>%
+    mutate(アーム = arm, 除外 = mode, .before = 1)
+}
+th <- bind_rows(eps_star_fn(ins_with, "in-sample", "投稿版（除外あり）"),
+                eps_star_fn(ins_none, "in-sample", "除外なし"),
+                eps_star_fn(tt_with,  "train/test", "投稿版（除外あり）"),
+                eps_star_fn(tt_none,  "train/test", "除外なし"))
+th_self <- bind_rows(eps_star_fn(ins_self, "in-sample", "自己参照ベースライン"),
+                     eps_star_fn(tt_self,  "train/test", "自己参照ベースライン"))
+fmt <- function(x) ifelse(is.na(x), "> 1000", as.character(x))
+th_wide <- bind_rows(th, th_self) %>%
+  mutate(across(c(eps_lsr50, eps_lsr10, eps_fpr10), fmt)) %>%
+  pivot_longer(c(eps_lsr50, eps_lsr10, eps_fpr10), names_to = "閾値", values_to = "eps") %>%
+  pivot_wider(names_from = 除外, values_from = eps) %>%
+  mutate(一致 = (`投稿版（除外あり）` == `除外なし`),
+         `自己参照が投稿版と一致` = (`投稿版（除外あり）` == `自己参照ベースライン`))
+kable(th_wide, caption = "ε* 閾値: 除外あり vs 除外なし（Phase 3）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+n_diff <- sum(!th_wide$一致)
+n_self_same <- sum(th_wide$`自己参照が投稿版と一致`)
+cat(sprintf("\nε* 閾値 %d 個のうち、除外の有無で変わるのは %d 個\n", nrow(th_wide), n_diff))
+cat(sprintf("自己参照ベースラインが投稿版と一致するのは %d / %d 個\n", n_self_same, nrow(th_wide)))
+if (n_diff > 0) {
+  kable(th_wide %>% filter(!一致), caption = "除外の有無で変わる ε* 閾値") %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE)
+}
+
+write_csv(th_wide, file.path(EVAL_DIR, "phase3_exclusion_thresholds.csv"))
+cat(sprintf("ε* 閾値表を書き出した: phase3_exclusion_thresholds.csv（%d 行）\n", nrow(th_wide)))
+```
+
+```{r excluded-behaviour}
+ex_lsr <- ins_none$lsr_var %>%
+  semi_join(PHASE3_LSR_EXCLUDE, by = c("dataset", "variable")) %>%
+  mutate(区分 = "除外された係数")
+other_lsr <- ins_none$lsr_var %>%
+  anti_join(PHASE3_LSR_EXCLUDE, by = c("dataset", "variable")) %>%
+  filter(dataset %in% unique(PHASE3_LSR_EXCLUDE$dataset)) %>%
+  mutate(区分 = "同じデータセットの他の係数")
+cmp <- bind_rows(ex_lsr, other_lsr) %>%
+  filter(epsilon %in% c(0.1, 1, 10, 30, 100, Inf)) %>%
+  group_by(dataset, epsilon, 区分) %>%
+  summarise(`平均 LSR` = mean(lsr), n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = 区分, values_from = c(`平均 LSR`, n))
+kable(cmp %>% mutate(epsilon = as.character(epsilon)), digits = 3,
+      caption = "除外された係数と他の係数の LSR（in-sample、代表 ε）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r conclusion}
+max_lsr_d <- long %>% filter(指標 == "mean_lsr") %>% pull(差) %>% abs() %>% max(na.rm = TRUE)
+max_fpr_d <- long %>% filter(指標 == "mean_fpr") %>% pull(差) %>% abs() %>% max(na.rm = TRUE)
+tibble(
+  項目 = c("実装の妥当性", "平均 LSR の最大変化", "平均 FPR の最大変化",
+           "ε* 閾値の変化", "(3) への回答"),
+  結果 = c(
+    "「除外あり」の再集計が kpi_summary_reffix.csv / kpi_traintest_reffix.csv と一致（最大差 < 1e-12）",
+    sprintf("%.4f", max_lsr_d),
+    sprintf("%.4f", max_fpr_d),
+    sprintf("%d / %d 個が変化", n_diff, nrow(th_wide)),
+    if (n_diff == 0 && max_lsr_d < 0.05)
+      "除外は掲載する閾値を 1 つも変えない。実務者が事前に特定する必要はない"
+    else
+      "除外が掲載値に影響する。Limitations に明記が要る"
+  )) %>%
+  kable(caption = "実験 H-2 のまとめ") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```
+

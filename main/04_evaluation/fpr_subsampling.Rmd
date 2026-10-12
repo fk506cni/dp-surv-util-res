@@ -1,0 +1,1112 @@
+---
+title: "flchain 部分抽出による標本サイズ仮説の直接検証"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dpi = 150)
+options(width = 130)
+```
+
+```{r libraries}
+library(tidyverse)
+library(survival)
+library(knitr)
+library(kableExtra)
+library(callr)
+```
+
+```{r constants}
+project_dir <- "/home/rstudio/project"
+prep_dir    <- file.path(project_dir, "data/01_prepared")
+eval_dir    <- file.path(project_dir, "data/04_evaluation")
+
+DATASET   <- "flchain"
+N_LEVELS  <- c(168L, 312L, 500L, 929L, 2000L, 2982L, 6524L)
+B_ITER    <- 1000L
+ALPHA_REF <- 0.05
+
+SUBSAMPLE_BASE_SEED <- 2000000L
+
+DP_SLOT       <- c(40L, 41L, 42L, 43L, 44L, 45L, 4L)
+DP_LEVEL_BASE <- 42L + 100000L * DP_SLOT
+
+SE_UNIDENTIFIED <- 10
+
+FIXED_DENOM <- c("kappa", "creatinine", "mgus")
+
+RSE_INFLATED <- 1.5
+
+VARS <- c("age", "sexM", "sample.yr", "kappa", "lambda", "creatinine", "mgus")
+
+CHUNK_SIZE <- 25L
+```
+
+```{r plan-table}
+tribble(
+  ~項目, ~値, ~根拠,
+  "対象データセット", "flchain（n=6524, q=7, イベント 1962）",
+  "最大データセットであり FPR ピークが最も高い（0.619）",
+  "n の水準", paste(N_LEVELS, collapse = " / "),
+  "他 4 データセットの n（lung 168・pbc 312・colon 929・rotterdam 2982）に一致させ、500 と 2000 で間を埋める",
+  "反復数", sprintf("%s（1 反復 = 1 抽出 + 1 DP 摂動）", format(B_ITER, big.mark = ",")),
+  "抽出変動と DP ノイズを 1 対 1 で対応させ、両方を 1000 回で平均する",
+  "抽出方法", "status で層別（イベント数 = round(n × イベント率））",
+  "イベント率を保つ",
+  "抽出シード", sprintf("%d + 水準番号 × 100000 + 反復", SUBSAMPLE_BASE_SEED),
+  "既存の全シード空間（最大 915,042）より上",
+  "DP ノイズシード",
+  sprintf("42 + 100000 × スロット番号 + (ε 番号−1) × B + 反復（スロット %s）",
+          paste(DP_SLOT, collapse = " / ")),
+  paste("本編と同一の式。水準 7 のスロット 4 は本編 flchain の base（400042）そのものであり、",
+        "水準 7 は本編 Phase 1 とビット単位で一致する"),
+  "ε", "既存の 15 点グリッド", "既存曲線と重ね描きできる",
+  "ε 間の対応", "同じ 1000 標本を 15 個の ε すべてで共有",
+  "ε 曲線が同一の抽出に対応し、曲線の形の雑音が減る",
+  "Phase", "Phase 1（共変量のみ摂動、予算 ε/q）", "機序分解の主対象と揃える",
+  "クリッピング境界", "全 7 水準で全データ（n=6524）の実測 min/max に固定",
+  "部分標本ごとに引き直すと「境界の推定も n に依存する」という別の交絡が入るため"
+) %>%
+  kable(caption = "実験 B-2（再実施版）の設計") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r load-data}
+source(file.path(project_dir, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(project_dir, "main/03_simulation/R/simulation_engine.R"))
+
+full_data <- read.csv(file.path(prep_dir, paste0(DATASET, "_prepared.csv")),
+                      stringsAsFactors = FALSE)
+BOUNDS <- CLIPPING_BOUNDS[[DATASET]]
+TYPES  <- COVARIATE_TYPES[[DATASET]]
+COX_FM <- COX_FORMULAS[[DATASET]]
+Q_FL   <- length(TYPES)
+
+stopifnot(
+  nrow(full_data) == 6524L, !anyNA(full_data), Q_FL == 7L,
+  sum(full_data$status == 1L) == 1962L,
+  setequal(names(TYPES), setdiff(names(full_data), SURV_COLS))
+)
+EVENT_RATE <- mean(full_data$status == 1L)
+MGUS_PREV  <- mean(full_data$mgus == 1L)
+cat(sprintf("flchain: N = %d / イベント %d / イベント率 %.4f / q = %d / mgus 有病率 %.4f (%d/%d)\n",
+            nrow(full_data), sum(full_data$status == 1L), EVENT_RATE, Q_FL,
+            MGUS_PREV, sum(full_data$mgus == 1L), nrow(full_data)))
+```
+
+```{r bounds-check}
+bound_chk <- map_dfr(names(TYPES), function(v) {
+  b <- BOUNDS[[v]]
+  if (TYPES[[v]] == "continuous") {
+    tibble(変数 = v, 型 = "continuous",
+           `境界 下` = b[1], `境界 上` = b[2],
+           `実測 min` = min(full_data[[v]]), `実測 max` = max(full_data[[v]]),
+           `範囲 range_j` = diff(b),
+           内包 = min(full_data[[v]]) >= b[1] && max(full_data[[v]]) <= b[2])
+  } else {
+    tibble(変数 = v, 型 = TYPES[[v]],
+           `境界 下` = NA_real_, `境界 上` = NA_real_,
+           `実測 min` = NA_real_, `実測 max` = NA_real_, `範囲 range_j` = NA_real_,
+           内包 = all(as.character(full_data[[v]]) %in% as.character(b)))
+  }
+})
+bound_chk %>% kable(caption = "クリッピング境界と実測範囲（全 7 水準で共通に使う）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(nrow(bound_chk) == Q_FL, !anyNA(bound_chk$内包), all(bound_chk$内包))
+cat("全 7 共変量で境界が実測範囲を内包 ✅ → 部分標本でもクリッピングは恒等写像であり、",
+    "ε=∞ の摂動はベースラインと厳密に一致する\n")
+```
+
+```{r seed-space}
+n_eps_all <- length(EPSILON_VALUES)
+
+dp_seeds_of <- function(L) as.integer(outer(seq_len(n_eps_all) - 1L, seq_len(B_ITER),
+                                            function(e, it) DP_LEVEL_BASE[L] + e * B_ITER + it))
+dp_by_level <- lapply(seq_along(N_LEVELS), dp_seeds_of)
+sub_range <- range(outer(seq_along(N_LEVELS), seq_len(B_ITER),
+                         function(L, i) SUBSAMPLE_BASE_SEED + L * 100000L + i))
+
+MAIN_PQ <- file.path(project_dir, "data/03_simulation/reffix/all_phase1_reffix.parquet")
+main_seeds <- arrow::read_parquet(MAIN_PQ, col_select = c("dataset", "seed")) %>%
+  filter(dataset == DATASET) %>% pull(seed) %>% unique() %>% sort()
+L_FULL <- which(N_LEVELS == max(N_LEVELS))
+stopifnot(
+  length(main_seeds) == n_eps_all * B_ITER,
+  length(dp_by_level[[L_FULL]]) == n_eps_all * B_ITER,
+  setequal(dp_by_level[[L_FULL]], main_seeds)
+)
+
+EXISTING_SEED_MAX <- 3990005L
+other <- setdiff(seq_along(N_LEVELS), L_FULL)
+stopifnot(
+  length(other) == length(N_LEVELS) - 1L,
+  !any(duplicated(unlist(dp_by_level))),
+  min(unlist(dp_by_level[other])) > EXISTING_SEED_MAX,
+  min(unlist(dp_by_level[other])) > sub_range[2]
+)
+
+cat(sprintf("抽出シード %d–%d（本編に対応物が無いので現状維持）\n", sub_range[1], sub_range[2]))
+cat(sprintf("水準 7 の DP ノイズ %d–%d = 本編 %s・Phase 1 の %d 個と完全一致 ✅（成果物の seed 列と集合比較）\n",
+            min(dp_by_level[[L_FULL]]), max(dp_by_level[[L_FULL]]), DATASET, length(main_seeds)))
+cat(sprintf("水準 1–6 の DP ノイズ %d–%d ✅ 既存帯の上限 %d と抽出シードの上端 %d より上\n",
+            min(unlist(dp_by_level[other])), max(unlist(dp_by_level[other])), EXISTING_SEED_MAX, sub_range[2]))
+```
+
+```{r sim-runner}
+run_paired_sim <- function(full_data, n_levels, b_iter, eps_values, sub_base_seed, dp_level_base,
+                           dataset, vars, n_workers, chunk_size, seed_stride) {
+  callr::r(
+    function(full_data, n_levels, b_iter, eps_values, sub_base_seed, dp_level_base,
+             dataset, vars, n_workers, chunk_size, seed_stride) {
+      Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1",
+                 MKL_NUM_THREADS = "1", VECLIB_MAXIMUM_THREADS = "1",
+                 RCPP_PARALLEL_NUM_THREADS = "1")
+      library(survival); library(dplyr); library(furrr)
+      source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+      source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+      source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+
+      bounds <- CLIPPING_BOUNDS[[dataset]]
+      types  <- COVARIATE_TYPES[[dataset]]
+      cox_fm <- COX_FORMULAS[[dataset]]
+      n_eps  <- length(eps_values)
+      nv     <- length(vars)
+      cont_vars  <- names(types)[unlist(types) == "continuous"]
+      event_rate <- mean(full_data$status == 1L)
+      idx_event  <- which(full_data$status == 1L)
+      idx_cens   <- which(full_data$status == 0L)
+
+      n_chunk <- ceiling(b_iter / chunk_size)
+      tasks <- expand.grid(level_idx = seq_along(n_levels), chunk = seq_len(n_chunk))
+      tasks$n_sub <- n_levels[tasks$level_idx]
+      tasks <- tasks[order(-tasks$n_sub), , drop = FALSE]
+
+      if (n_workers <= 0L) plan(sequential) else plan(multisession, workers = n_workers)
+      out <- future_map(seq_len(nrow(tasks)), function(k) {
+        L   <- tasks$level_idx[k]
+        n_t <- n_levels[L]
+        n_e <- round(n_t * event_rate)
+        its <- seq.int((tasks$chunk[k] - 1L) * chunk_size + 1L,
+                       min(tasks$chunk[k] * chunk_size, b_iter))
+        base_l <- vector("list", length(its))
+        dp_l   <- vector("list", length(its))
+        sd_l   <- vector("list", length(its))
+
+        for (ii in seq_along(its)) {
+          it <- its[ii]
+          set.seed(sub_base_seed + L * 100000L + it)
+          sel <- sort(c(sample(idx_event, n_e), sample(idx_cens, n_t - n_e)))
+          dat <- full_data[sel, , drop = FALSE]
+
+          warns <- character(0)
+          fb <- withCallingHandlers(
+            coxph(cox_fm, data = dat),
+            warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") }
+          )
+          bb <- coef(fb); sb <- sqrt(diag(vcov(fb)))
+          base_l[[ii]] <- data.frame(
+            level_idx = L, iter = it, variable = vars,
+            beta_base = unname(bb[vars]), se_base = unname(sb[vars]),
+            base_warn = length(warns) > 0,
+            n_mgus = sum(dat$mgus == 1L), n_event = sum(dat$status == 1L),
+            stringsAsFactors = FALSE, row.names = NULL)
+          sd_l[[ii]] <- data.frame(
+            level_idx = L, iter = it, src_var = cont_vars,
+            sd_x = vapply(cont_vars, function(v) sd(dat[[v]]), numeric(1)),
+            stringsAsFactors = FALSE, row.names = NULL)
+
+          bm <- matrix(NA_real_, n_eps, nv); sm <- bm; cv <- logical(n_eps)
+          for (e in seq_len(n_eps)) {
+            set.seed(dp_level_base[L] + (e - 1L) * seed_stride + it)
+            pert <- perturb_covariates_phase1_fast(dat, bounds, eps_values[e], types)
+            r <- tryCatch({
+              f <- coxph(cox_fm, data = pert)
+              list(ok = TRUE, b = coef(f), s = sqrt(diag(vcov(f))))
+            }, warning = function(w) {
+              f <- suppressWarnings(coxph(cox_fm, data = pert))
+              list(ok = FALSE, b = coef(f), s = sqrt(diag(vcov(f))))
+            }, error = function(e2) list(ok = FALSE, b = NULL, s = NULL))
+            cv[e] <- isTRUE(r$ok)
+            if (!is.null(r$b)) {
+              nm <- intersect(names(r$b), vars)
+              bm[e, match(nm, vars)] <- r$b[nm]
+              sm[e, match(nm, vars)] <- r$s[nm]
+            }
+          }
+          dp_l[[ii]] <- data.frame(
+            level_idx = L, iter = it,
+            eps_idx  = rep(seq_len(n_eps), times = nv),
+            variable = rep(vars, each = n_eps),
+            beta_dp = as.vector(bm), se_dp = as.vector(sm),
+            converged = rep(cv, times = nv),
+            stringsAsFactors = FALSE, row.names = NULL)
+        }
+        list(base = do.call(rbind, base_l),
+             dp   = do.call(rbind, dp_l),
+             sdx  = do.call(rbind, sd_l))
+      }, .options = furrr_options(seed = FALSE, chunk_size = 1L))
+      plan(sequential)
+
+      list(base = dplyr::bind_rows(lapply(out, `[[`, "base")),
+           dp   = dplyr::bind_rows(lapply(out, `[[`, "dp")),
+           sdx  = dplyr::bind_rows(lapply(out, `[[`, "sdx")))
+    },
+    args = list(full_data = full_data, n_levels = n_levels, b_iter = b_iter,
+                eps_values = eps_values, sub_base_seed = sub_base_seed,
+                dp_level_base = dp_level_base, dataset = dataset, vars = vars,
+                n_workers = n_workers, chunk_size = chunk_size, seed_stride = seed_stride)
+  )
+}
+```
+
+```{r run-sim}
+CPU_FRACTION <- 0.7
+N_WORKERS <- max(1L, as.integer(floor(parallel::detectCores() * CPU_FRACTION)))
+
+env_int <- function(nm) {
+  v <- Sys.getenv(nm, "")
+  if (!nzchar(v)) return(NULL)
+  n <- suppressWarnings(as.integer(v))
+  stopifnot(!is.na(n), n >= 0L)
+  n
+}
+if (!is.null(w <- env_int("B2_N_WORKERS"))) {
+  stopifnot(w <= as.integer(floor(parallel::detectCores() * CPU_FRACTION)))
+  N_WORKERS <- w
+  cat(sprintf("⚠️ B2_N_WORKERS=%d による上書き（並列度不変性の検証用）\n", N_WORKERS))
+}
+SEED_STRIDE <- B_ITER
+if (!is.null(b <- env_int("B2_B_ITER"))) {
+  stopifnot(b >= 1L, b <= B_ITER)
+  B_ITER <- as.integer(b)
+  cat(sprintf("⚠️ B2_B_ITER=%d による上書き（並列度不変性の検証用。本番は %d。刻み幅は %d のまま）\n",
+              B_ITER, SEED_STRIDE, SEED_STRIDE))
+}
+stopifnot(SEED_STRIDE >= B_ITER)
+B2_OVERRIDE <- !is.null(env_int("B2_N_WORKERS")) || !is.null(env_int("B2_B_ITER"))
+if (B2_OVERRIDE) {
+  eval_dir <- file.path(project_dir, "data/variants",
+                        sprintf("fpr_subsampling_w%d_b%d", N_WORKERS, B_ITER))
+  dir.create(eval_dir, recursive = TRUE, showWarnings = FALSE)
+  cat(sprintf("⚠️ 上書きが有効なので出力先を %s に切り替える（本番の data/04_evaluation は触らない）\n", eval_dir))
+}
+
+t0 <- Sys.time()
+sim <- run_paired_sim(
+  full_data = full_data, n_levels = N_LEVELS, b_iter = B_ITER,
+  eps_values = EPSILON_VALUES, sub_base_seed = SUBSAMPLE_BASE_SEED,
+  dp_level_base = DP_LEVEL_BASE, dataset = DATASET, vars = VARS, seed_stride = SEED_STRIDE,
+  n_workers = N_WORKERS, chunk_size = CHUNK_SIZE
+)
+elapsed <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+saveRDS(sim, file.path(eval_dir, "fpr_subsampling_raw.rds"))
+
+lv <- tibble(level_idx = seq_along(N_LEVELS), n_target = N_LEVELS)
+baseline_tbl <- sim$base %>%
+  left_join(lv, by = "level_idx") %>%
+  mutate(estimable = !is.na(beta_base) & is.finite(se_base) & se_base > 0,
+         z_base = beta_base / se_base,
+         p_base = 2 * pnorm(-abs(z_base)),
+         identified = estimable & se_base < SE_UNIDENTIFIED,
+         sig_base = identified & p_base < ALPHA_REF)
+dp_tbl <- sim$dp %>%
+  left_join(lv, by = "level_idx") %>%
+  mutate(epsilon = EPSILON_VALUES[eps_idx],
+         z_dp = beta_dp / se_dp,
+         p_dp = 2 * pnorm(-abs(z_dp)),
+         sig_dp = p_dp < ALPHA_REF)
+sd_tbl <- sim$sdx %>% left_join(lv, by = "level_idx")
+
+n_fits <- length(N_LEVELS) * B_ITER * (1L + length(EPSILON_VALUES))
+cat(sprintf("完了: %s 回の当てはめ（DP %s + ベースライン %s）/ %d ワーカー / %.1f 分（%.1f 万回/分）\n",
+            format(n_fits, big.mark = ","),
+            format(length(N_LEVELS) * B_ITER * length(EPSILON_VALUES), big.mark = ","),
+            format(length(N_LEVELS) * B_ITER, big.mark = ","),
+            N_WORKERS, elapsed, n_fits / elapsed / 1e4))
+
+NOT_EST <- baseline_tbl %>% filter(!estimable)
+stopifnot(
+  nrow(baseline_tbl) == length(N_LEVELS) * B_ITER * length(VARS),
+  nrow(dp_tbl) == length(N_LEVELS) * B_ITER * length(EPSILON_VALUES) * length(VARS),
+  !anyNA(baseline_tbl$beta_base[baseline_tbl$estimable]),
+  !anyNA(baseline_tbl$se_base[baseline_tbl$estimable]),
+  all(baseline_tbl$se_base[baseline_tbl$estimable] > 0),
+  nrow(NOT_EST) == 0L || all(NOT_EST$variable == "mgus")
+)
+cat(sprintf("ベースライン %s 行 / DP %s 行 ✅（期待どおり）\n",
+            format(nrow(baseline_tbl), big.mark = ","), format(nrow(dp_tbl), big.mark = ",")))
+cat(sprintf("係数が推定できなかったセル %s 件（%.2f%%）。すべて mgus で、部分標本に陽性者が 0 名だった反復である\n",
+            format(nrow(NOT_EST), big.mark = ","), 100 * nrow(NOT_EST) / nrow(baseline_tbl)))
+```
+
+```{r subsample-check}
+sub_diag <- baseline_tbl %>%
+  distinct(level_idx, iter, n_target, n_event, n_mgus) %>%
+  mutate(event_rate = n_event / n_target)
+
+stopifnot(
+  nrow(sub_diag) == length(N_LEVELS) * B_ITER,
+  !anyNA(sub_diag$event_rate),
+  all(abs(sub_diag$event_rate - EVENT_RATE) < 1 / min(N_LEVELS))
+)
+cat(sprintf("部分標本 %s 個（%d 水準 × %s 反復）✅ イベント率のずれは最大 %.5f\n",
+            format(nrow(sub_diag), big.mark = ","), length(N_LEVELS),
+            format(B_ITER, big.mark = ","), max(abs(sub_diag$event_rate - EVENT_RATE))))
+
+sub_diag %>%
+  group_by(n_target) %>%
+  summarise(`反復数` = n(), `イベント数` = first(n_event), `イベント率` = first(event_rate),
+            `mgus 陽性 最小` = min(n_mgus), `mgus 陽性 中央` = median(n_mgus),
+            `mgus 陽性 最大` = max(n_mgus), .groups = "drop") %>%
+  kable(caption = paste("水準別の部分標本の内訳。イベント率は全データの", sprintf("%.4f", EVENT_RATE),
+                        "を保っている。mgus は有病率", sprintf("%.2f%%", 100 * MGUS_PREV),
+                        "の希少な二値共変量であり、小標本では陽性が数名にとどまる。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+full_lv <- which(N_LEVELS == max(N_LEVELS))
+fb <- baseline_tbl %>% filter(level_idx == full_lv)
+stopifnot(
+  n_distinct(fb$beta_base[fb$variable == "age"]) == 1L,
+  all(fb$n_event == sum(full_data$status == 1L)),
+  all(fb$n_mgus == sum(full_data$mgus == 1L))
+)
+cat(sprintf("n=6524 の %s 反復はいずれも全データと同一（ベースライン β が 1 種類のみ）✅\n",
+            format(B_ITER, big.mark = ",")))
+```
+
+```{r identity-eps-inf}
+inf_chk <- dp_tbl %>%
+  filter(is.infinite(epsilon)) %>%
+  inner_join(baseline_tbl %>% select(level_idx, iter, variable, beta_base, se_base, estimable),
+             by = c("level_idx", "iter", "variable")) %>%
+  mutate(d_beta = abs(beta_dp - beta_base), d_se = abs(se_dp - se_base))
+inf_ok <- inf_chk %>% filter(estimable)
+
+stopifnot(
+  nrow(inf_chk) == length(N_LEVELS) * B_ITER * length(VARS),
+  !anyNA(inf_ok$d_beta), !anyNA(inf_ok$d_se),
+  max(inf_ok$d_beta) < 1e-12, max(inf_ok$d_se) < 1e-12,
+  all(is.na(inf_chk$beta_dp) == !inf_chk$estimable)
+)
+cat(sprintf("ε=∞ の %s セル（推定できた %s セル）で β・SE がベースラインと一致（最大差 %g、%s）✅\n",
+            format(nrow(inf_chk), big.mark = ","), format(nrow(inf_ok), big.mark = ","),
+            max(inf_ok$d_beta, inf_ok$d_se),
+            if (max(inf_ok$d_beta, inf_ok$d_se) == 0) "厳密に 0" else "倍精度の丸め誤差の範囲"))
+cat("推定できなかったセルは ε=∞ 側でも同じく推定できない（欠損の型が一致）✅\n")
+```
+
+```{r identification}
+sep <- baseline_tbl %>% filter(estimable, !identified)
+id_max   <- max(baseline_tbl$se_base[baseline_tbl$identified])
+unid_min <- if (nrow(sep) > 0) min(sep$se_base) else Inf
+stopifnot(id_max < SE_UNIDENTIFIED, unid_min > SE_UNIDENTIFIED)
+cat(sprintf("識別済みの SE の最大 %.4f < 閾値 %g < 分離した SE の最小 %.1f（隔たり %.0f 倍）✅\n",
+            id_max, SE_UNIDENTIFIED, unid_min, unid_min / id_max))
+cat("→ 閾値をこの隔たりの間のどこに置いても同じ集合が得られる。閾値は恣意的ではない\n")
+
+unid <- baseline_tbl %>% filter(!identified)
+stopifnot(all(unid$variable == "mgus"))
+cat(sprintf("評価できない係数は %s 件（全 %s 件の %.2f%%）、すべて mgus ✅ 内訳: 推定不能 %s 件 / 分離 %s 件\n",
+            format(nrow(unid), big.mark = ","), format(nrow(baseline_tbl), big.mark = ","),
+            100 * nrow(unid) / nrow(baseline_tbl),
+            format(nrow(NOT_EST), big.mark = ","), format(nrow(sep), big.mark = ",")))
+
+id_by_n <- baseline_tbl %>%
+  group_by(n_target) %>%
+  summarise(`mgus 陽性 0 名で推定不能` = sum(!estimable),
+            `分離で識別されない` = sum(estimable & !identified),
+            `評価できない反復の合計` = sum(!identified),
+            `その割合` = sum(!identified) / B_ITER,
+            `ベースラインが警告を出した反復` = n_distinct(iter[base_warn]),
+            .groups = "drop")
+id_by_n %>%
+  kable(caption = paste("水準別の識別不能（すべて mgus の分離）。",
+                        "反転確率は全水準で同一だが、mgus の陽性者数が",
+                        "1 名から 96 名まで動くため摂動の実効的な破壊度は n に依存する。",
+                        "初版は 5 抽出中 1 本が結果を支配していたが、本版は 1000 反復で平均される。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r convergence}
+cfr_tbl <- dp_tbl %>%
+  distinct(level_idx, n_target, iter, epsilon, converged) %>%
+  group_by(n_target, epsilon) %>%
+  summarise(cfr = 1 - mean(converged), .groups = "drop")
+
+eval_tbl <- dp_tbl %>%
+  inner_join(baseline_tbl %>% select(level_idx, iter, variable, beta_base, se_base,
+                                     z_base, p_base, estimable, identified, sig_base),
+             by = c("level_idx", "iter", "variable")) %>%
+  filter(identified, is.finite(beta_dp), is.finite(se_dp), se_dp > 0) %>%
+  rename(conv = converged)
+
+drop_tbl <- dp_tbl %>%
+  inner_join(baseline_tbl %>% select(level_idx, iter, variable, identified),
+             by = c("level_idx", "iter", "variable")) %>%
+  filter(identified) %>%
+  group_by(n_target, epsilon) %>%
+  summarise(`摂動後に推定できなかった割合` = mean(!(is.finite(beta_dp) & is.finite(se_dp) & se_dp > 0)),
+            .groups = "drop")
+
+cfr_tbl %>% inner_join(drop_tbl, by = c("n_target", "epsilon")) %>%
+  group_by(n_target) %>%
+  summarise(`CFR 平均` = mean(cfr), `CFR 最大` = max(cfr),
+            `摂動後に推定できなかった割合 最大` = max(`摂動後に推定できなかった割合`), .groups = "drop") %>%
+  kable(caption = paste("水準別の収束失敗率（CFR）。CFR は coxph が警告を出した反復の割合",
+                        "（既存規約では収束失敗として扱う）。右端はベースラインで識別された係数のうち",
+                        "摂動後に推定値が得られなかったセルの割合。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(!anyNA(cfr_tbl$cfr), all(drop_tbl$`摂動後に推定できなかった割合` < 0.05),
+          nrow(eval_tbl) > 0, !anyNA(eval_tbl$p_dp))
+cat(sprintf("摂動後に推定できなかったセルの割合は最大 %.4f。CFR（警告ベース）の最大は %.3f\n",
+            max(drop_tbl$`摂動後に推定できなかった割合`), max(cfr_tbl$cfr)))
+cat(sprintf("評価に使えるセル %s 件\n", format(nrow(eval_tbl), big.mark = ",")))
+```
+
+```{r metrics-ab}
+per_iter <- function(dat, lab) {
+  dat %>%
+    group_by(level_idx, n_target, iter, epsilon) %>%
+    summarise(
+      k_ns  = sum(!sig_base), k_sig = sum(sig_base),
+      fpr   = if (sum(!sig_base) > 0) mean(sig_dp[!sig_base]) else NA_real_,
+      lsr   = if (sum(sig_base)  > 0) mean(!sig_dp[sig_base]) else NA_real_,
+      .groups = "drop") %>%
+    mutate(denominator = lab)
+}
+
+base_A <- eval_tbl %>% filter(identified)
+base_B <- eval_tbl %>% filter(identified, variable %in% FIXED_DENOM)
+
+iter_A <- per_iter(base_A, "A: 各反復で分母を引き直し")
+iter_B <- per_iter(base_B, "B: 全データの非有意 3 係数に限定")
+
+curve_of <- function(it) {
+  it %>%
+    filter(is.finite(epsilon)) %>%
+    group_by(denominator, n_target, epsilon) %>%
+    summarise(mean_fpr = mean(fpr, na.rm = TRUE), se_fpr = sd(fpr, na.rm = TRUE) / sqrt(sum(!is.na(fpr))),
+              n_fpr = sum(!is.na(fpr)), mean_denom = mean(k_ns),
+              mean_lsr = mean(lsr, na.rm = TRUE), se_lsr = sd(lsr, na.rm = TRUE) / sqrt(sum(!is.na(lsr))),
+              n_lsr = sum(!is.na(lsr)), mean_denom_sig = mean(k_sig),
+              .groups = "drop")
+}
+curves <- bind_rows(curve_of(iter_A), curve_of(iter_B))
+
+EPS_FINITE <- sort(EPSILON_VALUES[is.finite(EPSILON_VALUES)])
+curves <- curves %>% mutate(across(c(mean_fpr, mean_lsr, se_fpr, se_lsr), ~ ifelse(is.nan(.x), NA_real_, .x)))
+stopifnot(
+  nrow(curves) == 2L * length(N_LEVELS) * length(EPS_FINITE),
+  !anyNA(curves$mean_fpr),
+  all(curves$mean_fpr >= 0 & curves$mean_fpr <= 1),
+  all(curves$n_fpr > 0.5 * B_ITER),
+  all(is.na(curves$mean_lsr) == (curves$n_lsr == 0))
+)
+cat(sprintf("曲線テーブル %d 行（2 定義 × %d 水準 × %d ε）✅ 各点は最小 %d 反復の平均\n",
+            nrow(curves), length(N_LEVELS), length(EPS_FINITE), min(curves$n_fpr)))
+cat(sprintf("LSR の分母が空になるのは %d 行（%s）。設計上の帰結である\n",
+            sum(curves$n_lsr == 0),
+            paste(unique(sprintf("%s / n=%d", curves$denominator[curves$n_lsr == 0],
+                                 curves$n_target[curves$n_lsr == 0])), collapse = ", ")))
+```
+
+```{r peaks}
+EPS_MAX <- max(EPS_FINITE)
+peak_of <- function(cv, col) {
+  cv %>%
+    rename(y = all_of(col)) %>%
+    group_by(denominator, n_target) %>%
+    summarise(
+      plateau  = y[epsilon == min(EPS_FINITE)],
+      peak     = max(y),
+      peak_eps = min(epsilon[y == max(y)]),
+      excess   = max(y) - plateau,
+      half_lvl = plateau + (max(y) - plateau) / 2,
+      eps_lo   = min(epsilon[y >= half_lvl]),
+      eps_hi   = max(epsilon[y >= half_lvl]),
+      fwhm_dec = log10(eps_hi) - log10(eps_lo),
+      censored = max(epsilon[y >= half_lvl]) == EPS_MAX,
+      mean_denom = mean(mean_denom),
+      .groups = "drop")
+}
+peaks_fpr <- peak_of(curves, "mean_fpr") %>% mutate(metric = "FPR")
+peaks_lsr <- peak_of(curves %>% filter(n_lsr > 0), "mean_lsr") %>% mutate(metric = "LSR")
+peaks <- bind_rows(peaks_fpr, peaks_lsr)
+
+stopifnot(nrow(peaks_fpr) == 2L * length(N_LEVELS), !anyNA(peaks$fwhm_dec),
+          all(peaks$peak >= peaks$plateau))
+
+peaks_fpr %>%
+  select(denominator, n_target, mean_denom, plateau, peak, excess, peak_eps, fwhm_dec, censored) %>%
+  arrange(denominator, n_target) %>%
+  kable(caption = paste("偽陽性率のピーク高さ・位置・幅。excess はプラトーからの上振れ、",
+                        "fwhm_dec はプラトーを基線とした半値全幅（ε の decade 数）。",
+                        "censored = TRUE は右側が ε の格子の最終点で打ち切られており幅が下限であることを示す。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+peaks_lsr %>%
+  select(denominator, n_target, plateau, peak, excess, peak_eps) %>%
+  arrange(denominator, n_target) %>%
+  kable(caption = "有意性喪失率（LSR）の同じ量。低 ε ではほぼ全係数が有意性を失う。", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r rank-correlation}
+rho_tbl <- peaks %>%
+  group_by(metric, denominator) %>%
+  filter(n() == length(N_LEVELS)) %>%
+  summarise(
+    rho = cor(n_target, peak, method = "spearman"),
+    `p 値（厳密）` = suppressWarnings(
+      cor.test(n_target, peak, method = "spearman", exact = TRUE)$p.value),
+    `p 値（近似・参考）` = suppressWarnings(
+      cor.test(n_target, peak, method = "spearman", exact = FALSE)$p.value),
+    `95% 下限` = tanh(atanh(cor(n_target, peak, method = "spearman")) - 1.96 / sqrt(length(N_LEVELS) - 3)),
+    `95% 上限` = tanh(atanh(cor(n_target, peak, method = "spearman")) + 1.96 / sqrt(length(N_LEVELS) - 3)),
+    `逆転の数` = sum(diff(peak[order(n_target)]) < 0),
+    .groups = "drop")
+rho_tbl %>%
+  kable(caption = paste("ピーク高さと n の順位相関（7 水準）。信頼区間は Fisher 変換による。",
+                        "「逆転の数」は隣接水準で値が下がった箇所の数。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(nrow(rho_tbl) >= 3L, !anyNA(rho_tbl$rho))
+```
+
+```{r peak-significance}
+EPS_LO <- min(EPS_FINITE)
+paired_tbl <- map_dfr(N_LEVELS, function(nn) {
+  pe <- peaks_fpr$peak_eps[peaks_fpr$n_target == nn &
+                             str_starts(peaks_fpr$denominator, "A:")]
+  if (pe == EPS_LO) {
+    return(tibble(n_target = nn, `ピーク ε` = pe, `対応のある反復数` = NA_integer_,
+                  `上振れ 平均` = 0, `95% 下限` = NA_real_, `95% 上限` = NA_real_,
+                  `p 値` = NA_real_))
+  }
+  w <- iter_A %>% filter(n_target == nn, epsilon %in% c(EPS_LO, pe), !is.na(fpr)) %>%
+    select(iter, epsilon, fpr) %>%
+    pivot_wider(names_from = epsilon, values_from = fpr) %>%
+    drop_na()
+  d <- w[[as.character(pe)]] - w[[as.character(EPS_LO)]]
+  tt <- t.test(d)
+  tibble(n_target = nn, `ピーク ε` = pe, `対応のある反復数` = length(d),
+         `上振れ 平均` = mean(d), `95% 下限` = tt$conf.int[1], `95% 上限` = tt$conf.int[2],
+         `p 値` = tt$p.value)
+})
+paired_tbl %>%
+  kable(caption = paste("ピーク ε とプラトー（ε=0.1）の対応のある比較。",
+                        "初版は 5 本の抽出しかなく n=168 の上振れが 0 と区別できなかった（p = 0.31）。"),
+        digits = 5) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+stopifnot(nrow(paired_tbl) == length(N_LEVELS),
+          all(is.na(paired_tbl$`p 値`) == (paired_tbl$`ピーク ε` == EPS_LO)))
+```
+
+```{r converged-only-sensitivity}
+conv_curve <- base_A %>% filter(conv) %>% per_iter("A（警告なしの反復のみ）") %>%
+  filter(is.finite(epsilon)) %>%
+  group_by(n_target, epsilon) %>%
+  summarise(fpr_conv = mean(fpr, na.rm = TRUE), n_conv_iter = sum(!is.na(fpr)), .groups = "drop")
+nonconv_tbl <- dp_tbl %>%
+  distinct(n_target, epsilon, iter, converged) %>%
+  filter(is.finite(epsilon)) %>%
+  group_by(n_target, epsilon) %>%
+  summarise(n_nonconv = sum(!converged), .groups = "drop")
+sens <- curves %>% filter(str_starts(denominator, "A:")) %>%
+  select(n_target, epsilon, fpr_all = mean_fpr, n_all_iter = n_fpr) %>%
+  inner_join(conv_curve,   by = c("n_target", "epsilon")) %>%
+  inner_join(nonconv_tbl,  by = c("n_target", "epsilon")) %>%
+  mutate(signed_d = fpr_all - fpr_conv, d = abs(signed_d))
+tibble(項目 = c("比較した (水準 × ε) セル数", "|全反復 − 警告なしのみ| の中央値",
+                "同 最大", "同 0.01 を超えたセル数",
+                "水準 7・ε=100 の差（本文に載る点）", "水準 7 で差が 0 でない ε"),
+       値 = c(sprintf("%d", nrow(sens)), sprintf("%.5f", median(sens$d)),
+              sprintf("%.5f", max(sens$d)), sprintf("%d", sum(sens$d > 0.01)),
+              sprintf("%.5g（規約 A %.6f / 規約 B %.6f、非収束 %d 件）",
+                      sens$signed_d[sens$n_target == max(N_LEVELS) & sens$epsilon == 100],
+                      sens$fpr_all[sens$n_target == max(N_LEVELS) & sens$epsilon == 100],
+                      sens$fpr_conv[sens$n_target == max(N_LEVELS) & sens$epsilon == 100],
+                      sens$n_nonconv[sens$n_target == max(N_LEVELS) & sens$epsilon == 100]),
+              { z <- sens %>% filter(n_target == max(N_LEVELS), d > 0)
+                if (nrow(z) == 0) "なし" else paste(sprintf("%g", z$epsilon), collapse = " / ") })) %>%
+  kable(caption = "集計対象（全反復 vs 警告なしの反復のみ）の違いが偽陽性率に与える影響") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+sens %>% filter(n_target == max(N_LEVELS)) %>%
+  select(epsilon, `規約 A（全反復）` = fpr_all, `規約 B（収束のみ）` = fpr_conv,
+         `差 A−B` = signed_d, `非収束反復` = n_nonconv) %>%
+  kable(caption = paste("水準 7（n=6524）における 2 つの集計規約の比較。",
+                        "本文に載るのは ε=100 の行である。"), digits = 7) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+CONV_SENS_MED <- median(sens$d); CONV_SENS_MAX <- max(sens$d)
+CONV_SENS_FULL_PEAK <- sens$signed_d[sens$n_target == max(N_LEVELS) & sens$epsilon == 100]
+stopifnot(nrow(sens) > 0, !anyNA(sens$d),
+          nrow(sens) == length(N_LEVELS) * length(EPS_FINITE),
+          sens$n_nonconv[sens$n_target == max(N_LEVELS) & sens$epsilon == 100] == 0L,
+          CONV_SENS_FULL_PEAK == 0)
+```
+
+```{r curve-plot, fig.height=5}
+curves %>%
+  mutate(n_lab = factor(n_target, levels = N_LEVELS)) %>%
+  select(denominator, n_target, n_lab, epsilon, FPR = mean_fpr, LSR = mean_lsr) %>%
+  pivot_longer(c(FPR, LSR), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = epsilon, y = value, color = n_lab)) +
+  geom_hline(yintercept = ALPHA_REF, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.2) +
+  facet_grid(metric ~ denominator, scales = "free_y") +
+  scale_x_log10() +
+  scale_color_viridis_d(option = "C", end = 0.9) +
+  labs(x = "ε（対数軸）", y = "割合", color = "n",
+       title = "flchain の部分標本における偽陽性率と有意性喪失率（Phase 1・α=0.05）") +
+  theme_bw(base_size = 12)
+```
+
+```{r metric-c}
+rse_cell <- eval_tbl %>%
+  filter(identified, is.finite(epsilon)) %>%
+  mutate(r_se     = se_dp / se_base,
+         shift_z  = (beta_dp - beta_base) / se_base,
+         bias_b   = beta_dp - beta_base,
+         z_eff    = beta_dp / se_dp)
+
+rse_summary <- rse_cell %>%
+  group_by(n_target, epsilon) %>%
+  summarise(mean_rse = mean(r_se), median_rse = median(r_se), sd_rse = sd(r_se),
+            max_rse = max(r_se), n_inflated = sum(r_se > RSE_INFLATED), n_cells = n(),
+            .groups = "drop")
+
+rse_summary %>%
+  select(n_target, epsilon, mean_rse) %>%
+  pivot_wider(names_from = n_target, values_from = mean_rse) %>%
+  kable(caption = paste("r_SE の**平均**（反復 × 係数、識別済みセルのみ）。列が n、行が ε。",
+                        "値が小さいほど SE が縮んでいる。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+rse_summary %>%
+  select(n_target, epsilon, median_rse) %>%
+  pivot_wider(names_from = n_target, values_from = median_rse) %>%
+  kable(caption = paste("同じ量の**中央値**。平均か中央値かを明示する。",
+                        "係数の違いを調整していないこの中央値は、",
+                        "低 ε では希少二値共変量 mgus の挙動に追随するため n とともに下がる。",
+                        "係数の違いを調整した量は下の rse-normalized チャンクを参照。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r rse-normalized}
+rse_ref <- rse_cell %>% filter(n_target == max(N_LEVELS)) %>%
+  group_by(variable, epsilon) %>% summarise(ref = median(r_se), .groups = "drop")
+rse_rel <- rse_cell %>%
+  inner_join(rse_ref, by = c("variable", "epsilon")) %>%
+  mutate(rel = r_se / ref) %>%
+  group_by(n_target, epsilon) %>%
+  summarise(median_rel = median(rel), mean_rel = mean(rel), n_cells = n(), .groups = "drop")
+
+rse_rel %>%
+  select(n_target, epsilon, median_rel) %>%
+  pivot_wider(names_from = n_target, values_from = median_rel) %>%
+  kable(caption = paste("係数ごとに n=6524 の値で正規化した r_SE の中央値。",
+                        "1.00 に近いほど n に依存しない。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(nrow(rse_rel) == length(N_LEVELS) * length(EPS_FINITE), !anyNA(rse_rel$median_rel))
+rse_cell %>%
+  filter(epsilon %in% c(1, 10, 100)) %>%
+  group_by(variable, epsilon, n_target) %>%
+  summarise(m = median(r_se), .groups = "drop") %>%
+  pivot_wider(names_from = n_target, values_from = m) %>%
+  arrange(variable, epsilon) %>%
+  kable(caption = paste("係数別・ε 別の r_SE 中央値（ε = 1 / 10 / 100 のみ）。",
+                        "係数ごとに見ればほぼ水平であり、mgus だけが n とともに動く。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+RSE_REL_RANGE <- range(rse_rel$median_rel)
+cat(sprintf("正規化した r_SE の中央値は全 %d セルで %.3f–%.3f（1 からのずれは最大 %.1f%%）\n",
+            nrow(rse_rel), RSE_REL_RANGE[1], RSE_REL_RANGE[2],
+            100 * max(abs(RSE_REL_RANGE - 1))))
+```
+
+```{r rse-inflated}
+rse_agg <- rse_cell %>%
+  group_by(n_target, epsilon, variable) %>%
+  summarise(mean_rse = mean(r_se), median_rse = median(r_se), max_rse = max(r_se),
+            q25_rse = quantile(r_se, 0.25), q75_rse = quantile(r_se, 0.75),
+            反復数 = n(), .groups = "drop")
+
+n_gt1  <- sum(rse_agg$mean_rse > 1)
+n_infl <- sum(rse_agg$mean_rse > RSE_INFLATED)
+cat(sprintf("反復単位: r_SE > 1 のセルは %s / %s 件（%.1f%%）。1 回の摂動に基づくばらつきを含む。\n",
+            format(sum(rse_cell$r_se > 1), big.mark = ","),
+            format(nrow(rse_cell), big.mark = ","),
+            100 * mean(rse_cell$r_se > 1)))
+cat(sprintf("平均単位（(水準 × ε × 係数) の %d セル）: 平均 r_SE > 1 は %d 件、閾値 %.1f 超は %d 件\n",
+            nrow(rse_agg), n_gt1, RSE_INFLATED, n_infl))
+
+rse_infl <- rse_agg %>% filter(mean_rse > RSE_INFLATED) %>% arrange(desc(mean_rse))
+if (n_infl > 0) {
+  rse_infl %>% head(20) %>%
+    kable(caption = sprintf("平均 r_SE > %.1f（摂動後に SE が膨らんだ）セル（上位 20 行）", RSE_INFLATED),
+          digits = 3) %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE)
+  MGUS_SHARE <- mean(rse_infl$variable == "mgus")
+  gap_lo <- if (any(rse_agg$mean_rse > 1 & rse_agg$mean_rse <= RSE_INFLATED))
+    max(rse_agg$mean_rse[rse_agg$mean_rse > 1 & rse_agg$mean_rse <= RSE_INFLATED]) else 1
+  cat(sprintf("閾値の前後の隔たりは %.2f–%.2f。うち mgus が %.0f%%\n",
+              gap_lo, min(rse_infl$mean_rse), 100 * MGUS_SHARE))
+  stopifnot(MGUS_SHARE > 0.9)
+} else {
+  MGUS_SHARE <- NA_real_
+  cat("平均で見ると SE が膨らむセルは 1 つも無い。初版で報告した 5 件は、抽出が 5 本しか無く",
+      "1 本の外れ値が平均を支配していたことによる（本版は 1000 反復で平均される）\n")
+}
+cat(sprintf("反復単位で最大の r_SE は %.1f（%s・ε=%g・n=%d）\n",
+            max(rse_cell$r_se),
+            rse_cell$variable[which.max(rse_cell$r_se)],
+            rse_cell$epsilon[which.max(rse_cell$r_se)],
+            rse_cell$n_target[which.max(rse_cell$r_se)]))
+```
+
+```{r rse-regression}
+cell_agg <- rse_cell %>%
+  group_by(n_target, epsilon, variable) %>%
+  summarise(r_se      = mean(r_se),
+            se_base   = mean(se_base),
+            beta_base = mean(abs(beta_base)),
+            bias_b    = mean(bias_b),
+            z_eff     = mean(abs(z_eff)),
+            n_cells   = n(), .groups = "drop") %>%
+  mutate(z_base  = beta_base / se_base,
+         shift_z = bias_b / se_base)
+
+slope_tbl <- function(dat) {
+  map_dfr(EPS_FINITE, function(e) {
+    d <- dat %>% filter(epsilon == e)
+    m <- lm(log(r_se) ~ log(n_target) + variable, data = d)
+    ci <- confint(m)["log(n_target)", ]
+    tibble(epsilon = e, セル数 = nrow(d),
+           `log(n) の係数` = unname(coef(m)["log(n_target)"]),
+           `95% 下限` = ci[1], `95% 上限` = ci[2],
+           `p 値` = summary(m)$coefficients["log(n_target)", 4])
+  })
+}
+rse_slope        <- slope_tbl(cell_agg %>% filter(variable != "mgus"))
+rse_slope_allvar <- slope_tbl(cell_agg)
+
+rse_slope %>%
+  kable(caption = paste("【主判定】ε ごとの log(r_SE) ~ log(n) + 係数固定効果（mgus を除く 6 係数）。",
+                        "負の係数は「n が大きいほど SE がより縮む」を意味する（標本サイズ仮説の向き）。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+rse_slope_allvar %>%
+  kable(caption = paste("【感度分析】mgus を含めた 7 係数。ε=30 付近で係数と信頼区間が広がるのは",
+                        "mgus の摂動後 SE の裾によるものであり、他の 6 係数には現れない。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+NRATIO <- max(N_LEVELS) / min(N_LEVELS)
+RSE_SLOPE_MAX       <- max(abs(rse_slope$`log(n) の係数`))
+RSE_SLOPE_CI_MAX    <- max(abs(c(rse_slope$`95% 下限`, rse_slope$`95% 上限`)))
+RSE_SLOPE_MAX_ALL   <- max(abs(rse_slope_allvar$`log(n) の係数`))
+RSE_SLOPE_CI_ALL    <- max(abs(c(rse_slope_allvar$`95% 下限`, rse_slope_allvar$`95% 上限`)))
+RSE_SIGN_POS        <- sum(rse_slope$`95% 下限` > 0)
+RSE_SIGN_NEG        <- sum(rse_slope$`95% 上限` < 0)
+pct <- function(s) 100 * (exp(s * log(NRATIO)) - 1)
+cat(sprintf("【主判定・6 係数】|log(n) の係数| の最大 %.4f（点推定）/ %.4f（信頼区間の端）\n",
+            RSE_SLOPE_MAX, RSE_SLOPE_CI_MAX))
+cat(sprintf("  n を %.1f 倍にしたときの r_SE の変化: 点推定 %.1f%% / 信頼区間の端でも %.1f%%\n",
+            NRATIO, pct(RSE_SLOPE_MAX), pct(RSE_SLOPE_CI_MAX)))
+cat(sprintf("  信頼区間が 0 を含まない ε: 正の側 %d 個 / 負の側 %d 個（全 %d 個）。",
+            RSE_SIGN_POS, RSE_SIGN_NEG, length(EPS_FINITE)))
+cat("正の係数は「n が大きいほど SE の縮みが弱い」であり、標本サイズ仮説とは逆向きである\n")
+cat(sprintf("【感度分析・7 係数】同 %.4f（点推定）/ %.4f（信頼区間の端）。mgus の裾を含むため広がる\n",
+            RSE_SLOPE_MAX_ALL, RSE_SLOPE_CI_ALL))
+stopifnot(nrow(rse_slope) == length(EPS_FINITE), RSE_SLOPE_CI_MAX < 0.2)
+```
+
+```{r channel-decomposition}
+slope_of <- function(d, y) {
+  ok <- is.finite(y)
+  m <- lm(y[ok] ~ log(d$n_target[ok]) + d$variable[ok])
+  unname(coef(m)[2])
+}
+channel_of <- function(dat) {
+  map_dfr(EPS_FINITE, function(e) {
+    d <- dat %>% filter(epsilon == e,
+                        is.finite(log(se_base)), is.finite(log(z_base)),
+                        is.finite(log(abs(shift_z))), is.finite(log(r_se)),
+                        is.finite(log(abs(bias_b))), is.finite(log(z_eff)),
+                        is.finite(log(beta_base)))
+    tibble(epsilon = e, セル数 = nrow(d),
+           `log(SE_base)`    = slope_of(d, log(d$se_base)),
+           `log|z_base|`     = slope_of(d, log(d$z_base)),
+           `log|s(ε)|`       = slope_of(d, log(abs(d$shift_z))),
+           `log(r_SE)`       = slope_of(d, log(d$r_se)),
+           `log|β バイアス|` = slope_of(d, log(abs(d$bias_b))),
+           `log|β_base|`     = slope_of(d, log(d$beta_base)),
+           `log|z_eff|`      = slope_of(d, log(d$z_eff)))
+  })
+}
+channel        <- channel_of(cell_agg %>% filter(variable != "mgus"))
+channel_allvar <- channel_of(cell_agg)
+
+channel %>%
+  kable(caption = paste("【主判定】各量の log を log(n) に回帰したときの傾き（mgus を除く 6 係数、",
+                        "係数を固定効果として調整）。0.5 は √n 則、0 は n 非依存、",
+                        "−0.5 は 1/√n での縮小を意味する。集計単位は (水準 × 係数)。"),
+        digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+channel_allvar %>%
+  kable(caption = "【感度分析】mgus を含めた 7 係数", digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+CH <- function(nm) median(channel[[nm]])
+stopifnot(nrow(channel) == length(EPS_FINITE), !anyNA(channel$`log(r_SE)`))
+cat(sprintf(paste0("中央値: log(SE_base) %.3f / log|z_base| %.3f / log|s(ε)| %.3f / log(r_SE) %.3f / ",
+                   "log|β バイアス| %.3f / log|β_base| %.3f / log|z_eff| %.3f\n"),
+            CH("log(SE_base)"), CH("log|z_base|"), CH("log|s(ε)|"), CH("log(r_SE)"),
+            CH("log|β バイアス|"), CH("log|β_base|"), CH("log|z_eff|")))
+
+stopifnot(
+  length(unique(channel$セル数)) == 1L,
+  channel$セル数[1] == length(N_LEVELS) * (length(VARS) - 1L),
+  length(unique(channel_allvar$セル数)) == 1L,
+  max(abs(channel$`log|s(ε)|` - channel$`log|β バイアス|` + channel$`log(SE_base)`)) < 1e-8,
+  max(abs(channel$`log|z_base|` - channel$`log|β_base|` + channel$`log(SE_base)`)) < 1e-8
+)
+cat(sprintf("行集合の確認: 全 %d 個の ε で回帰の対象が %d セル（%d 水準 × %d 係数）で一定 ✅\n",
+            length(EPS_FINITE), channel$セル数[1], length(N_LEVELS), length(VARS) - 1L))
+cat("傾きの加法性も成立するが、これは s と z_base の定義からの代数的な帰結であり、",
+    "6 本の回帰が同じ行集合を見ていることの確認にすぎない。\n")
+cat("**「n の入口は SE_base による除算だけ」の根拠は、この関係ではなく",
+    "r_SE の傾きが 0 に近いという別個の測定である。**\n")
+```
+
+```{r metric-d}
+z_slope <- baseline_tbl %>%
+  filter(identified) %>%
+  group_by(n_target, variable) %>%
+  summarise(z = mean(abs(z_base)), .groups = "drop") %>%
+  group_by(variable) %>%
+  summarise(セル数 = n(),
+            `log|z_base| ~ log(n) の傾き` = unname(coef(lm(log(z) ~ log(n_target)))[2]),
+            `決定係数` = summary(lm(log(z) ~ log(n_target)))$r.squared,
+            `|z_base| at n=168` = z[n_target == 168L],
+            `|z_base| at n=6524` = z[n_target == max(N_LEVELS)],
+            .groups = "drop")
+z_slope %>%
+  kable(caption = paste("ベースライン Wald 統計量の n 依存（√n 則なら傾き 0.5）。",
+                        "各点は 1000 反復の平均。"), digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+cat(sprintf("係数ごとの傾きの中央値 = %.3f（経路分解のプール回帰では %.3f）\n",
+            median(z_slope$`log|z_base| ~ log(n) の傾き`), CH("log|z_base|")))
+```
+
+```{r nsr-check}
+cont_vars <- names(TYPES)[unlist(TYPES) == "continuous"]
+nsr_var <- sd_tbl %>%
+  group_by(src_var) %>%
+  summarise(`sd(X) 最小` = min(sd_x), `sd(X) 最大` = max(sd_x),
+            `最大 / 最小` = max(sd_x) / min(sd_x),
+            `変動係数` = sd(sd_x) / mean(sd_x), .groups = "drop")
+nsr_trend <- sd_tbl %>%
+  group_by(src_var, n_target) %>% summarise(sd_x = mean(sd_x), .groups = "drop") %>%
+  group_by(src_var) %>%
+  summarise(`水準平均の最大 / 最小` = max(sd_x) / min(sd_x),
+            `rho(n, sd(X) の水準平均)` = cor(n_target, sd_x, method = "spearman"),
+            `p 値` = suppressWarnings(
+              cor.test(n_target, sd_x, method = "spearman", exact = TRUE)$p.value),
+            .groups = "drop")
+nsr_var %>% inner_join(nsr_trend, by = "src_var") %>%
+  kable(caption = paste("nsr は b が固定されているため sd(X) と反比例する。",
+                        "個々の部分標本の間では最大 3 倍前後動くが、**水準平均には n との",
+                        "系統的な傾向がない**（順位相関の p 値を参照）。",
+                        "個々のばらつきは 1000 反復の平均で打ち消される。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+NSR_TREND_MAX_RHO <- max(abs(nsr_trend$`rho(n, sd(X) の水準平均)`))
+NSR_TREND_MIN_P   <- min(nsr_trend$`p 値`)
+NSR_LEVEL_RATIO   <- max(nsr_trend$`水準平均の最大 / 最小`)
+NSR_CELL_RATIO    <- max(nsr_var$`最大 / 最小`)
+stopifnot(nrow(sd_tbl) == length(N_LEVELS) * B_ITER * length(cont_vars),
+          !anyNA(sd_tbl$sd_x), all(sd_tbl$sd_x > 0))
+cat(sprintf("個々の部分標本の間で sd(X) は最大 %.2f 倍動く（したがって nsr も同じだけ動く）。\n",
+            NSR_CELL_RATIO))
+cat(sprintf("水準平均どうしでは最大 %.3f 倍にとどまる。水準平均と n の順位相関は絶対値で最大 %.3f（最小 p = %.4f）。\n",
+            NSR_LEVEL_RATIO, NSR_TREND_MAX_RHO, NSR_TREND_MIN_P))
+if (NSR_TREND_MIN_P < 0.05) {
+  cat("→ 水準平均に n との関係が検出された変数がある。上表の該当変数と倍率を報告書に明記すること。\n")
+} else {
+  cat("→ 水準平均に n との系統的な関係は検出されない（すべての変数で p >= 0.05）。\n")
+}
+cat("いずれにせよ「ノイズ対分散比を固定した」とは書けない。書けるのは",
+    "「Laplace ノイズのスケール b と反転確率を固定した」までである。\n")
+
+cat(sprintf("ε の格子の隣接間隔（decade）: 最小 %.3f / 最大 %.3f。ピークの位置と高さはこの格子に量子化される\n",
+            min(diff(log10(EPS_FINITE))), max(diff(log10(EPS_FINITE)))))
+```
+
+```{r headline}
+pkA <- peaks_fpr %>% filter(str_starts(denominator, "A:"))
+pkB <- peaks_fpr %>% filter(str_starts(denominator, "B:"))
+lsA <- peaks_lsr %>% filter(str_starts(denominator, "A:"))
+gv  <- function(d, nn, col) d[[col]][d$n_target == nn]
+rr  <- function(m, dn) rho_tbl %>% filter(metric == m, str_starts(denominator, dn))
+fmt_rho <- function(r) sprintf("%.3f (厳密 p = %.4f、95%% CI %.2f–%.2f、逆転 %d 箇所)",
+                               r$rho, r$`p 値（厳密）`, r$`95% 下限`, r$`95% 上限`, r$`逆転の数`)
+
+headline <- tibble(
+  指標 = c("A: ピーク FPR（n=168）", "A: ピーク FPR（n=6524）",
+           "A: ピーク位置 ε（n=168 / n=6524）", "A: rho(n, ピーク高さ)",
+           "A: n=168 の上振れ（対応のある比較）",
+           "B: ピーク FPR（n=168）", "B: ピーク FPR（n=6524）", "B: rho(n, ピーク高さ)",
+           "A-LSR: ピーク（n=168 / n=6524）",
+           "C: log(r_SE) ~ log(n) の係数（6 係数・|最大|、点推定）",
+           "C: 同（信頼区間の端）",
+           sprintf("C: n を %.1f 倍にしたときの r_SE の変化（信頼区間の端）", NRATIO),
+           "C: 正規化した r_SE の中央値の範囲",
+           "C: log|s(ε)| ~ log(n) の傾き（中央値）",
+           "C: log|β スケールのバイアス| ~ log(n) の傾き（中央値）",
+           "C: log|z_eff| ~ log(n) の傾き（中央値）",
+           "C: log(SE_base) ~ log(n) の傾き（中央値）",
+           "C: log|β_base| ~ log(n) の傾き（中央値）",
+           "D: log|z_base| ~ log(n) の傾き（係数ごとの中央値 / プール回帰）",
+           "分母サイズ（n=168 / n=6524 の平均）",
+           "CFR（警告ベース）の最大",
+           "識別されない反復の割合（最大）",
+           "集計対象の違いによる FPR の差（中央値 / 最大）",
+           "sd(X) の水準平均と n の順位相関（|最大|）"),
+  値 = c(
+    sprintf("%.4f", gv(pkA, 168L, "peak")), sprintf("%.4f", gv(pkA, 6524L, "peak")),
+    sprintf("%g / %g", gv(pkA, 168L, "peak_eps"), gv(pkA, 6524L, "peak_eps")),
+    fmt_rho(rr("FPR", "A:")),
+    sprintf("%.4f (95%% CI %.4f–%.4f、p = %.4f)",
+            paired_tbl$`上振れ 平均`[paired_tbl$n_target == 168L],
+            paired_tbl$`95% 下限`[paired_tbl$n_target == 168L],
+            paired_tbl$`95% 上限`[paired_tbl$n_target == 168L],
+            paired_tbl$`p 値`[paired_tbl$n_target == 168L]),
+    sprintf("%.4f", gv(pkB, 168L, "peak")), sprintf("%.4f", gv(pkB, 6524L, "peak")),
+    fmt_rho(rr("FPR", "B:")),
+    sprintf("%.4f / %.4f", gv(lsA, 168L, "peak"), gv(lsA, 6524L, "peak")),
+    sprintf("%.4f", RSE_SLOPE_MAX),
+    sprintf("%.4f（7 係数版は点推定 %.4f / 信頼区間の端 %.4f）",
+            RSE_SLOPE_CI_MAX, RSE_SLOPE_MAX_ALL, RSE_SLOPE_CI_ALL),
+    sprintf("%.1f%%（点推定では %.1f%%）", pct(RSE_SLOPE_CI_MAX), pct(RSE_SLOPE_MAX)),
+    sprintf("%.3f–%.3f", RSE_REL_RANGE[1], RSE_REL_RANGE[2]),
+    sprintf("%.3f", CH("log|s(ε)|")), sprintf("%.3f", CH("log|β バイアス|")),
+    sprintf("%.3f", CH("log|z_eff|")), sprintf("%.3f", CH("log(SE_base)")),
+    sprintf("%.3f", CH("log|β_base|")),
+    sprintf("%.3f / %.3f", median(z_slope$`log|z_base| ~ log(n) の傾き`), CH("log|z_base|")),
+    sprintf("%.2f / %.2f", gv(pkA, 168L, "mean_denom"), gv(pkA, 6524L, "mean_denom")),
+    sprintf("%.3f", max(cfr_tbl$cfr)),
+    sprintf("%.3f", max(id_by_n$`その割合`)),
+    sprintf("%.5f / %.5f", CONV_SENS_MED, CONV_SENS_MAX),
+    sprintf("%.3f (最小 p = %.3f)", NSR_TREND_MAX_RHO, NSR_TREND_MIN_P))
+)
+headline %>% kable(caption = "実験 B-2（再実施版）の主要数値（報告書への転記用）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r write-outputs}
+out_files <- list(
+  fpr_subsampling_subsamples   = sub_diag,
+  fpr_subsampling_baseline     = baseline_tbl %>%
+    group_by(n_target, variable) %>%
+    summarise(反復数 = n(), 識別された反復 = sum(identified),
+              有意だった反復 = sum(sig_base & identified),
+              beta_base = mean(beta_base[identified]), se_base = mean(se_base[identified]),
+              z_base = mean(abs(z_base[identified])), .groups = "drop"),
+  fpr_subsampling_curves       = curves,
+  fpr_subsampling_peaks        = peaks,
+  fpr_subsampling_rho          = rho_tbl,
+  fpr_subsampling_paired       = paired_tbl,
+  fpr_subsampling_rse          = rse_summary,
+  fpr_subsampling_rse_by_var    = rse_agg,
+  fpr_subsampling_rse_rel      = rse_rel,
+  fpr_subsampling_rse_slope    = rse_slope,
+  fpr_subsampling_rse_slope_allvar = rse_slope_allvar,
+  fpr_subsampling_rse_inflated = rse_infl,
+  fpr_subsampling_channels     = channel,
+  fpr_subsampling_channels_allvar = channel_allvar,
+  fpr_subsampling_cfr          = cfr_tbl,
+  fpr_subsampling_conv_sens    = sens,
+  fpr_subsampling_zbase        = z_slope,
+  fpr_subsampling_nsr          = nsr_var %>% inner_join(nsr_trend, by = "src_var"),
+  fpr_subsampling_identification = id_by_n,
+  fpr_subsampling_headline     = headline
+)
+
+out_csv <- paste0(names(out_files), ".csv")
+stopifnot(all(startsWith(names(out_files), "fpr_subsampling_")))
+
+stale <- setdiff(list.files(eval_dir, pattern = "^fpr_subsampling_.*\\.csv$"), out_csv)
+if (length(stale) > 0) {
+  file.remove(file.path(eval_dir, stale))
+  cat(sprintf("旧版の残存ファイル %d 件を削除: %s\n", length(stale), paste(stale, collapse = ", ")))
+}
+
+foreign <- setdiff(list.files(eval_dir, pattern = "\\.csv$"), out_csv)
+stopifnot(!any(startsWith(foreign, "fpr_subsampling_")))
+cat("出力名の検査: 名前空間 OK / 他の生成元との衝突 0 件 ✅\n")
+
+iwalk(out_files, function(df, nm) {
+  path <- file.path(eval_dir, paste0(nm, ".csv"))
+  write.csv(df, path, row.names = FALSE)
+  cat(sprintf("%-45s %6d 行\n", basename(path), nrow(df)))
+})
+cat(sprintf("\n中間データ: CSV %d ファイル + 生データ fpr_subsampling_raw.rds 1 ファイル\n",
+            length(out_files)))
+```
+
+```{r conclusion}
+tibble(
+  問い = c(
+    "flchain を lung と同じ n=168 まで小さくしてもピークは残るか",
+    "ピーク高さは n とともに増えるか（分母を反復ごとに引き直し）",
+    "ピーク高さは n とともに増えるか（全データの非有意 3 係数に限定）",
+    "SE 縮小率 r_SE は n に依存するか（機序の主エンドポイント）",
+    "では n はどの経路で FPR に効いているか",
+    "有意性の喪失（LSR）は n とともにどう動くか",
+    "小標本での識別可能性"
+  ),
+  答え = c(
+    sprintf("ほぼ消える。n=168 でピーク %.3f（プラトー %.3f からの上振れ %.4f、95%% CI %.4f–%.4f、p = %.4f）、n=6524 でピーク %.3f",
+            gv(pkA, 168L, "peak"), gv(pkA, 168L, "plateau"),
+            paired_tbl$`上振れ 平均`[paired_tbl$n_target == 168L],
+            paired_tbl$`95% 下限`[paired_tbl$n_target == 168L],
+            paired_tbl$`95% 上限`[paired_tbl$n_target == 168L],
+            paired_tbl$`p 値`[paired_tbl$n_target == 168L], gv(pkA, 6524L, "peak")),
+    sprintf("増える。%s", fmt_rho(rr("FPR", "A:"))),
+    sprintf("増える。%s", fmt_rho(rr("FPR", "B:"))),
+    sprintf("実用上は依存しない（mgus を除く 6 係数）。log(r_SE) ~ log(n) の係数は全 %d ε で |.| <= %.4f（信頼区間の端でも %.4f）。n を %.1f 倍にしても %.1f%% の変化。符号は正であり、標本サイズ仮説とは逆向き",
+            length(EPS_FINITE), RSE_SLOPE_MAX, RSE_SLOPE_CI_MAX, NRATIO, pct(RSE_SLOPE_CI_MAX)),
+    sprintf("SE 単位の量。log(n) に対する傾きの中央値は z_base %.2f・s(ε) %.2f・z_eff %.2f、一方 β スケールはバイアス %.2f・β_base %.2f と増えない",
+            CH("log|z_base|"), CH("log|s(ε)|"), CH("log|z_eff|"),
+            CH("log|β バイアス|"), CH("log|β_base|")),
+    sprintf("n=168 でピーク %.3f、n=6524 で %.3f。低 ε ではどちらもほぼ全係数が有意性を失う",
+            gv(lsA, 168L, "peak"), gv(lsA, 6524L, "peak")),
+    sprintf("mgus が識別されない反復は最大 %.1f%%（n=%d）。原因は有病率 %.2f%% の二値共変量の分離であり DP メカニズムではない",
+            100 * max(id_by_n$`その割合`), id_by_n$n_target[which.max(id_by_n$`その割合`)],
+            100 * MGUS_PREV)
+  )
+) %>%
+  kable(caption = "実験 B-2（再実施版）の結果サマリー") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```
+

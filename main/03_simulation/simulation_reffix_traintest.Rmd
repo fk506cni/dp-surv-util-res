@@ -1,0 +1,355 @@
+---
+title: "参照レベル修正アーム（train/test）"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(width = 130)
+```
+
+```{r libs}
+library(survival)
+library(dplyr)
+library(readr)
+library(arrow)
+library(knitr)
+library(callr)
+
+PROJECT_DIR <- "/home/rstudio/project"
+REFFIX_SMOKE <- identical(Sys.getenv("REFFIX_SMOKE"), "1")
+OUT_DIR     <- file.path(PROJECT_DIR, if (REFFIX_SMOKE) "data/variants/reffix_traintest_smoke" else "data/03_simulation/reffix_traintest")
+PREP_DIR    <- file.path(PROJECT_DIR, "data/01_prepared")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+source(file.path(PROJECT_DIR, "main/03_simulation/R/dp_fast.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+source(file.path(PROJECT_DIR, "main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R"))
+source(file.path(PROJECT_DIR, "main/03_simulation/R/data_split.R"))
+source(file.path(PROJECT_DIR, "main/03_simulation/R/simulation_engine.R"))
+
+BASE_SEED <- 42L
+SPLIT_BASE_SEED <- 100000L
+DATASET_SEED_OFFSET <- c(lung = 0L, pbc = 100000L, colon = 200000L,
+                         rotterdam = 300000L, flchain = 400000L)
+DATASETS <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+
+B_TEST <- 10L
+B_PROD <- 1000L
+B <- if (REFFIX_SMOKE) B_TEST else B_PROD
+cat(sprintf("B = %d, SPLIT_BASE_SEED = %d\n", B, SPLIT_BASE_SEED))
+
+PREV_DIR <- file.path(tempdir(), "reffix_tt_prev")
+dir.create(PREV_DIR, showWarnings = FALSE, recursive = TRUE)
+prev_files <- list.files(OUT_DIR, pattern = "\\.parquet$", full.names = TRUE)
+if (length(prev_files) > 0) file.copy(prev_files, PREV_DIR, overwrite = TRUE)
+cat(sprintf("前回実行の退避: %d 件\n", length(prev_files)))
+
+dat <- setNames(lapply(DATASETS, function(d)
+  as.data.frame(read_csv(file.path(PREP_DIR, paste0(d, "_prepared.csv")),
+                         show_col_types = FALSE))), DATASETS)
+```
+
+```{r p12-runner}
+run_p12_tt <- function(data, dataset_name, B, seed, phase) {
+  callr::r(function(data, dataset_name, B, seed, phase) {
+    library(survival); library(dplyr); library(furrr); library(progressr)
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_survival_time.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_event_indicator.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase2.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine_traintest.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    bounds <- CLIPPING_BOUNDS[[dataset_name]]; types <- COVARIATE_TYPES[[dataset_name]]
+    perturb_fn <- if (phase == 1L) {
+      function(data, epsilon)
+        perturb_covariates_phase1_fast(data, bounds, epsilon, types,
+                                       preserve_factor_levels = TRUE)
+    } else {
+      tmax <- T_MAX[[dataset_name]]
+      function(data, epsilon)
+        perturb_all_phase2(data, bounds, tmax, epsilon, types,
+                           preserve_factor_levels = TRUE)$data
+    }
+    res <- run_simulation_batch_traintest(
+      data = data, perturb_fn = perturb_fn, epsilon_values = EPSILON_VALUES,
+      B = B, base_seed = seed, cox_formula = COX_FORMULAS[[dataset_name]],
+      dataset_name = dataset_name, split_base_seed = 100000)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed, phase = phase))
+}
+```
+
+```{r p12-run, results='hide'}
+t0 <- Sys.time()
+p1_tt <- bind_rows(lapply(DATASETS, function(d)
+  run_p12_tt(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]], 1L) %>% mutate(dataset = d)))
+p2_tt <- bind_rows(lapply(DATASETS, function(d)
+  run_p12_tt(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]], 2L) %>% mutate(dataset = d)))
+p12_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r p12-save}
+cat(sprintf("Phase 1: %d 行 / Phase 2: %d 行 / %.1f 分\n",
+            nrow(p1_tt), nrow(p2_tt), as.numeric(p12_time)))
+write_csv(p1_tt, file.path(OUT_DIR, "all_phase1_reffix_traintest.csv"))
+write_parquet(p1_tt, file.path(OUT_DIR, "all_phase1_reffix_traintest.parquet"))
+write_csv(p2_tt, file.path(OUT_DIR, "all_phase2_reffix_traintest.csv"))
+write_parquet(p2_tt, file.path(OUT_DIR, "all_phase2_reffix_traintest.parquet"))
+```
+
+```{r p3-runner}
+run_p3_tt <- function(data, dataset_name, B, seed) {
+  callr::r(function(data, dataset_name, B, seed) {
+    library(survival); library(dplyr); library(furrr); library(progressr); library(splines)
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/survival_stacking.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_discrete_time.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase3.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_phase3.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_phase3_traintest.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    res <- run_simulation_batch_phase3_traintest(
+      data = data, epsilon_values = EPSILON_VALUES, B = B, base_seed = seed,
+      K = K_VALUES[[dataset_name]], clipping_bounds = CLIPPING_BOUNDS[[dataset_name]],
+      covariate_types = COVARIATE_TYPES[[dataset_name]],
+      cox_formula = COX_FORMULAS[[dataset_name]], dataset_name = dataset_name,
+      split_base_seed = 100000, preserve_factor_levels = TRUE)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed))
+}
+```
+
+```{r p3-run, results='hide'}
+t0 <- Sys.time()
+p3_tt <- bind_rows(lapply(DATASETS, function(d)
+  run_p3_tt(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]]) %>% mutate(dataset = d)))
+p3_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r p3-save}
+cat(sprintf("Phase 3: %d 行 / %.1f 分\n", nrow(p3_tt), as.numeric(p3_time)))
+write_csv(p3_tt, file.path(OUT_DIR, "all_phase3_reffix_traintest.csv"))
+write_parquet(p3_tt, file.path(OUT_DIR, "all_phase3_reffix_traintest.parquet"))
+```
+
+```{r out-runner}
+run_out_tt <- function(data, dataset_name, B, seed, use_dfbeta, standardize) {
+  callr::r(function(data, dataset_name, B, seed, use_dfbeta, standardize) {
+    library(survival); library(dplyr); library(furrr); library(progressr)
+    source("/home/rstudio/project/main/03_simulation/R/data_split.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R")
+    source("/home/rstudio/project/main/02_dp_mechanisms/R/dp_output_perturbation.R")
+    source("/home/rstudio/project/main/04_evaluation/R/dp_aware_pvalue.R")
+    source("/home/rstudio/project/main/03_simulation/R/dp_fast.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_engine.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_output.R")
+    source("/home/rstudio/project/main/03_simulation/R/simulation_output_traintest.R")
+    n_workers <- min(10, parallel::detectCores() - 1)
+    Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
+               VECLIB_MAXIMUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+    plan(multisession, workers = n_workers)
+    res <- run_output_simulation_batch_traintest(
+      data = data, cox_formula = COX_FORMULAS[[dataset_name]],
+      epsilon_values = EPSILON_VALUES, B = B, base_seed = seed,
+      clipping_bounds = CLIPPING_BOUNDS[[dataset_name]],
+      covariate_types = COVARIATE_TYPES[[dataset_name]],
+      dataset_name = dataset_name, split_base_seed = 100000,
+      standardize = standardize, use_dfbeta = use_dfbeta)
+    plan(sequential); res
+  }, args = list(data = data, dataset_name = dataset_name, B = B, seed = seed,
+                 use_dfbeta = use_dfbeta, standardize = standardize))
+}
+```
+
+```{r out-run, results='hide'}
+t0 <- Sys.time()
+out_df_tt <- bind_rows(lapply(DATASETS, function(d)
+  run_out_tt(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]],
+             use_dfbeta = TRUE, standardize = FALSE) %>% mutate(dataset = d)))
+out_std_tt <- bind_rows(lapply(DATASETS, function(d)
+  run_out_tt(dat[[d]], d, B, BASE_SEED + DATASET_SEED_OFFSET[[d]],
+             use_dfbeta = FALSE, standardize = TRUE) %>% mutate(dataset = d)))
+out_time <- difftime(Sys.time(), t0, units = "mins")
+```
+
+```{r out-save}
+cat(sprintf("出力摂動: dfbeta %d 行 / std %d 行 / %.1f 分\n",
+            nrow(out_df_tt), nrow(out_std_tt), as.numeric(out_time)))
+write_csv(out_df_tt, file.path(OUT_DIR, "all_output_dfbeta_reffix_traintest.csv"))
+write_parquet(out_df_tt, file.path(OUT_DIR, "all_output_dfbeta_reffix_traintest.parquet"))
+write_csv(out_std_tt, file.path(OUT_DIR, "all_output_std_reffix_traintest.csv"))
+write_parquet(out_std_tt, file.path(OUT_DIR, "all_output_std_reffix_traintest.parquet"))
+```
+
+```{r compare-gate}
+COMPARE_OK <- (B == B_PROD)
+if (!COMPARE_OK) cat(sprintf("B = %d はスモークのため照合をスキップする\n", B))
+```
+
+```{r compare-setup}
+old_paths <- c(
+  phase1 = "all_phase1_traintest.parquet",
+  phase2 = "all_phase2_traintest.parquet",
+  phase3 = "all_phase3_traintest.parquet",
+  output_dfbeta = "all_output_dfbeta_traintest.parquet",
+  output_std    = "all_output_std_traintest.parquet"
+)
+new_tbl <- list(phase1 = p1_tt, phase2 = p2_tt, phase3 = p3_tt,
+                output_dfbeta = out_df_tt, output_std = out_std_tt)
+
+key_cols <- c("dataset", "variable", "epsilon", "iteration")
+num_cols <- c("beta", "se", "p_value", "c_index", "c_index_test")
+
+rel_diff <- function(a, b) {
+  d <- abs(a - b) / pmax(1, abs(a), abs(b), na.rm = TRUE)
+  d[is.na(a) & is.na(b)] <- 0
+  d[xor(is.na(a), is.na(b))] <- Inf
+  d
+}
+
+present_original <- file.exists(file.path(PROJECT_DIR, "data/03_simulation/traintest", old_paths))
+if (any(present_original) && !all(present_original))
+  stop("The submission-version arm is only partly present: ", paste(old_paths[!present_original], collapse = ", "))
+HAS_ORIGINAL_ARM <- all(present_original)
+if (COMPARE_OK && !HAS_ORIGINAL_ARM)
+  cat("The submission-version arm is not present; the comparison with it is skipped.\n")
+```
+
+```{r compare-existing, eval=COMPARE_OK && HAS_ORIGINAL_ARM}
+cmp_rows <- bind_rows(lapply(names(old_paths), function(arm) {
+  f <- file.path(PROJECT_DIR, "data/03_simulation/traintest", old_paths[[arm]])
+  if (!file.exists(f)) return(tibble(arm = arm, dataset = NA_character_,
+                                     状態 = "既存ファイルなし", n = NA_integer_,
+                                     最大相対差 = NA_real_))
+  old <- as.data.frame(read_parquet(f)); new <- as.data.frame(new_tbl[[arm]])
+  stopifnot(all(key_cols %in% names(old)), all(key_cols %in% names(new)))
+  cols <- intersect(intersect(names(old), names(new)), c(key_cols, num_cols))
+  j <- inner_join(old[, cols], new[, cols], by = key_cols, suffix = c("_o", "_n"))
+  nc <- intersect(num_cols, cols)
+  j$maxdiff <- do.call(pmax, c(lapply(nc, function(v)
+    rel_diff(j[[paste0(v, "_o")]], j[[paste0(v, "_n")]])), list(na.rm = TRUE)))
+  j %>% group_by(dataset) %>%
+    summarise(n = n(), 最大相対差 = max(maxdiff, na.rm = TRUE), .groups = "drop") %>%
+    mutate(arm = arm, .before = 1) %>%
+    mutate(状態 = case_when(最大相対差 == 0 ~ "完全一致",
+                            最大相対差 < 1e-10 ~ sprintf("数値誤差内（%.1e）", 最大相対差),
+                            TRUE ~ sprintf("差あり（%.3g）", 最大相対差))) %>%
+    select(arm, dataset, 状態, n, 最大相対差)
+}))
+kable(cmp_rows, caption = "既存 train/test アームとの行単位照合")
+
+unmatched <- bind_rows(lapply(names(old_paths), function(arm) {
+  f <- file.path(PROJECT_DIR, "data/03_simulation/traintest", old_paths[[arm]])
+  if (!file.exists(f)) return(NULL)
+  old <- as.data.frame(read_parquet(f)); new <- as.data.frame(new_tbl[[arm]])
+  k <- key_cols
+  bind_rows(
+    anti_join(old[, k], new[, k], by = k) %>%
+      distinct(dataset, variable) %>% mutate(arm = arm, side = "既存アームのみ"),
+    anti_join(new[, k], old[, k], by = k) %>%
+      distinct(dataset, variable) %>% mutate(arm = arm, side = "本アームのみ"))
+}))
+kable(unmatched %>% arrange(arm, dataset, variable),
+      caption = "突合できなかった (dataset, variable)（想定は colon の rx 係数のみ）")
+stopifnot(nrow(unmatched) > 0,
+          all(unmatched$dataset == "colon"),
+          all(grepl("^rx", unmatched$variable)))
+
+n_coef <- vapply(DATASETS, function(d)
+  length(coef(coxph(COX_FORMULAS[[d]], data = dat[[d]]))), integer(1L))
+expect_n <- cmp_rows %>% filter(!is.na(dataset), dataset != "colon") %>%
+  mutate(期待件数 = n_coef[as.character(dataset)] * length(EPSILON_VALUES) * B,
+         一致 = (n == 期待件数))
+kable(expect_n %>% select(arm, dataset, n, 期待件数, 一致),
+      caption = "突合件数と期待件数（colon 以外）")
+stopifnot(all(expect_n$一致))
+cat("突合できなかったのは colon の rx 係数のみ / 非 colon の突合件数は期待どおり ✅\n")
+
+inp <- cmp_rows %>% filter(arm %in% c("phase1", "phase2", "phase3"), !is.na(dataset))
+out <- cmp_rows %>% filter(arm %in% c("output_dfbeta", "output_std"), !is.na(dataset))
+out_df <- cmp_rows %>% filter(arm == "output_dfbeta", !is.na(dataset))
+stopifnot(all(inp$最大相対差[inp$dataset != "colon"] < 1e-10),
+          all(out$最大相対差 < 1e-10),
+          all(out_df$最大相対差 == 0))
+cat(sprintf(paste0("入力摂動: colon 以外が一致（最大相対差 %.1e）/ ",
+                   "出力摂動: 全データセットが一致（最大相対差 %.1e、dfbeta はビット一致を検査済み）✅\n"),
+            max(inp$最大相対差[inp$dataset != "colon"]), max(out$最大相対差)))
+```
+
+```{r rx-names, eval=COMPARE_OK}
+rx_tbl <- bind_rows(lapply(names(new_tbl), function(arm) {
+  x <- new_tbl[[arm]] %>% filter(dataset == "colon", grepl("^rx", variable))
+  x %>% mutate(eps_grp = ifelse(is.infinite(epsilon), "Inf", "finite")) %>%
+    distinct(eps_grp, variable) %>% group_by(eps_grp) %>%
+    summarise(vars = paste(sort(variable), collapse = ", "), .groups = "drop") %>%
+    mutate(arm = arm, .before = 1)
+}))
+kable(rx_tbl, caption = "本アームの colon rx 係数名（ε=∞ と有限 ε で同じになるはず）")
+stopifnot(all(rx_tbl$vars == "rxLev, rxLev+5FU"))
+cat("ε=∞ と有限 ε で係数名が一致し、どちらも対照群 Obs 基準になった ✅\n")
+```
+
+```{r self-repro-tt, eval=COMPARE_OK}
+self_paths <- c(phase1 = "all_phase1_reffix_traintest.parquet",
+                phase2 = "all_phase2_reffix_traintest.parquet",
+                phase3 = "all_phase3_reffix_traintest.parquet",
+                output_dfbeta = "all_output_dfbeta_reffix_traintest.parquet",
+                output_std    = "all_output_std_reffix_traintest.parquet")
+self_rows <- bind_rows(lapply(names(self_paths), function(arm) {
+  f <- file.path(PREV_DIR, self_paths[[arm]])
+  if (!file.exists(f)) return(tibble(arm = arm, 状態 = "前回実行なし（初回）",
+                                     n = NA_integer_, 最大相対差 = NA_real_))
+  prev <- as.data.frame(read_parquet(f)); cur <- as.data.frame(new_tbl[[arm]])
+  cols <- intersect(intersect(names(prev), names(cur)), c(key_cols, num_cols))
+  j <- inner_join(prev[, cols], cur[, cols], by = key_cols, suffix = c("_p", "_c"))
+  nc <- intersect(num_cols, cols)
+  md <- do.call(pmax, c(lapply(nc, function(v)
+    rel_diff(j[[paste0(v, "_p")]], j[[paste0(v, "_c")]])), list(na.rm = TRUE)))
+  tibble(arm = arm,
+         状態 = if (max(md) == 0) "ビット一致" else sprintf("差あり（%.1e）", max(md)),
+         n = nrow(j), 最大相対差 = max(md))
+}))
+kable(self_rows, caption = "前回の本アーム実行との突合（自己再現性）")
+if (all(!is.na(self_rows$最大相対差))) {
+  cat(sprintf("自己再現性: %d アーム中 %d アームがビット一致\n",
+              nrow(self_rows), sum(self_rows$最大相対差 == 0)))
+}
+```
+
+```{r summary}
+tibble(
+  アーム = c("Phase 1", "Phase 2", "Phase 3", "出力摂動 (dfbeta)", "出力摂動 (std)"),
+  行数 = c(nrow(p1_tt), nrow(p2_tt), nrow(p3_tt), nrow(out_df_tt), nrow(out_std_tt)),
+  収束率 = sprintf("%.4f", c(mean(p1_tt$converged), mean(p2_tt$converged), mean(p3_tt$converged),
+                             mean(out_df_tt$converged), mean(out_std_tt$converged)))
+) %>% kable(caption = sprintf("本アームの実行結果（B = %d）", B))
+cat(sprintf("\n合計所要: %.1f 分\n出力先: %s\n",
+            as.numeric(p12_time) + as.numeric(p3_time) + as.numeric(out_time), OUT_DIR))
+```
+
+```{r session-info}
+sessionInfo()
+```
+

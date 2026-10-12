@@ -1,0 +1,849 @@
+---
+title: "FPR 逆 U 字の機序分解"
+author: "dp-surv-util"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dpi = 150)
+options(width = 120)
+```
+
+```{r libraries}
+library(tidyverse)
+library(arrow)
+library(knitr)
+library(kableExtra)
+```
+
+```{r paths}
+project_dir <- "/home/rstudio/project"
+sim_dir     <- file.path(project_dir, "data/03_simulation")
+eval_dir    <- file.path(project_dir, "data/04_evaluation")
+prep_dir    <- file.path(project_dir, "data/01_prepared")
+
+ARM <- "reffix"
+stopifnot(ARM %in% c("submitted", "reffix"))
+
+ARM_SUFFIX <- if (ARM == "reffix") "_reffix" else ""
+
+SIM_FILES <- if (ARM == "reffix") {
+  c("Phase 1" = "reffix/all_phase1_reffix.parquet",
+    "Phase 2" = "reffix/all_phase2_reffix.parquet",
+    "Phase 3" = "reffix/all_phase3_reffix.parquet")
+} else {
+  c("Phase 1" = "phase1_covariates/all_phase1_results.parquet",
+    "Phase 2" = "phase2_full_input/all_phase2_results.parquet",
+    "Phase 3" = "phase3_discrete/all_phase3_results.parquet")
+}
+
+BASELINE_FILE <- if (ARM == "reffix") "baseline_cox_reffix.csv" else "baseline_cox_results.csv"
+
+cat("アーム:", ARM, " / 出力接尾辞:", if (ARM_SUFFIX == "") "(なし)" else ARM_SUFFIX, "\n")
+
+ALPHAS        <- c(0.01, 0.05, 0.10)
+ALPHA_REF     <- 0.05
+DATASET_ORDER <- c("lung", "pbc", "colon", "rotterdam", "flchain")
+INPUT_PHASES  <- c("Phase 1", "Phase 2", "Phase 3")
+FOCUS_PHASE   <- "Phase 1"
+```
+
+```{r load-simulation}
+sim_raw <- imap_dfr(SIM_FILES, function(rel, ph) {
+  read_parquet(file.path(sim_dir, rel)) %>% mutate(phase = ph)
+}) %>%
+  select(dataset, variable, epsilon, iteration, beta, se, p_value, converged, phase)
+
+EPSILON_GRID <- sort(unique(sim_raw$epsilon))
+EPS_FINITE   <- EPSILON_GRID[is.finite(EPSILON_GRID)]
+stopifnot(length(EPSILON_GRID) == 15L, length(EPS_FINITE) == 14L)
+cat("読み込み行数:", nrow(sim_raw), " / ε グリッド:", length(EPSILON_GRID), "点\n")
+```
+
+```{r load-baseline}
+baseline <- read.csv(file.path(prep_dir, BASELINE_FILE), stringsAsFactors = FALSE) %>%
+  select(dataset, variable, beta_base = beta, se_base = se, z_base = z, p_cox = p_value)
+
+EXPECTED_ONLY_BASELINE <- if (ARM == "reffix") character(0) else c("pbc sexf", "colon rxLev")
+EXPECTED_ONLY_SIM      <- if (ARM == "reffix") character(0) else c("pbc sexm", "colon rxObs")
+sim_names     <- sim_raw %>% distinct(dataset, variable)
+only_baseline <- anti_join(baseline, sim_names, by = c("dataset", "variable"))
+only_sim      <- anti_join(sim_names, baseline, by = c("dataset", "variable"))
+stopifnot(nrow(only_baseline) == length(EXPECTED_ONLY_BASELINE),
+          setequal(paste(only_baseline$dataset, only_baseline$variable),
+                   EXPECTED_ONLY_BASELINE),
+          nrow(only_sim) == length(EXPECTED_ONLY_SIM),
+          setequal(paste(only_sim$dataset, only_sim$variable), EXPECTED_ONLY_SIM))
+baseline_used <- baseline %>% semi_join(sim_names, by = c("dataset", "variable"))
+cat("照合可能なベースライン Cox 係数:", nrow(baseline_used), "行\n")
+```
+
+```{r load-covariate-info}
+source(file.path(project_dir, "main/02_dp_mechanisms/R/dp_input_perturbation_phase1.R"))
+
+prepared <- map(set_names(DATASET_ORDER), function(ds) {
+  read.csv(file.path(prep_dir, paste0(ds, "_prepared.csv")), stringsAsFactors = FALSE)
+})
+
+N_VALUES <- vapply(prepared, nrow, integer(1))
+Q_VALUES <- vapply(DATASET_ORDER, function(ds) length(COVARIATE_TYPES[[ds]]), integer(1))
+names(Q_VALUES) <- DATASET_ORDER
+
+stopifnot(identical(as.integer(N_VALUES[DATASET_ORDER]),
+                    c(168L, 312L, 929L, 2982L, 6524L)),
+          identical(as.integer(Q_VALUES[DATASET_ORDER]),
+                    c(7L, 17L, 11L, 9L, 7L)))
+
+covar_info <- baseline_used %>%
+  rowwise() %>%
+  mutate(
+    src_var = {
+      cand <- names(COVARIATE_TYPES[[dataset]])
+      hit <- cand[vapply(cand, function(v) identical(v, variable) || startsWith(variable, v),
+                         logical(1))]
+      if (length(hit) == 0) NA_character_ else hit[which.max(nchar(hit))]
+    }
+  ) %>%
+  ungroup() %>%
+  mutate(
+    vtype   = map2_chr(dataset, src_var,
+                       ~ if (is.na(.y)) NA_character_ else COVARIATE_TYPES[[.x]][[.y]]),
+    range_j = map2_dbl(dataset, src_var, function(ds, v) {
+      if (is.na(v)) return(NA_real_)
+      b <- CLIPPING_BOUNDS[[ds]][[v]]
+      if (is.null(b) || length(b) != 2L || !is.numeric(b)) NA_real_ else diff(b)
+    }),
+    sd_x    = map2_dbl(dataset, src_var, function(ds, v) {
+      if (is.na(v) || !v %in% names(prepared[[ds]])) return(NA_real_)
+      x <- prepared[[ds]][[v]]
+      if (!is.numeric(x)) NA_real_ else sd(x)
+    }),
+    n = N_VALUES[dataset], q = Q_VALUES[dataset]
+  )
+
+stopifnot(
+  !anyNA(covar_info$src_var), !anyNA(covar_info$vtype), !anyNA(covar_info$n),
+  !anyNA(covar_info$range_j[covar_info$vtype == "continuous"]),
+  !anyNA(covar_info$sd_x[covar_info$vtype == "continuous"]),
+  sum(covar_info$vtype == "continuous") > 0
+)
+covar_info %>% count(dataset, vtype, name = "n_coef") %>%
+  pivot_wider(names_from = vtype, values_from = n_coef, values_fill = 0L) %>%
+  kable(caption = "ベースライン Cox 係数の摂動機構別内訳（tabS5 は元変数単位、こちらは係数単位）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r load-alpha-outputs}
+alpha_fpr_detail <- read.csv(file.path(eval_dir,
+                                       paste0("alpha_sensitivity_fpr_detail", ARM_SUFFIX, ".csv")),
+                             stringsAsFactors = FALSE)
+ALPHA_CSV_ALL   <- list.files(eval_dir, pattern = "^alpha_sensitivity_.*\\.csv$", full.names = TRUE)
+is_reffix_csv   <- endsWith(basename(ALPHA_CSV_ALL), "_reffix.csv")
+ALPHA_CSV_FILES <- ALPHA_CSV_ALL[if (ARM == "reffix") is_reffix_csv else !is_reffix_csv]
+stopifnot(length(ALPHA_CSV_FILES) == 8L)
+ALPHA_CSV_MTIME  <- max(file.mtime(ALPHA_CSV_FILES))
+alpha_src <- file.path(project_dir, "main/04_evaluation/alpha_sensitivity.Rmd")
+alpha_csv <- file.path(eval_dir, paste0("alpha_sensitivity_fpr_detail", ARM_SUFFIX, ".csv"))
+stopifnot(all(file.exists(c(alpha_src, alpha_csv))))
+if (file.mtime(alpha_csv) < file.mtime(alpha_src)) {
+  stop(basename(alpha_csv), " が alpha_sensitivity.Rmd より古い。先に再 knit すること。",
+       call. = FALSE)
+}
+cat("実験 A の係数レベル FPR:", nrow(alpha_fpr_detail), "行\n")
+```
+
+```{r identity-check}
+identity_chk <- map_dfr(ALPHAS, function(a) {
+  zc <- qnorm(1 - a / 2)
+  sim_raw %>%
+    filter(converged, phase %in% INPUT_PHASES) %>%
+    summarise(alpha = a,
+              n_rows = n(),
+              n_mismatch = sum((p_value < a) != (abs(beta / se) > zc)))
+})
+
+identity_chk %>%
+  kable(caption = "有意判定の同値性（不一致 0 なら Wald 検定の定義どおり）") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(nrow(identity_chk) == length(ALPHAS),
+          !anyNA(identity_chk$n_mismatch),
+          all(identity_chk$n_rows > 0),
+          all(identity_chk$n_mismatch == 0L))
+cat("3 水準すべてで不一致 0 行 ✅（以降の β / SE 分解は厳密に FPR を再現する）\n")
+```
+
+```{r coef-peaks}
+coef_peaks <- alpha_fpr_detail %>%
+  filter(phase %in% INPUT_PHASES, is.finite(epsilon)) %>%
+  group_by(alpha, dataset, phase, variable) %>%
+  slice_max(fpr, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(alpha, dataset, phase, variable, peak_eps = epsilon, peak_fpr = fpr) %>%
+  left_join(covar_info, by = c("dataset", "variable")) %>%
+  mutate(dist = log10(p_cox) - log10(alpha),
+         dataset = factor(dataset, levels = DATASET_ORDER))
+
+denom_ref <- read.csv(file.path(eval_dir,
+                                 paste0("alpha_sensitivity_denominators", ARM_SUFFIX, ".csv")),
+                      stringsAsFactors = FALSE)
+expected_peaks <- denom_ref %>% summarise(n = sum(n_nonsig_coef)) %>% pull(n)
+stopifnot(nrow(coef_peaks) == expected_peaks,
+          !anyNA(coef_peaks$peak_fpr), !anyNA(coef_peaks$dist),
+          all(coef_peaks$peak_eps %in% EPS_FINITE))
+cat("係数レベルのピーク:", nrow(coef_peaks), "行（実験 A の分母合計と一致）✅\n")
+
+N_NONSIG_P1 <- sum(coef_peaks$phase == FOCUS_PHASE & coef_peaks$alpha == ALPHA_REF)
+stopifnot(N_NONSIG_P1 == (denom_ref %>%
+  filter(alpha == ALPHA_REF, phase == FOCUS_PHASE) %>% summarise(n = sum(n_nonsig_coef)) %>% pull(n)))
+cat("Phase 1・α=", ALPHA_REF, " の非有意係数:", N_NONSIG_P1, "個（アーム ", ARM, "）\n", sep = "")
+
+stopifnot(all(coef_peaks$dist >= 0))
+```
+
+```{r dist-vs-peak-stats}
+dist_stats <- coef_peaks %>%
+  filter(phase == FOCUS_PHASE) %>%
+  group_by(alpha) %>%
+  summarise(
+    n_coef       = n(),
+    rho_dist     = cor(dist, peak_fpr, method = "spearman"),
+    p_rho_dist   = cor.test(dist, peak_fpr, method = "spearman",
+                            exact = FALSE)$p.value,
+    rho_peak_eps = cor(dist, log10(peak_eps), method = "spearman"),
+    .groups = "drop"
+  )
+
+dist_stats %>%
+  kable(caption = paste("Phase 1: 距離 dist と係数レベルピークの Spearman 相関。",
+                        "負なら「閾値に近いほどピークが高い」。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+pooled <- coef_peaks %>% filter(phase == FOCUS_PHASE)
+cat(sprintf("3 水準プール（%d 点）: rho(dist, peak FPR) = %.3f (p = %.3f)\n",
+            nrow(pooled), cor(pooled$dist, pooled$peak_fpr, method = "spearman"),
+            cor.test(pooled$dist, pooled$peak_fpr, method = "spearman",
+                     exact = FALSE)$p.value))
+```
+
+```{r dist-vs-peak-table}
+coef_peaks %>%
+  filter(phase == FOCUS_PHASE, alpha == ALPHA_REF) %>%
+  arrange(desc(peak_fpr)) %>%
+  select(dataset, variable, vtype, n, p_cox, dist, peak_eps, peak_fpr) %>%
+  kable(caption = paste0("Phase 1・α=0.05: 非有意 ", N_NONSIG_P1, " 係数のピーク FPR（降順）。",
+                        "dist = log10(p_cox) - log10(α)。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  scroll_box(height = "420px")
+```
+
+```{r dist-vs-peak-regression}
+fit_dist <- lm(peak_fpr ~ dist + log10(n),
+               data = coef_peaks %>% filter(phase == FOCUS_PHASE, alpha == ALPHA_REF))
+broom_like <- summary(fit_dist)$coefficients %>% as.data.frame() %>%
+  rownames_to_column("term")
+broom_like %>%
+  kable(caption = sprintf("Phase 1・α=0.05: peak FPR ~ dist + log10(n)（R^2 = %.3f, n = %d）",
+                          summary(fit_dist)$r.squared, nobs(fit_dist)),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r decomposition}
+ZCRIT <- qnorm(1 - ALPHA_REF / 2)
+
+nsig_ref <- baseline_used %>% filter(p_cox >= ALPHA_REF)
+
+decomp <- sim_raw %>%
+  filter(converged, phase == FOCUS_PHASE, is.finite(epsilon)) %>%
+  inner_join(nsig_ref, by = c("dataset", "variable")) %>%
+  group_by(dataset, variable, epsilon) %>%
+  mutate(mean_beta_g = mean(beta)) %>%
+  summarise(
+    n_sims        = n(),
+    fpr_full      = mean(p_value < ALPHA_REF),
+    fpr_se_only   = mean(abs(first(beta_base) / se) > ZCRIT),
+    fpr_beta_only = mean(abs(beta / first(se_base)) > ZCRIT),
+    fpr_disp_only = mean(abs((beta - first(mean_beta_g) + first(beta_base)) /
+                               first(se_base)) > ZCRIT),
+    mean_beta = mean(beta), sd_beta = sd(beta), mean_se = mean(se),
+    beta_base = first(beta_base), se_base = first(se_base), z_base = first(z_base),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    shift_z  = (mean_beta - beta_base) / se_base,
+    r_se     = mean_se / se_base,
+    z_eff    = mean_beta / mean_se,
+    disp_eff = sd_beta / mean_se,
+    fpr_pred = pnorm(-(ZCRIT - z_eff) / disp_eff) + pnorm(-(ZCRIT + z_eff) / disp_eff)
+  )
+
+expected_decomp <- nrow(nsig_ref) * length(EPS_FINITE)
+stopifnot(
+  nrow(decomp) == expected_decomp,
+  !anyNA(decomp$fpr_full), !anyNA(decomp$z_eff), !anyNA(decomp$disp_eff),
+  all(decomp$n_sims >= 990L), max(decomp$n_sims) == 1000L,
+  all(decomp$fpr_full >= 0 & decomp$fpr_full <= 1)
+)
+cat("分解テーブル:", nrow(decomp), "行（期待", expected_decomp, "行 =", nrow(nsig_ref),
+    "係数 ×", length(EPS_FINITE), "ε）✅\n")
+
+stopifnot(max(abs(decomp$z_eff - (decomp$z_base + decomp$shift_z) / decomp$r_se)) < 1e-9)
+cat("恒等式 z_eff = (z_base + s) / r_SE を全", nrow(decomp), "セルで確認 ✅\n")
+```
+
+```{r normal-approximation}
+cat(sprintf("正規近似 vs 実測 FPR（%d セル）: Pearson r = %.4f, 中央絶対誤差 = %.4f, 最大 = %.4f\n",
+            nrow(decomp), cor(decomp$fpr_full, decomp$fpr_pred),
+            median(abs(decomp$fpr_full - decomp$fpr_pred)),
+            max(abs(decomp$fpr_full - decomp$fpr_pred))))
+
+ggplot(decomp, aes(x = fpr_pred, y = fpr_full, color = dataset)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(alpha = 0.6, size = 1.6) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "FPR は (z_eff, d_eff) の 2 母数で再現できる",
+       subtitle = "予測 = P(|N(z_eff, d_eff^2)| > 1.96)",
+       x = "予測 FPR", y = "実測 FPR", color = "Dataset") +
+  theme_bw(base_size = 12)
+```
+
+```{r approximation-robustness}
+rob_band <- map_dfr(list(c(0, 1), c(0.02, 0.98), c(0.05, 0.95), c(0.10, 0.90)), function(b) {
+  sub <- decomp %>% filter(fpr_full >= b[1], fpr_full <= b[2],
+                           !(b[1] > 0 & (fpr_full <= b[1] | fpr_full >= b[2])))
+  sub <- if (b[1] == 0) decomp else decomp %>% filter(fpr_full > b[1], fpr_full < b[2])
+  tibble(条件 = if (b[1] == 0) "全セル" else sprintf("FPR が (%.2f, %.2f) のセルのみ", b[1], b[2]),
+         セル数 = nrow(sub), Pearson = cor(sub$fpr_full, sub$fpr_pred),
+         中央絶対誤差 = median(abs(sub$fpr_full - sub$fpr_pred)))
+})
+rob_band %>%
+  kable(caption = "(a) 0 / 1 に張り付いたセルを除いても当てはまりは保たれる", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+rivals <- decomp %>%
+  mutate(pred_d1 = pnorm(-(ZCRIT - z_eff) / 1) + pnorm(-(ZCRIT + z_eff) / 1),
+         pred_z0 = pnorm(-(ZCRIT - 0) / disp_eff) + pnorm(-(ZCRIT + 0) / disp_eff),
+         pred_zb = pnorm(-(ZCRIT - z_base) / disp_eff) + pnorm(-(ZCRIT + z_base) / disp_eff))
+tibble(モデル = c("実装（z_eff, d_eff）", "d_eff を 1 に固定", "z_eff を 0 に固定",
+                  "z_eff の代わりに z_base"),
+       Pearson = c(cor(rivals$fpr_full, rivals$fpr_pred), cor(rivals$fpr_full, rivals$pred_d1),
+                   cor(rivals$fpr_full, rivals$pred_z0), cor(rivals$fpr_full, rivals$pred_zb)),
+       中央絶対誤差 = c(median(abs(rivals$fpr_full - rivals$fpr_pred)),
+                        median(abs(rivals$fpr_full - rivals$pred_d1)),
+                        median(abs(rivals$fpr_full - rivals$pred_z0)),
+                        median(abs(rivals$fpr_full - rivals$pred_zb)))) %>%
+  kable(caption = "(b) 2 母数の一方を潰した対抗モデル（潰すと一致は大きく崩れる）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+shape <- sim_raw %>%
+  filter(converged, phase == FOCUS_PHASE, is.finite(epsilon)) %>%
+  inner_join(nsig_ref, by = c("dataset", "variable")) %>%
+  group_by(dataset, variable, epsilon) %>%
+  summarise(fpr = mean(p_value < ALPHA_REF),
+            skew = { m <- mean(beta); mean((beta - m)^3) / mean((beta - m)^2)^1.5 },
+            kurt = { m <- mean(beta); mean((beta - m)^4) / mean((beta - m)^2)^2 },
+            cv_se = sd(se) / mean(se),
+            pred_z = { mz <- mean(beta / se); sz <- sd(beta / se)
+                       pnorm(-(ZCRIT - mz) / sz) + pnorm(-(ZCRIT + mz) / sz) },
+            .groups = "drop")
+stopifnot(nrow(shape) == nrow(decomp))
+cat(sprintf("(c) β の歪度: 中央値 %.3f / |歪度| 最大 %.3f（|歪度| > 0.5 は %d / %d セル）。尖度は最大 %.2f\n",
+            median(shape$skew), max(abs(shape$skew)), sum(abs(shape$skew) > 0.5), nrow(shape),
+            max(shape$kurt)))
+cat(sprintf("(d) SE の反復間変動係数: 中央値 %.4f / 最大 %.4f。反復ごとの SE_i を使う版は Pearson %.4f\n",
+            median(shape$cv_se), max(shape$cv_se), cor(shape$fpr, shape$pred_z)))
+```
+
+```{r decomposition-at-peak}
+peak_decomp <- decomp %>%
+  group_by(dataset, variable) %>%
+  slice_max(fpr_full, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(covar_info %>% select(dataset, variable, vtype, n, q), by = c("dataset", "variable")) %>%
+  mutate(dataset = factor(dataset, levels = DATASET_ORDER)) %>%
+  arrange(desc(fpr_full))
+
+peak_decomp %>%
+  select(dataset, variable, vtype, epsilon, fpr_full,
+         z_base, shift_z, r_se, z_eff, disp_eff,
+         fpr_se_only, fpr_beta_only, fpr_disp_only) %>%
+  kable(caption = paste("Phase 1・α=0.05: 各係数のピーク ε における分解。",
+                        "z_eff = (z_base + shift_z) / r_se。"),
+        digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  scroll_box(height = "420px")
+```
+
+```{r driver-classification}
+peak_decomp <- peak_decomp %>%
+  mutate(driver = case_when(
+    fpr_se_only   >= 0.5 * fpr_full & fpr_beta_only >= 0.5 * fpr_full ~ "両経路とも単独で十分",
+    fpr_se_only   >= 0.5 * fpr_full                                   ~ "SE 縮小が単独で十分",
+    fpr_beta_only >= 0.5 * fpr_full                                   ~ "β の変動が単独で十分",
+    TRUE                                                              ~ "どちらも単独では不十分（相互作用）"
+  ))
+
+peak_decomp %>% count(driver, name = "係数数") %>%
+  kable(caption = paste0("ピーク ε における駆動経路の分類（Phase 1・α=0.05、", N_NONSIG_P1, " 係数）")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+map_dfr(c(0.3, 0.5, 0.7), function(th) {
+  peak_decomp %>%
+    mutate(dr = case_when(
+      fpr_se_only >= th * fpr_full & fpr_beta_only >= th * fpr_full ~ "両経路とも単独で十分",
+      fpr_se_only >= th * fpr_full                                  ~ "SE 縮小が単独で十分",
+      fpr_beta_only >= th * fpr_full                                ~ "β の変動が単独で十分",
+      TRUE                                                          ~ "どちらも単独では不十分（相互作用）")) %>%
+    count(dr, name = "係数数") %>% mutate(閾値 = th)
+}) %>%
+  pivot_wider(names_from = 閾値, values_from = 係数数, names_prefix = "閾値=", values_fill = 0L) %>%
+  kable(caption = paste("閾値の感度（採用は 0.5）。0.3–0.7 で内訳は 1–2 係数しか動かず分類は頑健である。",
+                        "")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+peak_decomp %>%
+  summarise(
+    `rho(|z_eff|, peak FPR)`  = cor(abs(z_eff), fpr_full, method = "spearman"),
+    `rho(r_SE, peak FPR)`     = cor(r_se, fpr_full, method = "spearman"),
+    `rho(|shift_z|, peak FPR)`= cor(abs(shift_z), fpr_full, method = "spearman"),
+    `rho(d_eff, peak FPR)`    = cor(disp_eff, fpr_full, method = "spearman"),
+    `rho(|z_base|, peak FPR)` = cor(abs(z_base), fpr_full, method = "spearman")
+  ) %>%
+  pivot_longer(everything(), names_to = "統計量", values_to = "Spearman rho") %>%
+  kable(caption = paste0("ピーク高さを説明する量の比較（", N_NONSIG_P1, " 係数）"), digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r low-eps-attenuation}
+decomp %>%
+  filter(dataset == "flchain", variable == "kappa") %>%
+  select(epsilon, r_se, shift_z, z_eff, disp_eff, fpr_full, fpr_se_only, fpr_beta_only) %>%
+  kable(caption = paste("flchain kappa の ε 依存。低 ε では r_SE が 0.07 まで縮む一方",
+                        "z_eff は 0 付近にとどまる（β の減衰が SE 縮小を相殺する）。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+atten <- decomp %>%
+  group_by(dataset, variable) %>%
+  summarise(z_base = first(z_base),
+            z_eff_lo = z_eff[epsilon == min(EPS_FINITE)],
+            z_eff_peak = z_eff[which.max(fpr_full)],
+            .groups = "drop")
+cat(sprintf("最小 ε (%.1f) で |z_eff| < |z_base| となる係数: %d / %d\n",
+            min(EPS_FINITE), sum(abs(atten$z_eff_lo) < abs(atten$z_base)), nrow(atten)))
+cat(sprintf("ピーク ε で |z_eff| > |z_base| となる係数: %d / %d\n",
+            sum(abs(atten$z_eff_peak) > abs(atten$z_base)), nrow(atten)))
+```
+
+```{r scale-coef-level}
+scale_stats <- tibble(
+  観点 = c("rho(log10 n, peak FPR)",
+           "rho(log10 n, r_SE at peak)",
+           "rho(log10 n, |shift_z| at peak)",
+           "rho(log10 n, d_eff at peak)"),
+  `Spearman rho` = c(
+    cor(log10(peak_decomp$n), peak_decomp$fpr_full, method = "spearman"),
+    cor(log10(peak_decomp$n), peak_decomp$r_se, method = "spearman"),
+    cor(log10(peak_decomp$n), abs(peak_decomp$shift_z), method = "spearman"),
+    cor(log10(peak_decomp$n), peak_decomp$disp_eff, method = "spearman")
+  ),
+  `p 値` = c(
+    cor.test(log10(peak_decomp$n), peak_decomp$fpr_full, method = "spearman", exact = FALSE)$p.value,
+    cor.test(log10(peak_decomp$n), peak_decomp$r_se, method = "spearman", exact = FALSE)$p.value,
+    cor.test(log10(peak_decomp$n), abs(peak_decomp$shift_z), method = "spearman", exact = FALSE)$p.value,
+    cor.test(log10(peak_decomp$n), peak_decomp$disp_eff, method = "spearman", exact = FALSE)$p.value
+  )
+)
+scale_stats %>%
+  kable(caption = paste0("係数レベル（Phase 1・α=0.05、", N_NONSIG_P1, " 係数）での n 依存性"), digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+rho_rse_n <- cor(peak_decomp$r_se, peak_decomp$n, method = "spearman")
+ci_rse_n  <- tanh(atanh(rho_rse_n) + c(-1, 1) * qnorm(0.975) * sqrt(1.06 / (nrow(peak_decomp) - 3)))
+stopifnot(is.finite(rho_rse_n), all(is.finite(ci_rse_n)))
+```
+
+```{r scale-dataset-level}
+ds_curve <- decomp %>%
+  group_by(dataset, epsilon) %>%
+  summarise(mean_fpr = mean(fpr_full), n_denom = n(), .groups = "drop")
+
+ds_scale <- ds_curve %>%
+  group_by(dataset) %>%
+  summarise(
+    n_denom   = first(n_denom),
+    plateau   = mean_fpr[epsilon == min(EPS_FINITE)],
+    peak_fpr  = max(mean_fpr),
+    peak_eps  = min(epsilon[mean_fpr == max(mean_fpr)]),
+    half_lvl  = plateau + (max(mean_fpr) - plateau) / 2,
+    eps_lo    = min(epsilon[mean_fpr >= half_lvl]),
+    eps_hi    = max(epsilon[mean_fpr >= half_lvl]),
+    fwhm_dec  = log10(eps_hi) - log10(eps_lo),
+    .groups = "drop"
+  ) %>%
+  mutate(n = N_VALUES[as.character(dataset)], q = Q_VALUES[as.character(dataset)]) %>%
+  arrange(n)
+
+stopifnot(nrow(ds_scale) == length(DATASET_ORDER), !anyNA(ds_scale$fwhm_dec),
+          all(ds_scale$peak_fpr > ds_scale$plateau))
+
+ds_scale %>%
+  select(dataset, n, q, n_denom, plateau, peak_fpr, peak_eps, eps_lo, eps_hi, fwhm_dec) %>%
+  kable(caption = paste("Phase 1・α=0.05: データセットレベルのピーク高さと幅（n 昇順）。",
+                        "fwhm_dec はプラトーを基線とした半値全幅（ε の decade 数）。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+cat(sprintf("Spearman(n, peak FPR) = %.2f (p = %.3f) / Spearman(n, FWHM) = %.2f (p = %.3f)\n",
+            cor(ds_scale$n, ds_scale$peak_fpr, method = "spearman"),
+            cor.test(ds_scale$n, ds_scale$peak_fpr, method = "spearman", exact = FALSE)$p.value,
+            cor(ds_scale$n, ds_scale$fwhm_dec, method = "spearman"),
+            cor.test(ds_scale$n, ds_scale$fwhm_dec, method = "spearman", exact = FALSE)$p.value))
+```
+
+```{r width-definition-sensitivity}
+width_defs <- ds_curve %>%
+  group_by(dataset) %>%
+  summarise(
+    plateau = mean_fpr[epsilon == min(EPS_FINITE)], peak = max(mean_fpr),
+    `実装: プラトー基線 50%` = { h <- plateau + (peak - plateau) / 2
+      log10(max(epsilon[mean_fpr >= h])) - log10(min(epsilon[mean_fpr >= h])) },
+    `単純な半値 (peak/2)` = { h <- peak / 2
+      log10(max(epsilon[mean_fpr >= h])) - log10(min(epsilon[mean_fpr >= h])) },
+    `FPR >= 2α` = if (any(mean_fpr >= 2 * ALPHA_REF))
+      log10(max(epsilon[mean_fpr >= 2 * ALPHA_REF])) -
+        log10(min(epsilon[mean_fpr >= 2 * ALPHA_REF])) else NA_real_,
+    `プラトー基線 25%` = { h <- plateau + (peak - plateau) * 0.25
+      log10(max(epsilon[mean_fpr >= h])) - log10(min(epsilon[mean_fpr >= h])) },
+    `プラトー基線 75%` = { h <- plateau + (peak - plateau) * 0.75
+      log10(max(epsilon[mean_fpr >= h])) - log10(min(epsilon[mean_fpr >= h])) },
+    .groups = "drop") %>%
+  mutate(n = N_VALUES[as.character(dataset)]) %>% arrange(n)
+
+width_defs %>% select(-plateau, -peak) %>%
+  kable(caption = "幅の定義を変えた場合（ε の decade 数）", digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+DEF_COLS <- setdiff(names(width_defs), c("dataset", "plateau", "peak", "n"))
+width_def_stats <- map_dfr(DEF_COLS, function(v) {
+  x <- width_defs[[v]]; ok <- !is.na(x)
+  tibble(定義 = v, 範囲 = sprintf("%.2f – %.2f", min(x[ok]), max(x[ok])),
+         width_min = min(x[ok]), width_max = max(x[ok]),
+         `rho(n, 幅)` = cor(width_defs$n[ok], x[ok], method = "spearman"),
+         `p 値` = cor.test(width_defs$n[ok], x[ok], method = "spearman", exact = FALSE)$p.value)
+})
+width_def_stats %>% select(-width_min, -width_max) %>%
+  kable(caption = paste("定義ごとの幅の範囲と n との相関。数値は定義に依存するが、",
+                        "「幅が n とともに増えない」という結論はどの定義でも変わらない。"),
+        digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(nrow(width_defs) == length(DATASET_ORDER),
+          all(width_defs[["実装: プラトー基線 50%"]] > 0))
+cat(sprintf("ε グリッドの隣接間隔（decade）: 最小 %.3f / 最大 %.3f。幅はこの格子に量子化される\n",
+            min(diff(log10(EPS_FINITE))), max(diff(log10(EPS_FINITE)))))
+```
+
+```{r scale-composition}
+composition <- decomp %>%
+  group_by(dataset, variable) %>%
+  summarise(coef_peak = max(fpr_full), .groups = "drop") %>%
+  group_by(dataset) %>%
+  summarise(n_denom = n(), max_coef_peak = max(coef_peak),
+            median_coef_peak = median(coef_peak),
+            n_coef_over_50 = sum(coef_peak >= 0.5), .groups = "drop") %>%
+  mutate(n = N_VALUES[as.character(dataset)]) %>%
+  arrange(n)
+
+composition %>%
+  kable(caption = "FPR の分母（ベースライン非有意な Cox 係数）の組成", digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r case-study}
+CASES <- tribble(
+  ~dataset,  ~variable,
+  "flchain", "kappa",
+  "colon",   "differ"
+)
+
+case_tbl <- decomp %>%
+  semi_join(CASES, by = c("dataset", "variable")) %>%
+  left_join(covar_info %>% select(dataset, variable, src_var, vtype, range_j, sd_x, q, p_cox),
+            by = c("dataset", "variable")) %>%
+  mutate(
+    eps_j = epsilon / q,
+    k_cat = map2_int(dataset, src_var, function(ds, v) {
+      b <- CLIPPING_BOUNDS[[ds]][[v]]
+      if (is.null(b)) NA_integer_ else length(b)
+    }),
+    noise_scale = if_else(vtype == "continuous", range_j / eps_j, NA_real_),
+    flip_prob   = if_else(vtype == "categorical",
+                          (k_cat - 1) / (exp(eps_j) + k_cat - 1), NA_real_),
+    nsr = if_else(vtype == "continuous", sqrt(2) * noise_scale / sd_x, NA_real_),
+    r_se_theory = if_else(vtype == "continuous", 1 / sqrt(1 + nsr^2), NA_real_)
+  )
+
+stopifnot(nrow(case_tbl) == 2L * length(EPS_FINITE), !anyNA(case_tbl$eps_j))
+
+case_tbl %>%
+  filter(dataset == "flchain") %>%
+  select(epsilon, eps_j, noise_scale, nsr, r_se_theory, r_se, shift_z, z_eff, disp_eff, fpr_full) %>%
+  kable(caption = paste("flchain kappa（連続、range = 20.49、sd(X) = 0.937、q = 7）。",
+                        "r_se_theory はクリッピングを無視した理論値",
+                        "1/sqrt(1 + 2b^2/Var(X))。低 ε では再クリッピングで分散が飽和するため",
+                        "理論値が過小になる。"),
+        digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+case_tbl %>%
+  filter(dataset == "colon") %>%
+  select(epsilon, eps_j, k_cat, flip_prob, r_se, shift_z, z_eff, disp_eff, fpr_full) %>%
+  kable(caption = paste("colon differ（カテゴリカル k=3、q = 11）。",
+                        "flip_prob は differ 自身が反転する確率。"),
+        digits = 5) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+case_peak <- case_tbl %>%
+  group_by(dataset, variable) %>% slice_max(fpr_full, n = 1, with_ties = FALSE) %>% ungroup()
+case_peak %>%
+  select(dataset, variable, vtype, epsilon, eps_j, noise_scale, flip_prob,
+         p_cox, z_base, shift_z, r_se, z_eff, disp_eff, fpr_full) %>%
+  kable(caption = "ピーク ε における 2 係数の比較", digits = 5) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r case-study-narrative}
+kp <- case_peak %>% filter(dataset == "flchain")
+dp <- case_peak %>% filter(dataset == "colon")
+cat(sprintf(
+  paste0("flchain kappa: ε=%g で ε_j=%.2f、Laplace スケール b=%.2f（sd(X)=%.3f の %.1f 倍）。\n",
+         "  Var(X) が %.1f 倍に膨らみ SE は %.3f 倍に縮小。z_base=%.3f が z_eff=%.2f になり FPR=%.3f。\n"),
+  kp$epsilon, kp$eps_j, kp$noise_scale, kp$sd_x, kp$noise_scale / kp$sd_x,
+  1 / kp$r_se^2, kp$r_se, kp$z_base, kp$z_eff, kp$fpr_full))
+cat(sprintf(
+  paste0("colon differ: ε=%g で ε_j=%.2f、自身の反転確率は %.5f（%.3f%%）。\n",
+         "  SE はほぼ不変（r_SE=%.3f）で、他 10 共変量のノイズによる交絡変化が β を +%.3f SE 動かす。\n",
+         "  z_base=%.3f + %.3f = %.3f を SE 単位のばらつき %.4f と比べると FPR=%.3f。\n"),
+  dp$epsilon, dp$eps_j, dp$flip_prob, 100 * dp$flip_prob,
+  dp$r_se, dp$shift_z, dp$z_base, dp$shift_z, dp$z_base + dp$shift_z, dp$disp_eff, dp$fpr_full))
+```
+
+```{r theory-validity}
+cont_all <- sim_raw %>%
+  filter(converged, phase == FOCUS_PHASE, is.finite(epsilon)) %>%
+  group_by(dataset, variable, epsilon) %>%
+  summarise(mean_se = mean(se), .groups = "drop") %>%
+  inner_join(baseline_used %>% select(dataset, variable, se_base),
+             by = c("dataset", "variable")) %>%
+  inner_join(covar_info %>% select(dataset, variable, vtype, range_j, sd_x, q, n),
+             by = c("dataset", "variable")) %>%
+  filter(vtype == "continuous") %>%
+  mutate(eps_j = epsilon / q, b = range_j / eps_j,
+         nsr = sqrt(2) * b / sd_x,
+         r_se = mean_se / se_base,
+         r_theory = 1 / sqrt(1 + nsr^2),
+         ratio = r_se / r_theory)
+
+N_CONT_COEF <- n_distinct(paste(cont_all$dataset, cont_all$variable))
+stopifnot(
+  nrow(cont_all) == N_CONT_COEF * length(EPS_FINITE),
+  !anyNA(cont_all$nsr), !anyNA(cont_all$ratio),
+  all(cont_all$nsr > 0), all(cont_all$r_se > 0)
+)
+cat(sprintf("連続共変量 %d 係数 × %d 個の有限 ε = %d セル\n",
+            N_CONT_COEF, length(EPS_FINITE), nrow(cont_all)))
+
+theory_bins <- cont_all %>%
+  mutate(bin = cut(nsr, c(-Inf, 0.1, 0.5, 1, 3, Inf),
+                   labels = c("<= 0.1", "0.1 - 0.5", "0.5 - 1", "1 - 3", "> 3"))) %>%
+  group_by(`nsr の帯` = bin) %>%
+  summarise(セル数 = n(), `実測/理論 中央値` = median(ratio),
+            最小 = min(ratio), 最大 = max(ratio), .groups = "drop")
+
+theory_bins %>%
+  kable(caption = paste("r_SE の実測と理論値 1/sqrt(1 + 2b^2/Var(X)) の比。",
+                        "1 に近いほど理論が成り立っている。"), digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+N_LOW_NSR  <- sum(cont_all$nsr <= 1)
+CELL_OK    <- abs(cont_all$ratio - 1) <= 0.10
+N_CELL_OK  <- sum(CELL_OK)
+N_LOW_OK   <- sum(CELL_OK & cont_all$nsr <= 1)
+N_HIGH_OK  <- sum(CELL_OK & cont_all$nsr > 1)
+MARGIN_LOW <- max(abs(theory_bins$`実測/理論 中央値`[1:3] - 1))
+stopifnot(nrow(theory_bins) == 5L, !anyNA(theory_bins$`実測/理論 中央値`),
+          MARGIN_LOW < 0.10,
+          theory_bins$`実測/理論 中央値`[5] > 3,
+          N_CELL_OK == N_LOW_OK + N_HIGH_OK)
+cat(sprintf("**帯の中央値**が 1 から 10%% 以内に収まるのは nsr <= 1 の 3 帯（%d セル）である。\n", N_LOW_NSR))
+cat(sprintf("**セル単位**では全 %d セル中 %d セルが 10%% 以内。内訳は nsr <= 1 が %d/%d（%.0f%%）、nsr > 1 が %d/%d。\n",
+            nrow(cont_all), N_CELL_OK, N_LOW_OK, N_LOW_NSR, 100 * N_LOW_OK / N_LOW_NSR,
+            N_HIGH_OK, sum(cont_all$nsr > 1)))
+cat(sprintf("すなわち nsr <= 1 でも %d セルは 10%% を外れる（最悪 %.0f%% の乖離）。「71 セルだけが 10%% 以内」とは書けない。\n",
+            N_LOW_NSR - N_LOW_OK,
+            100 * max(abs(cont_all$ratio[cont_all$nsr <= 1] - 1))))
+cat(sprintf("nsr > 3 の %d セルでは実測/理論の中央値が %.1f（最大 %.0f）に達する。\n",
+            sum(cont_all$nsr > 3), theory_bins$`実測/理論 中央値`[5], theory_bins$最大[5]))
+cat(sprintf("条件 (a) の余裕: 低ノイズ 3 帯の中央値の 1 からのずれは最大 %.4f（閾値 0.10 に対し余裕 %.4f）。\n",
+            MARGIN_LOW, 0.10 - MARGIN_LOW))
+```
+
+```{r theory-kappa}
+cont_all %>%
+  filter(dataset == "flchain", variable == "kappa") %>%
+  select(epsilon, eps_j, b, nsr, r_theory, r_se, ratio) %>%
+  kable(caption = paste("flchain kappa の理論値と実測。§7 は ε=100 の 1 点だけを示していた。",
+                        "低 ε では実測が理論を上回り（再クリッピングで分散が飽和する）、",
+                        "ε=100 では逆に下回る。"), digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+kappa_100 <- cont_all %>% filter(dataset == "flchain", variable == "kappa", epsilon == 100)
+stopifnot(nrow(kappa_100) == 1L, !anyNA(kappa_100$ratio))
+cat(sprintf("ε=100 では nsr = %.3f、理論 %.4f に対し実測 %.4f（比 %.3f）— 実測が理論を**下回る**。\n",
+            kappa_100$nsr, kappa_100$r_theory, kappa_100$r_se, kappa_100$ratio))
+
+sat_cells <- cont_all %>% filter(nsr > 3)
+cat(sprintf("飽和が効く帯（nsr > 3）では実測/理論 > 1 が %d/%d セル。ε=100 の kappa は比 %.3f < 1 で向きが逆。\n",
+            sum(sat_cells$ratio > 1), nrow(sat_cells), kappa_100$ratio))
+stopifnot(kappa_100$ratio < 1, median(sat_cells$ratio) > 1)
+```
+
+```{r other-phases}
+other_decomp <- map_dfr(INPUT_PHASES, function(ph) {
+  ns <- nsig_ref
+  if (ph == "Phase 3") ns <- ns %>% filter(!(dataset == "flchain" & variable == "kappa"))
+  sim_raw %>%
+    filter(converged, phase == ph, is.finite(epsilon)) %>%
+    inner_join(ns, by = c("dataset", "variable")) %>%
+    group_by(dataset, variable, epsilon) %>%
+    summarise(fpr_full = mean(p_value < ALPHA_REF),
+              z_eff = mean(beta) / mean(se), disp_eff = sd(beta) / mean(se),
+              .groups = "drop") %>%
+    mutate(phase = ph,
+           fpr_pred = pnorm(-(ZCRIT - z_eff) / disp_eff) + pnorm(-(ZCRIT + z_eff) / disp_eff))
+})
+
+other_decomp %>%
+  group_by(phase) %>%
+  summarise(セル数 = n(), Pearson = cor(fpr_full, fpr_pred),
+            中央絶対誤差 = median(abs(fpr_full - fpr_pred)),
+            最大絶対誤差 = max(abs(fpr_full - fpr_pred)), .groups = "drop") %>%
+  kable(caption = "正規近似の当てはまり（3 フェーズ）", digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+stopifnot(nrow(other_decomp) > 0, !anyNA(other_decomp$fpr_pred),
+          all(other_decomp %>% group_by(phase) %>%
+                summarise(r = cor(fpr_full, fpr_pred), .groups = "drop") %>% pull(r) > 0.95))
+```
+
+```{r write-outputs}
+out_files <- list(
+  fpr_mechanism_coef_peaks    = coef_peaks %>% mutate(dataset = as.character(dataset)) %>%
+    select(alpha, dataset, phase, variable, src_var, vtype, n, q,
+           p_cox, z_base, dist, peak_eps, peak_fpr),
+  fpr_mechanism_decomposition = decomp %>%
+    select(dataset, variable, epsilon, n_sims, fpr_full, fpr_se_only, fpr_beta_only,
+           fpr_disp_only, fpr_pred, z_base, shift_z, r_se, z_eff, disp_eff,
+           mean_beta, sd_beta, mean_se, beta_base, se_base),
+  fpr_mechanism_peak_decomp   = peak_decomp %>% mutate(dataset = as.character(dataset)) %>%
+    select(dataset, variable, vtype, n, q, epsilon, fpr_full, fpr_se_only, fpr_beta_only,
+           fpr_disp_only, z_base, shift_z, r_se, z_eff, disp_eff, driver),
+  fpr_mechanism_dataset_scale = ds_scale %>% mutate(dataset = as.character(dataset)),
+  fpr_mechanism_case_study    = case_tbl %>%
+    select(dataset, variable, vtype, epsilon, eps_j, k_cat, noise_scale, flip_prob,
+           nsr, r_se_theory, r_se, shift_z, z_base, z_eff, disp_eff, fpr_full),
+  fpr_mechanism_theory_bins   = theory_bins %>%
+    rename(nsr_band = `nsr の帯`, n_cells = セル数, ratio_median = `実測/理論 中央値`,
+           ratio_min = 最小, ratio_max = 最大),
+  fpr_mechanism_theory_detail = cont_all %>%
+    select(dataset, variable, epsilon, eps_j, b, sd_x, nsr, r_theory, r_se, ratio),
+  fpr_mechanism_width_defs    = width_def_stats %>%
+    rename(definition = 定義, range_label = 範囲, rho_n_width = `rho(n, 幅)`, p_value = `p 値`)
+)
+
+out_csv  <- paste0(names(out_files), ARM_SUFFIX, ".csv")
+existing <- list.files(eval_dir)
+stopifnot(all(startsWith(names(out_files), "fpr_mechanism_")))
+foreign <- setdiff(existing, out_csv)
+stopifnot(length(intersect(out_csv, foreign)) == 0)
+if (ARM == "reffix") {
+  stopifnot(all(endsWith(out_csv, "_reffix.csv")),
+            length(intersect(out_csv, paste0(names(out_files), ".csv"))) == 0)
+}
+cat("出力名の検査: 名前空間 OK / 既存ファイルとの衝突 0 件 ✅\n")
+
+iwalk(setNames(out_files, out_csv), function(df, fn) {
+  path <- file.path(eval_dir, fn)
+  write.csv(df, path, row.names = FALSE)
+  cat(sprintf("%-38s %5d 行\n", basename(path), nrow(df)))
+})
+
+written_mtime <- min(file.mtime(file.path(eval_dir, out_csv)))
+stopifnot(!is.na(written_mtime), !is.na(ALPHA_CSV_MTIME))
+if (written_mtime < ALPHA_CSV_MTIME) {
+  stop("fpr_mechanism_*", ARM_SUFFIX, ".csv が alpha_sensitivity_*", ARM_SUFFIX,
+       ".csv より古い。knit の順序を確認すること。", call. = FALSE)
+}
+cat(sprintf("順序の検査: 出力は実験 A の中間データ（%s）より新しい ✅\n",
+            format(ALPHA_CSV_MTIME, "%Y-%m-%d %H:%M:%S")))
+```
+
+```{r conclusion}
+tibble(
+  項目 = c(
+    "1. 距離 dist とピーク高さ（Phase 1・α=0.05）",
+    "2. 正規近似 (z_eff, d_eff) の当てはまり（350 セル）",
+    "2. ピーク高さとの相関: |z_eff| / d_eff",
+    paste0("2. 駆動経路の分類（", N_NONSIG_P1, " 係数）"),
+    "3. n との相関: ピーク高さ / r_SE / |shift_z|",
+    "3. データセットレベル: ピーク高さ / 幅 と n",
+    "4. ケーススタディ: kappa / differ"
+  ),
+  結果 = c(
+    sprintf("Spearman rho = %.3f (p = %.3f)。距離だけでは説明できない",
+            cor(pooled$dist[pooled$alpha == ALPHA_REF], pooled$peak_fpr[pooled$alpha == ALPHA_REF],
+                method = "spearman"),
+            cor.test(pooled$dist[pooled$alpha == ALPHA_REF],
+                     pooled$peak_fpr[pooled$alpha == ALPHA_REF],
+                     method = "spearman", exact = FALSE)$p.value),
+    sprintf("Pearson r = %.4f、中央絶対誤差 %.4f", cor(decomp$fpr_full, decomp$fpr_pred),
+            median(abs(decomp$fpr_full - decomp$fpr_pred))),
+    sprintf("%.2f / %.2f（中心のずれが支配的で、広がりは効かない）",
+            cor(abs(peak_decomp$z_eff), peak_decomp$fpr_full, method = "spearman"),
+            cor(peak_decomp$disp_eff, peak_decomp$fpr_full, method = "spearman")),
+    paste(sprintf("%s %d", names(table(peak_decomp$driver)), as.integer(table(peak_decomp$driver))),
+          collapse = " / "),
+    sprintf("%.2f / %.2f / %.2f（いずれも弱く、SE 縮小は n に依存しない）",
+            cor(log10(peak_decomp$n), peak_decomp$fpr_full, method = "spearman"),
+            cor(log10(peak_decomp$n), peak_decomp$r_se, method = "spearman"),
+            cor(log10(peak_decomp$n), abs(peak_decomp$shift_z), method = "spearman")),
+    sprintf("Spearman %.2f / %.2f（5 点。高さは非単調、幅は %.1f-%.1f decade で一定）",
+            cor(ds_scale$n, ds_scale$peak_fpr, method = "spearman"),
+            cor(ds_scale$n, ds_scale$fwhm_dec, method = "spearman"),
+            min(ds_scale$fwhm_dec), max(ds_scale$fwhm_dec)),
+    sprintf("同じ p=0.053・同じ ε=100 で r_SE = %.3f vs %.3f（SE 経路 vs 交絡経路）",
+            kp$r_se, dp$r_se)
+  )
+) %>%
+  kable(caption = "実験 B の結果サマリー") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```
+
